@@ -72,13 +72,17 @@ def _enrich(host: Host) -> Host:
     Reverse-DNS gets a short timeout (0.3s) because most consumer devices
     don't register reverse DNS and the lookup just wastes wall-clock time.
 
-    TTL is captured during ICMP discovery already (host.ttl). For ARP-discovered
-    hosts we do ONE quick ICMP echo here to fill it in (skip if already set).
+    TTL: only probed when we don't already have one AND we don't have a MAC.
+    ARP-discovered hosts (have MAC) are on the local broadcast domain — running
+    redundant ICMP echoes against all of them causes scapy MAC-resolution
+    races and noisy warnings under high concurrency.
     """
     host.hostname = resolve_hostname(host.ip, timeout=0.3)
     host.vendor = oui_lookup(host.mac)
-    # If TTL wasn't captured during discovery (ARP path), grab it quickly.
-    if host.ttl is None:
+    # Skip ICMP TTL probe when we already have an ARP-derived MAC; we know
+    # this host is local. (TTL would just confirm "Linux/Windows" which we
+    # often get from OUI vendor + open-port fingerprints anyway.)
+    if host.ttl is None and not host.mac:
         from .discovery import quick_ttl
         ttl = quick_ttl(host.ip, timeout=0.5)
         if ttl is not None:

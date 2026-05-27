@@ -16,6 +16,12 @@ log = logging.getLogger(__name__)
 def _import_scapy():
     """Lazy import — scapy is heavy and may not be installed on dev box."""
     try:
+        # Silence scapy's runtime WARNING channel BEFORE importing — otherwise
+        # the L2 MAC-resolution fallback messages drown out scan output.
+        import logging as _logging
+        _logging.getLogger("scapy.runtime").setLevel(_logging.ERROR)
+        _logging.getLogger("scapy").setLevel(_logging.ERROR)
+
         from scapy.all import ARP, Ether, srp, IP, ICMP, sr1, conf
         conf.verb = 0
         return {"ARP": ARP, "Ether": Ether, "srp": srp,

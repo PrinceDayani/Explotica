@@ -63,6 +63,9 @@ def syn_scan(targets: Iterable[str], ports: list[int], *,
         log.warning("SYN scan requires root + scapy — not available")
         return {}
 
+    # Silence scapy runtime warnings before import (separate channel from verb)
+    logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+    logging.getLogger("scapy").setLevel(logging.ERROR)
     from scapy.all import IP, TCP, conf, AsyncSniffer, send
     conf.verb = 0
 

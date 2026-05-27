@@ -19,6 +19,10 @@ log = logging.getLogger(__name__)
 
 def _import_scapy():
     try:
+        # Silence scapy WARNING-level logger before import
+        import logging as _logging
+        _logging.getLogger("scapy.runtime").setLevel(_logging.ERROR)
+        _logging.getLogger("scapy").setLevel(_logging.ERROR)
         from scapy.all import (Ether, IP, UDP, BOOTP, DHCP, srp1,
                                  traceroute as scapy_traceroute, conf, get_if_hwaddr)
         conf.verb = 0
