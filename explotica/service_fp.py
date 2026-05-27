@@ -206,20 +206,28 @@ def deep_probe(host: str, port: Port, timeout: float = 2.5) -> Optional[str]:
     return None
 
 
-def deepen_host(host_ip: str, ports: list[Port], timeout: float = 2.5) -> None:
-    """For each port we know how to probe, run the active probe and merge
-    its output into port.banner if we learned something new."""
-    for p in ports:
-        if p.number not in DEEP_PROBE_PORTS:
-            continue
+def deepen_host(host_ip: str, ports: list[Port],
+                timeout: float = 2.5, workers: int = 8) -> None:
+    """For each port we know how to probe, run the active probe IN PARALLEL
+    and merge its output into port.banner if we learned something new."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    targets = [p for p in ports if p.number in DEEP_PROBE_PORTS]
+    if not targets:
+        return
+
+    def probe_one(p: Port) -> None:
         try:
             extra = deep_probe(host_ip, p, timeout=timeout)
         except Exception as e:
             log.debug("deep_probe crash %s:%d: %s", host_ip, p.number, e)
-            continue
+            return
         if not extra:
-            continue
-        # Merge: keep passive banner if it existed, append the active findings.
+            return
+        # Merge: keep passive banner if it existed, append active findings.
         p.banner = (
             f"{p.banner} || deep: {extra}" if p.banner else f"deep: {extra}"
         )[:512]
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as pool:
+        list(pool.map(probe_one, targets))

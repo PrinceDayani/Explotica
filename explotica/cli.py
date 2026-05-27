@@ -146,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="Per-host nmap timeout in seconds (default: 180)")
     p.add_argument("--workers", type=int, default=16,
                    help="Parallel host workers (default: 16)")
+    p.add_argument("--aggressive", action="store_true",
+                   help="Crank parallelism: host workers 16 → 48, parallel banner "
+                        "and deep probes within each host. Faster but noisier.")
     p.add_argument("--port-timeout", type=float, default=0.8)
     p.add_argument("--banner-timeout", type=float, default=1.5)
     p.add_argument("--json", metavar="PATH",
@@ -160,9 +163,15 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
+        level=logging.INFO if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+    # Aggressive mode: bump host workers (other parallelism is per-host and
+    # already happens inside the scanner/banners modules).
+    if args.aggressive and args.workers <= 16:
+        args.workers = 48
+        console.print("[yellow]--aggressive: host workers bumped to 48[/yellow]")
 
     # ── --list-network: read-only enumeration, no scanning ───────────
     if args.list_network:
@@ -317,12 +326,31 @@ def main(argv: list[str] | None = None) -> int:
     console.print(render_result(result, show_vulns=show_vulns))
 
     if show_vulns:
-        # Quick severity summary across all hosts
+        # CVE severity summary + coverage report
         sev_counts: dict[str, int] = {}
+        total_open = 0
+        fingerprinted = 0
+        ports_with_cve = 0
         for h in result.hosts:
             for p in h.ports:
+                total_open += 1
+                if p.product_name:
+                    fingerprinted += 1
+                if p.cves:
+                    ports_with_cve += 1
                 for c in p.cves:
                     sev_counts[c.severity] = sev_counts.get(c.severity, 0) + 1
+
+        # Coverage line — shows what fraction of open ports got identified
+        unfp = total_open - fingerprinted
+        cov_color = "green" if fingerprinted >= total_open * 0.5 else "yellow"
+        console.print(
+            f"[bold]Coverage:[/bold] "
+            f"[{cov_color}]{fingerprinted}/{total_open}[/{cov_color}] port(s) "
+            f"fingerprinted, {ports_with_cve} with CVE matches"
+            + (f", {unfp} unfingerprinted" if unfp else "")
+        )
+
         if sev_counts:
             parts = []
             for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
@@ -331,8 +359,12 @@ def main(argv: list[str] | None = None) -> int:
                                  f"{sev_counts[sev]} {sev}[/]")
             console.print("[bold]CVE summary:[/bold] " + ", ".join(parts))
         else:
-            console.print("[dim]No CVEs matched from banner data. "
-                          "Try --deep (coming) for active version probes.[/dim]")
+            console.print(
+                "[dim]No CVEs matched. Try [bold]--deep[/bold] for active "
+                "version probes, or [bold]--use-nmap[/bold] for nmap NSE "
+                "vuln scripts. Also check `-v` output for banner patterns "
+                "we couldn't parse.[/dim]"
+            )
 
     if args.json:
         out = Path(args.json)

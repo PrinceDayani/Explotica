@@ -58,13 +58,24 @@ def _scan_host_ports(host: Host, ports: list[int], port_timeout: float) -> Host:
     return host
 
 
-def _grab_host_banners(host: Host, banner_timeout: float) -> Host:
-    """For each open port on host, attempt a banner. Mutates port objects."""
-    for p in host.ports:
+def _grab_host_banners(host: Host, banner_timeout: float,
+                       workers: int = 16) -> Host:
+    """For each open port on host, attempt a banner IN PARALLEL.
+
+    9 open ports × 1.5s sequential = 14s.
+    9 open ports parallel = ~1.5s. Big win on busy hosts.
+    """
+    if not host.ports:
+        return host
+
+    def grab(p: Port) -> None:
         try:
             p.banner = grab_banner(host.ip, p.number, timeout=banner_timeout)
         except Exception as e:
             log.debug("banner %s:%d failed: %s", host.ip, p.number, e)
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(host.ports))) as pool:
+        list(pool.map(grab, host.ports))
     return host
 
 
@@ -134,18 +145,32 @@ def run_scan(
         log.warning("--use-nmap requested but `nmap` binary not on PATH; skipping.")
         use_nmap = False
 
+    # If --vuln-scan was requested and nmap is available, automatically use it
+    # as the fallback for ports we can't fingerprint from banners. This is
+    # what "scan all findings" means — every open port gets a CVE attempt.
+    auto_nmap_fallback = vuln_scan and nmap_available() and not use_nmap
+
     def pipeline(h: Host) -> Host:
         try:
             _enrich(h)
             _scan_host_ports(h, ports or [], port_timeout)
             if not skip_banners and h.ports:
-                _grab_host_banners(h, banner_timeout)
+                _grab_host_banners(h, banner_timeout, workers=16)
             if deep and h.ports:
-                deepen_host(h.ip, h.ports)
+                deepen_host(h.ip, h.ports, workers=8)
             if vuln_scan and h.ports:
                 vuln_enrich_host(h)
             if use_nmap and h.ports:
                 enrich_host_with_nmap(h.ip, h.ports, timeout=nmap_timeout)
+            elif auto_nmap_fallback and h.ports:
+                # Only run nmap on the ports our banner-parser couldn't pin down.
+                unfingerprinted = [p for p in h.ports if not p.product_name]
+                if unfingerprinted:
+                    log.info("fallback nmap for %s on %d unfingerprinted port(s)",
+                             h.ip, len(unfingerprinted))
+                    enrich_host_with_nmap(
+                        h.ip, unfingerprinted, timeout=nmap_timeout
+                    )
         except Exception as e:  # one bad host shouldn't kill the scan
             log.warning("pipeline failed for %s: %s", h.ip, e)
         return h
