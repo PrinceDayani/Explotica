@@ -126,6 +126,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--vuln-scan", action="store_true",
                    help="Match service banners against the NVD CVE database. "
                         "Adds network calls to nvd.nist.gov.")
+    p.add_argument("--deep", action="store_true",
+                   help="Active version probes (HTTP GET, FTP SYST, HTTPS cert, "
+                        "SMB negotiate). Touches each open port. Implies more "
+                        "noise on the target.")
+    p.add_argument("--use-nmap", action="store_true",
+                   help="Run `nmap -sV --script vuln` per host and merge findings. "
+                        "Requires `nmap` on PATH. Slow but thorough.")
+    p.add_argument("--nmap-timeout", type=int, default=180,
+                   help="Per-host nmap timeout in seconds (default: 180)")
     p.add_argument("--workers", type=int, default=16,
                    help="Parallel host workers (default: 16)")
     p.add_argument("--port-timeout", type=float, default=0.8)
@@ -169,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
             host_workers=args.workers,
             skip_banners=args.no_banners,
             vuln_scan=args.vuln_scan,
+            deep=args.deep,
+            use_nmap=args.use_nmap,
+            nmap_timeout=args.nmap_timeout,
             progress=progress,
         )
     except NotImplementedError as e:
@@ -182,9 +194,10 @@ def main(argv: list[str] | None = None) -> int:
                       "On Windows, ARP needs Administrator + Npcap installed.")
         return 1
 
-    console.print(render_result(result, show_vulns=args.vuln_scan))
+    show_vulns = args.vuln_scan or args.use_nmap or args.deep
+    console.print(render_result(result, show_vulns=show_vulns))
 
-    if args.vuln_scan:
+    if show_vulns:
         # Quick severity summary across all hosts
         sev_counts: dict[str, int] = {}
         for h in result.hosts:

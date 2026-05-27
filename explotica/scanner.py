@@ -16,8 +16,10 @@ from . import __version__
 from .banners import grab_banner
 from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
 from .models import Host, Port, ScanResult
+from .nmap_wrap import enrich_host_with_nmap, nmap_available
 from .oui import lookup as oui_lookup
 from .ports import TOP_100_PORTS, scan_ports
+from .service_fp import deepen_host
 from .vulnscan import enrich_host as vuln_enrich_host
 
 log = logging.getLogger(__name__)
@@ -98,6 +100,9 @@ def run_scan(
     host_workers: int = 16,
     skip_banners: bool = False,
     vuln_scan: bool = False,
+    deep: bool = False,
+    use_nmap: bool = False,
+    nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
     """Run a full scan and return a ScanResult.
@@ -125,14 +130,22 @@ def run_scan(
         )
 
     # ── Phase 2: per-host pipeline (parallel across hosts) ──────────────
+    if use_nmap and not nmap_available():
+        log.warning("--use-nmap requested but `nmap` binary not on PATH; skipping.")
+        use_nmap = False
+
     def pipeline(h: Host) -> Host:
         try:
             _enrich(h)
             _scan_host_ports(h, ports or [], port_timeout)
             if not skip_banners and h.ports:
                 _grab_host_banners(h, banner_timeout)
+            if deep and h.ports:
+                deepen_host(h.ip, h.ports)
             if vuln_scan and h.ports:
                 vuln_enrich_host(h)
+            if use_nmap and h.ports:
+                enrich_host_with_nmap(h.ip, h.ports, timeout=nmap_timeout)
         except Exception as e:  # one bad host shouldn't kill the scan
             log.warning("pipeline failed for %s: %s", h.ip, e)
         return h
