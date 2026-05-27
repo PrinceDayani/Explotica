@@ -352,6 +352,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--osint", action="store_true",
                    help="OSINT layer: crt.sh Cert Transparency subdomain "
                         "enum, team-cymru ASN lookup, RDAP WHOIS.")
+    p.add_argument("--async-io", action="store_true",
+                   help="Use asyncio (with uvloop if available) for the "
+                        "port-scan + banner-grab phase. 20-40x more concurrent "
+                        "connections than the thread-based default.")
     p.add_argument("--netfabric", action="store_true",
                    help="Network-fabric intel: DHCP DISCOVER broadcast + "
                         "traceroute hop discovery to live hosts.")
@@ -412,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         args.http_audit = True
         args.osint = True
         args.netfabric = True
+        args.async_io = True
         args.aggressive = True
         if args.ports == "top100":  # only override the default
             args.ports = "top1000"
@@ -550,6 +555,7 @@ def main(argv: list[str] | None = None) -> int:
                     http_audit_enabled=args.http_audit,
                     osint_enabled=args.osint,
                     netfabric_enabled=args.netfabric,
+                    async_io=args.async_io,
                     nmap_timeout=args.nmap_timeout,
                     progress=progress,
                 )
@@ -657,6 +663,7 @@ def main(argv: list[str] | None = None) -> int:
                 http_audit_enabled=args.http_audit,
                 osint_enabled=args.osint,
                 netfabric_enabled=args.netfabric,
+                async_io=args.async_io,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )

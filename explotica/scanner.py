@@ -16,6 +16,7 @@ from . import __version__
 from .banners import grab_banner
 from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
 from .models import Host, Port, ScanResult
+from .aio import run_async_scan
 from .dns_enum import enum_dns
 from .epss_kev import enrich_hosts_with_epss_kev
 from .http_audit import audit_http
@@ -356,6 +357,7 @@ def run_scan(
     http_audit_enabled: bool = False,
     osint_enabled: bool = False,
     netfabric_enabled: bool = False,
+    async_io: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -383,6 +385,48 @@ def run_scan(
             scanner_version=__version__,
         )
 
+    # ── Phase 2a: async I/O port + banner pre-pass (when --async-io) ─────
+    # Single event loop scans ALL hosts × ALL ports + banners in one go.
+    # The thread-based per-host pipeline below then skips port_scan +
+    # banner_grab when this populated the data.
+    async_results: dict[str, tuple[list[int], dict[int, str]]] = {}
+    if async_io and hosts and ports:
+        if progress:
+            progress(f"async I/O: {len(hosts)} hosts × {len(ports)} ports in "
+                     "one event loop…")
+        try:
+            from .models import Port
+            async_results = run_async_scan(
+                [h.ip for h in hosts], ports,
+                use_uvloop=True,
+                port_timeout=port_timeout,
+                banner_timeout=banner_timeout if not skip_banners else 0,
+                grab_banners=not skip_banners,
+                host_concurrency=min(host_workers * 2, 64),
+                port_concurrency=2000 if host_workers >= 128 else 1000,
+            )
+            # Populate Host.ports from the async results
+            from .ports import COMMON_SERVICE_NAMES
+            for h in hosts:
+                open_ports, banners = async_results.get(h.ip, ([], {}))
+                h.ports = [
+                    Port(
+                        number=p,
+                        protocol="tcp",
+                        state="open",
+                        service=COMMON_SERVICE_NAMES.get(p),
+                        banner=banners.get(p),
+                    )
+                    for p in open_ports
+                ]
+            if progress:
+                total_open = sum(len(h.ports) for h in hosts)
+                progress(f"async I/O complete: {total_open} open port(s) across "
+                         f"{len(hosts)} host(s)")
+        except Exception as e:
+            log.warning("async I/O failed (%s) — falling back to thread-based", e)
+            async_results = {}
+
     # ── Phase 2: per-host pipeline (parallel across hosts) ──────────────
     if use_nmap and not nmap_available():
         log.warning("--use-nmap requested but `nmap` binary not on PATH; skipping.")
@@ -395,6 +439,9 @@ def run_scan(
         auto_fallback and vuln_scan and nmap_available() and not use_nmap
     )
 
+    # When async_io ran, ports + banners are already populated.
+    async_populated = bool(async_results)
+
     def pipeline(h: Host) -> Host:
         """Per-host pipeline. Discovery + ports + banners are sequential
         (downstream phases need the data). Enrichment phases that are
@@ -405,9 +452,10 @@ def run_scan(
         try:
             # ── Sequential prelude (each step depends on the previous) ──
             _enrich(h)
-            _scan_host_ports(h, ports or [], port_timeout)
-            if not skip_banners and h.ports:
-                _grab_host_banners(h, banner_timeout, workers=16)
+            if not async_populated:
+                _scan_host_ports(h, ports or [], port_timeout)
+                if not skip_banners and h.ports:
+                    _grab_host_banners(h, banner_timeout, workers=16)
             if deep and h.ports:
                 deepen_host(h.ip, h.ports, workers=8)
 
