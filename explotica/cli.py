@@ -155,6 +155,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--aggressive", action="store_true",
                    help="Crank parallelism: host workers 16 → 128, lower "
                         "timeouts, parallel banner/deep probes. Faster but noisier.")
+    p.add_argument("--ultra", action="store_true",
+                   help="Maximum speed: 256 workers, 0.15s port timeout, "
+                        "0.5s banner timeout. Implies --aggressive. Use on "
+                        "fast LANs where you don't mind packet loss.")
     p.add_argument("--port-timeout", type=float, default=0.4,
                    help="TCP connect timeout per port (default: 0.4s — LAN tuned)")
     p.add_argument("--banner-timeout", type=float, default=1.0,
@@ -175,8 +179,19 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
-    # Aggressive mode: bump host workers + tighten timeouts.
-    if args.aggressive:
+    # --ultra implies --aggressive but cranks even harder
+    if args.ultra:
+        args.aggressive = True
+        if args.workers <= 16:
+            args.workers = 256
+        args.port_timeout = 0.15
+        args.banner_timeout = 0.5
+        console.print(
+            f"[red]--ultra:[/red] workers={args.workers}, "
+            f"port_timeout={args.port_timeout}s, "
+            f"banner_timeout={args.banner_timeout}s"
+        )
+    elif args.aggressive:
         if args.workers <= 16:
             args.workers = 128
         if args.port_timeout >= 0.4:

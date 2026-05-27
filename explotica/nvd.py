@@ -10,12 +10,16 @@ Responses are cached on disk keyed by CPE string with a TTL.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import os
+import socket
+import ssl
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock, Semaphore
 from typing import Optional
@@ -104,33 +108,82 @@ def _build_cpe(vendor: str, product: str, version: str) -> str:
     return f"cpe:2.3:a:{norm(vendor)}:{norm(product)}:{norm(version)}:*:*:*:*:*:*:*"
 
 
-def _fetch(cpe: str, timeout: float = 8.0) -> Optional[dict]:
-    """One HTTP request to NVD. Returns parsed JSON or None on failure.
+# ── HTTP keep-alive connection pool ───────────────────────────────────────
+# Reuse one HTTPSConnection per thread (thread-local) so we don't pay the
+# TLS handshake cost (~150ms) on every CVE lookup.
 
-    Concurrency: acquires a quota slot before the HTTP call, releases it
-    asynchronously after WINDOW elapsed. Multiple threads can be in-flight
-    simultaneously up to _MAX_PER_WINDOW.
-    """
+import threading as _threading
+_conn_local = _threading.local()
+_NVD_HOST = "services.nvd.nist.gov"
+_NVD_PATH_BASE = "/rest/json/cves/2.0"
+
+
+def _get_conn() -> http.client.HTTPSConnection:
+    conn = getattr(_conn_local, "conn", None)
+    if conn is None:
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(_NVD_HOST, timeout=10,
+                                           context=ctx)
+        _conn_local.conn = conn
+    return conn
+
+
+def _reset_conn() -> None:
+    conn = getattr(_conn_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _conn_local.conn = None
+
+
+def _fetch(cpe: str, timeout: float = 10.0) -> Optional[dict]:
+    """One HTTP request to NVD with HTTP keep-alive + quota gating."""
     _acquire_quota_slot()
     try:
         params = urllib.parse.urlencode({"cpeName": cpe})
-        url = f"{NVD_URL}?{params}"
-        req = urllib.request.Request(url, headers={
+        path = f"{_NVD_PATH_BASE}?{params}"
+        headers = {
             "User-Agent": "explotica/0.1 (network-recon-toolkit)",
-            **({"apiKey": NVD_API_KEY} if NVD_API_KEY else {}),
-        })
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            "Accept": "application/json",
+            "Connection": "keep-alive",
+        }
+        if NVD_API_KEY:
+            headers["apiKey"] = NVD_API_KEY
+
+        # Retry once on connection failure (keep-alive can race with server close)
+        for attempt in range(2):
+            try:
+                conn = _get_conn()
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                body = resp.read()
+                if resp.status != 200:
+                    log.warning("NVD HTTP %d for %s", resp.status, cpe)
+                    return None
+                data = json.loads(body.decode("utf-8"))
                 total = data.get("totalResults", 0)
                 log.info("NVD: %s → %d CVE(s)%s", cpe, total,
-                         "" if NVD_API_KEY else "  [no api key — rate limited]")
+                         "" if NVD_API_KEY else "  [anon rate-limited]")
                 return data
-        except Exception as e:
-            log.warning("NVD fetch FAILED for %s: %s", cpe, e)
-            return None
+            except (http.client.HTTPException, OSError, socket.error) as e:
+                log.debug("NVD attempt %d failed for %s: %s; resetting conn",
+                          attempt + 1, cpe, e)
+                _reset_conn()
+                if attempt == 1:
+                    log.warning("NVD fetch FAILED for %s: %s", cpe, e)
+                    return None
+        return None
     finally:
         _release_quota_slot()
+
+
+# ── In-process CPE → result cache (per-run dedup) ────────────────────────
+# If 20 hosts share the same (vendor, product, version), only ONE thread
+# actually hits NVD. Others receive the same result via Future.
+_inflight_lock = Lock()
+_inflight: dict[str, Future] = {}
 
 
 def _severity_from_score(score: float) -> str:
@@ -187,24 +240,55 @@ def _parse_vulns(data: dict) -> list[CVE]:
     return out
 
 
-def lookup_cves(vendor: str, product: str, version: str) -> list[CVE]:
-    """Return list of CVEs matching the given product/version, sorted by severity.
-
-    Cached on disk for 7 days. Returns [] on network failure, bad input,
-    or no matches.
-    """
-    if not vendor or not product or not version:
-        return []
-    cpe = _build_cpe(vendor, product, version)
+def _lookup_uncached(cpe: str) -> list[CVE]:
+    """Hit disk cache then NVD; called inside the inflight-dedup wrapper."""
     cached = _read_cache(cpe)
     if cached is not None:
-        log.debug("NVD cache hit: %s", cpe)
+        log.debug("NVD disk-cache hit: %s", cpe)
         return _parse_vulns(cached)
 
     log.info("NVD lookup: %s", cpe)
     data = _fetch(cpe)
     if data is None:
-        # Cache a negative response too (with shorter TTL? we use same)
         return []
     _write_cache(cpe, data)
     return _parse_vulns(data)
+
+
+def lookup_cves(vendor: str, product: str, version: str) -> list[CVE]:
+    """Return list of CVEs matching the given product/version, sorted by severity.
+
+    Three-tier cache:
+      1. In-process inflight dedup (same CPE within current run → one query)
+      2. Disk cache (7 days TTL)
+      3. NVD API
+    """
+    if not vendor or not product or not version:
+        return []
+    cpe = _build_cpe(vendor, product, version)
+
+    # Acquire-or-create the inflight future for this CPE
+    with _inflight_lock:
+        fut = _inflight.get(cpe)
+        owner = False
+        if fut is None:
+            fut = Future()
+            _inflight[cpe] = fut
+            owner = True
+
+    if owner:
+        try:
+            result = _lookup_uncached(cpe)
+            fut.set_result(result)
+        except Exception as e:
+            fut.set_exception(e)
+        finally:
+            # Don't remove from _inflight — keep result available for late
+            # arrivals. Cache lifetime = process lifetime.
+            pass
+
+    try:
+        return fut.result(timeout=60)
+    except Exception as e:
+        log.warning("NVD inflight lookup failed for %s: %s", cpe, e)
+        return []

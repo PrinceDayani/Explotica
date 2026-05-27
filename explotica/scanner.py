@@ -16,7 +16,8 @@ from . import __version__
 from .banners import grab_banner
 from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
 from .models import Host, Port, ScanResult
-from .nmap_wrap import enrich_host_with_nmap, nmap_available
+from .nmap_wrap import (enrich_host_with_nmap, enrich_hosts_with_nmap,
+                         nmap_available)
 from .oui import lookup as oui_lookup
 from .ports import TOP_100_PORTS, scan_ports
 from .service_fp import deepen_host
@@ -46,8 +47,12 @@ def _discover(target: str, use_arp: bool, timeout: float,
 
 
 def _enrich(host: Host) -> Host:
-    """Cheap enrichment — hostname (reverse DNS) + MAC vendor lookup."""
-    host.hostname = resolve_hostname(host.ip)
+    """Cheap enrichment — hostname (reverse DNS) + MAC vendor lookup.
+
+    Reverse-DNS gets a short timeout (0.3s) because most consumer devices
+    don't register reverse DNS and the lookup just wastes wall-clock time.
+    """
+    host.hostname = resolve_hostname(host.ip, timeout=0.3)
     host.vendor = oui_lookup(host.mac)
     return host
 
@@ -58,14 +63,35 @@ def _scan_host_ports(host: Host, ports: list[int], port_timeout: float) -> Host:
     return host
 
 
+# Ports that NEVER yield text banners (binary protocols). Skipping these
+# saves up to `banner_timeout` per port. We use --deep for these instead.
+_BANNER_SKIP = frozenset({
+    135,    # MSRPC — binary
+    137,    # NetBIOS name service (UDP, won't connect)
+    139,    # NetBIOS session — binary
+    445,    # SMB — binary, --deep has its own probe
+    593,    # RPC over HTTP — binary
+    1434,   # SQL Server browser (UDP)
+    1900,   # SSDP (UDP usually)
+    5353,   # mDNS (UDP)
+    5985,   # WinRM HTTP — won't speak unprompted
+    49152,  # MS dynamic RPC
+    49153, 49154, 49155, 49156, 49157,
+})
+
+
 def _grab_host_banners(host: Host, banner_timeout: float,
                        workers: int = 16) -> Host:
     """For each open port on host, attempt a banner IN PARALLEL.
 
-    9 open ports × 1.5s sequential = 14s.
-    9 open ports parallel = ~1.5s. Big win on busy hosts.
+    Skips ports in _BANNER_SKIP (known binary protocols where a banner
+    attempt just wastes `banner_timeout` seconds).
     """
     if not host.ports:
+        return host
+
+    targets = [p for p in host.ports if p.number not in _BANNER_SKIP]
+    if not targets:
         return host
 
     def grab(p: Port) -> None:
@@ -74,8 +100,8 @@ def _grab_host_banners(host: Host, banner_timeout: float,
         except Exception as e:
             log.debug("banner %s:%d failed: %s", host.ip, p.number, e)
 
-    with ThreadPoolExecutor(max_workers=min(workers, len(host.ports))) as pool:
-        list(pool.map(grab, host.ports))
+    with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as pool:
+        list(pool.map(grab, targets))
     return host
 
 
@@ -154,6 +180,8 @@ def run_scan(
     )
 
     def pipeline(h: Host) -> Host:
+        """Per-host pipeline — fast bits only. Nmap runs ONCE for all hosts
+        after this loop finishes (see post-pipeline phase below)."""
         try:
             _enrich(h)
             _scan_host_ports(h, ports or [], port_timeout)
@@ -163,17 +191,6 @@ def run_scan(
                 deepen_host(h.ip, h.ports, workers=8)
             if vuln_scan and h.ports:
                 vuln_enrich_host(h)
-            if use_nmap and h.ports:
-                enrich_host_with_nmap(h.ip, h.ports, timeout=nmap_timeout)
-            elif auto_nmap_fallback and h.ports:
-                # Only run nmap on the ports our banner-parser couldn't pin down.
-                unfingerprinted = [p for p in h.ports if not p.product_name]
-                if unfingerprinted:
-                    log.info("fallback nmap for %s on %d unfingerprinted port(s)",
-                             h.ip, len(unfingerprinted))
-                    enrich_host_with_nmap(
-                        h.ip, unfingerprinted, timeout=nmap_timeout
-                    )
         except Exception as e:  # one bad host shouldn't kill the scan
             log.warning("pipeline failed for %s: %s", h.ip, e)
         return h
@@ -189,6 +206,33 @@ def run_scan(
                     f"[{completed}/{len(hosts)}] {h.ip} "
                     f"— {len(h.ports)} open port(s)"
                 )
+
+    # ── Phase 3: ONE-SHOT nmap (after all hosts done) ───────────────────
+    # Either --use-nmap (run on ALL open ports) or --auto-fallback (run on
+    # ports without a fingerprinted product). Either way, ONE nmap invocation.
+    if use_nmap and hosts:
+        if progress:
+            progress(f"nmap one-shot on {len([h for h in hosts if h.ports])} host(s)…")
+        enrich_hosts_with_nmap(hosts, timeout=nmap_timeout)
+    elif auto_nmap_fallback and hosts:
+        # Build per-host port list of just the unfingerprinted ports
+        per_host: dict[str, list[int]] = {}
+        for h in hosts:
+            ufp = [p.number for p in h.ports if not p.product_name]
+            if ufp:
+                per_host[h.ip] = ufp
+        if per_host:
+            if progress:
+                total_ports = sum(len(v) for v in per_host.values())
+                progress(
+                    f"nmap fallback one-shot: {len(per_host)} host(s), "
+                    f"{total_ports} unfingerprinted port(s)…"
+                )
+            # Pass only hosts with unfingerprinted ports
+            fallback_hosts = [h for h in hosts if h.ip in per_host]
+            enrich_hosts_with_nmap(
+                fallback_hosts, ports_per_host=per_host, timeout=nmap_timeout
+            )
 
     return ScanResult(
         target=target,
