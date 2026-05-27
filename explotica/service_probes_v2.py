@@ -358,8 +358,13 @@ SERVICE_PROBES = {
 }
 
 
-def probe_service(host: str, port: int, timeout: float = 2.5) -> Optional[dict]:
-    """Dispatch a service-specific probe by port. Default timeout tightened."""
+def probe_service(host: str, port: int, timeout: float = 4.0) -> Optional[dict]:
+    """Dispatch a service-specific probe by port.
+
+    Default 4s — DB services (Mongo cold start, Postgres auth, etc.) can
+    take >2s to respond. Parallel pipeline absorbs the cost; only the
+    slowest probe per host matters for wall-clock.
+    """
     handler = SERVICE_PROBES.get(port)
     if handler is None:
         return None

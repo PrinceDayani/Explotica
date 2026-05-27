@@ -412,39 +412,42 @@ def run_scan(
                 deepen_host(h.ip, h.ports, workers=8)
 
             # ── Parallel enrichment phases (independent of each other) ──
+            # Note: http_audit reads p.crawl_info, so it must run AFTER
+            # web_crawl. We split into two waves:
+            #   Wave A: everything except http_audit
+            #   Wave B: http_audit (only after wave A completes)
             if h.ports:
-                enrichment_tasks: list = []
+                wave_a: list = []
                 if unmask:
-                    enrichment_tasks.append(("unmask",
-                                              lambda: _unmask_host(h)))
+                    wave_a.append(("unmask", lambda: _unmask_host(h)))
                 if udp_probe:
-                    enrichment_tasks.append(("udp", lambda: _udp_probe_host(h)))
+                    wave_a.append(("udp", lambda: _udp_probe_host(h)))
                 if rich_intel:
-                    enrichment_tasks.append(("rich_intel",
-                                              lambda: _rich_intel_host(h)))
+                    wave_a.append(("rich_intel", lambda: _rich_intel_host(h)))
                 if ssh_enum_enabled:
-                    enrichment_tasks.append(("ssh_enum",
-                                              lambda: _ssh_enum_host(h)))
+                    wave_a.append(("ssh_enum", lambda: _ssh_enum_host(h)))
                 if web_crawl_enabled:
-                    enrichment_tasks.append(("web_crawl",
-                                              lambda: _web_crawl_host(h)))
+                    wave_a.append(("web_crawl", lambda: _web_crawl_host(h)))
                 if service_intel_enabled:
-                    enrichment_tasks.append(("service_intel",
-                                              lambda: _service_intel_host(h)))
-                if http_audit_enabled:
-                    enrichment_tasks.append(("http_audit",
-                                              lambda: _http_audit_host(h)))
-                if enrichment_tasks:
+                    wave_a.append(("service_intel",
+                                    lambda: _service_intel_host(h)))
+                if wave_a:
                     with ThreadPoolExecutor(
-                        max_workers=min(8, len(enrichment_tasks))
+                        max_workers=min(8, len(wave_a))
                     ) as sub_pool:
-                        futs = [sub_pool.submit(fn) for _, fn in enrichment_tasks]
+                        futs = [sub_pool.submit(fn) for _, fn in wave_a]
                         for i, f in enumerate(futs):
                             try:
                                 f.result()
                             except Exception as e:
-                                log.debug("enrichment %s %s failed: %s",
-                                          enrichment_tasks[i][0], h.ip, e)
+                                log.debug("wave-A %s %s failed: %s",
+                                          wave_a[i][0], h.ip, e)
+                # Wave B: http_audit — now has crawl_info available
+                if http_audit_enabled:
+                    try:
+                        _http_audit_host(h)
+                    except Exception as e:
+                        log.debug("http_audit %s failed: %s", h.ip, e)
 
             # ── Vuln scan runs AFTER enrichment (needs fingerprints) ────
             if vuln_scan and h.ports:
