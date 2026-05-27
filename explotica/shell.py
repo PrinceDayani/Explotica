@@ -49,6 +49,50 @@ class ExploticaShell(cmd.Cmd):
         # cmd uses raw stdin — we print intro via rich
         self.intro_text = self.intro
 
+    def _try_autoload(self) -> bool:
+        """If no scan in memory, try to load the most recent JSON in ./scans/
+
+        Returns True if a scan got loaded, False if nothing found.
+        """
+        if self.scan_result is not None:
+            return True
+        scans_dir = Path("scans")
+        if not scans_dir.exists():
+            return False
+        candidates = sorted(scans_dir.glob("*.json"),
+                             key=lambda p: p.stat().st_mtime,
+                             reverse=True)
+        if not candidates:
+            return False
+        newest = candidates[0]
+        try:
+            from .models import ScanResult
+            data = json.loads(newest.read_text(encoding="utf-8"))
+            self.scan_result = ScanResult.from_dict(data)
+            self.scan_path = newest
+            console.print(f"[dim]Auto-loaded most recent scan: [cyan]{newest}[/cyan][/dim]")
+            return True
+        except Exception as e:
+            console.print(f"[dim]Could not auto-load {newest}: {e}[/dim]")
+            return False
+
+    def _require_scan(self) -> bool:
+        """Return True if a scan is in memory (auto-loading if needed).
+        Otherwise print a helpful message and return False."""
+        if self.scan_result is not None:
+            return True
+        if self._try_autoload():
+            return True
+        console.print("[yellow]No scan in memory.[/yellow]")
+        console.print("  Run a fresh scan:  [cyan]scan <target> --full-coverage --turbo[/cyan]")
+        console.print("  Or load a previous one:  [cyan]load <file.json>[/cyan]")
+        scans_dir = Path("scans")
+        if scans_dir.exists():
+            jsons = list(scans_dir.glob("*.json"))
+            if jsons:
+                console.print(f"  [dim](found {len(jsons)} JSON files in scans/ — try `load scans/...`)[/dim]")
+        return False
+
     # ── Lifecycle ────────────────────────────────────────────────────────
     def preloop(self) -> None:
         console.print(Panel.fit(self.intro_text, border_style="blue"))
@@ -200,8 +244,7 @@ class ExploticaShell(cmd.Cmd):
 
     # ── Browse ───────────────────────────────────────────────────────────
     def do_hosts(self, arg: str) -> bool:
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
             return False
         flags = arg.split()
         up_only = "--up-only" in flags
@@ -241,8 +284,7 @@ class ExploticaShell(cmd.Cmd):
     def do_host(self, arg: str) -> bool:
         """Show details for one host: `host <ip>`"""
         ip = arg.strip()
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
             return False
         target = next((h for h in self.scan_result.hosts if h.ip == ip), None)
         if not target:
@@ -283,8 +325,7 @@ class ExploticaShell(cmd.Cmd):
         return False
 
     def do_cves(self, arg: str) -> bool:
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
             return False
         flags = arg.split()
         severity_filter = None
@@ -343,8 +384,7 @@ class ExploticaShell(cmd.Cmd):
     def do_cve(self, arg: str) -> bool:
         """Show CVE detail + hosts affected: `cve <CVE-ID>`"""
         cve_id = arg.strip()
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
             return False
         affected = []
         cve_obj = None
@@ -373,8 +413,7 @@ class ExploticaShell(cmd.Cmd):
         return False
 
     def do_ports(self, arg: str) -> bool:
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
             return False
         flags = arg.split()
         svc_filter = None
@@ -412,8 +451,7 @@ class ExploticaShell(cmd.Cmd):
         except ValueError:
             console.print("[red]Usage:[/red] port <number>")
             return False
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
             return False
         hits = []
         for h in self.scan_result.hosts:
@@ -438,8 +476,7 @@ class ExploticaShell(cmd.Cmd):
         return False
 
     def do_priorities(self, arg: str) -> bool:
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
             return False
         from .prioritize import score_scan_result
         scored = score_scan_result(self.scan_result.to_dict())
@@ -464,8 +501,7 @@ class ExploticaShell(cmd.Cmd):
 
     def do_compliance(self, arg: str) -> bool:
         fw = arg.strip().lower() or "cis"
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
             return False
         from .compliance import evaluate
         r = evaluate(self.scan_result.to_dict(), framework=fw)
@@ -512,8 +548,7 @@ class ExploticaShell(cmd.Cmd):
             console.print("[red]Usage:[/red] report html|pdf|md <path>")
             return False
         fmt, path = parts[0], parts[1]
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
             return False
         if fmt == "html":
             from .report import write_report
@@ -532,8 +567,14 @@ class ExploticaShell(cmd.Cmd):
         return False
 
     def do_dashboard(self, arg: str) -> bool:
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
+            return False
+        # fastapi/uvicorn are optional — check first
+        from .dashboard import fastapi_available, serve
+        if not fastapi_available():
+            console.print("[yellow]The dashboard requires fastapi + uvicorn.[/yellow]")
+            console.print("  Install:  [cyan]pip install fastapi uvicorn[standard][/cyan]")
+            console.print("  Or use the TUI instead:  [cyan]tui[/cyan]")
             return False
         # Need a file on disk for the dashboard to serve
         if not self.scan_path:
@@ -542,7 +583,6 @@ class ExploticaShell(cmd.Cmd):
             tmp.write(json.dumps(self.scan_result.to_dict()).encode())
             tmp.close()
             self.scan_path = Path(tmp.name)
-        from .dashboard import serve
         port = 8765
         console.print(f"[green]Launching dashboard at http://127.0.0.1:{port}[/green]")
         console.print("[dim]Ctrl-C to stop and return to shell.[/dim]")
@@ -553,8 +593,15 @@ class ExploticaShell(cmd.Cmd):
         return False
 
     def do_tui(self, arg: str) -> bool:
-        if not self.scan_result:
-            console.print("[red]No scan loaded.[/red]")
+        if not self._require_scan():
+            return False
+        # textual is optional — check first so we give a nice error
+        try:
+            import textual  # noqa: F401
+        except ImportError:
+            console.print("[yellow]The TUI requires the `textual` library.[/yellow]")
+            console.print("  Install:  [cyan]pip install textual[/cyan]")
+            console.print("  Or alternatively use the web dashboard:  [cyan]dashboard[/cyan]")
             return False
         if not self.scan_path:
             self.do_save("scans/_shell_tmp.json")
