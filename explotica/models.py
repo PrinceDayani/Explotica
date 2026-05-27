@@ -60,6 +60,9 @@ class Port:
     http_info: Optional[dict] = None        # headers, tech stack, paths, sec headers
     smb_info: Optional[dict] = None         # shares, signing, dialect, NULL session
     tech_stack: list[str] = field(default_factory=list)  # human-readable tech labels
+    # Phase 12: extra intelligence on a port
+    ssh_info: Optional[dict] = None         # KEXINIT algorithms, weak-alg flags
+    crawl_info: Optional[dict] = None       # web crawler findings on this HTTP port
 
     def to_dict(self) -> dict:
         return {
@@ -77,6 +80,8 @@ class Port:
             "http_info": self.http_info,
             "smb_info": self.smb_info,
             "tech_stack": self.tech_stack,
+            "ssh_info": self.ssh_info,
+            "crawl_info": self.crawl_info,
         }
 
 
@@ -117,6 +122,7 @@ class ScanResult:
     duration_s: float
     hosts: list[Host] = field(default_factory=list)
     scanner_version: str = "0.1.0"
+    dns_info: Optional[dict] = None  # populated when target is a domain
 
     @staticmethod
     def now_iso() -> str:
@@ -130,6 +136,7 @@ class ScanResult:
             "duration_s": self.duration_s,
             "scanner_version": self.scanner_version,
             "hosts": [h.to_dict() for h in self.hosts],
+            "dns_info": self.dns_info,
         }
 
     @classmethod
@@ -173,6 +180,8 @@ class ScanResult:
                         http_info=p.get("http_info"),
                         smb_info=p.get("smb_info"),
                         tech_stack=p.get("tech_stack", []),
+                        ssh_info=p.get("ssh_info"),
+                        crawl_info=p.get("crawl_info"),
                         exploits=[
                             Exploit(
                                 title=e["title"],
@@ -200,4 +209,5 @@ class ScanResult:
             duration_s=data.get("duration_s", 0.0),
             hosts=hosts,
             scanner_version=data.get("scanner_version", "unknown"),
+            dns_info=data.get("dns_info"),
         )

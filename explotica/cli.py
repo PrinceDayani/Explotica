@@ -111,6 +111,25 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
             if p.smb_info and p.smb_info.get("recommendations"):
                 for rec in p.smb_info["recommendations"][:2]:
                     ports_cell.append(f"  ⚠ SMB: {rec}\n", style="bold yellow")
+            # SSH algorithm enum
+            if p.ssh_info:
+                lib = p.ssh_info.get("library_hint", "?")
+                ports_cell.append(f"  SSH lib: {lib}\n", style="dim cyan")
+                if p.ssh_info.get("issues"):
+                    for iss in p.ssh_info["issues"][:2]:
+                        ports_cell.append(f"  ⚠ SSH: {iss}\n", style="bold yellow")
+            # Web crawl summary
+            if p.crawl_info:
+                ci = p.crawl_info
+                ports_cell.append(
+                    f"  crawl: {ci.get('total_pages', 0)} page(s), "
+                    f"{len(ci.get('api_endpoints_found', []))} API endpoint(s), "
+                    f"{len(ci.get('forms', []))} form(s)\n",
+                    style="dim cyan"
+                )
+                # Show top 3 API endpoints
+                for ep in (ci.get("api_endpoints_found") or [])[:3]:
+                    ports_cell.append(f"    {ep}\n", style="dim")
 
             if show_vulns:
                 # Sort by KEV first, then EPSS/CVSS
@@ -246,6 +265,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--udp-probe", action="store_true",
                    help="Send SNMP, mDNS, SSDP, NetBIOS-NS queries to every "
                         "host. Discovers UDP-only services TCP scans miss.")
+    p.add_argument("--web-crawl", action="store_true",
+                   help="Crawl HTTP(S) services starting from / — extracts "
+                        "links, forms, JavaScript API endpoints.")
+    p.add_argument("--shodan", action="store_true",
+                   help="Query free Shodan InternetDB for each public IP "
+                        "(known CVEs, ports, tags, hostnames). Skips RFC1918.")
+    p.add_argument("--ssh-enum", action="store_true",
+                   help="Enumerate SSH algorithms via KEXINIT — KEX, host "
+                        "keys, ciphers, MACs, compression. Flags weak algs.")
+    p.add_argument("--dns-enum", action="store_true",
+                   help="Pull DNS records (A/AAAA/MX/NS/TXT/SOA), brute "
+                        "common subdomains, try AXFR, analyze SPF/DMARC.")
     p.add_argument("--full-coverage", action="store_true",
                    help="MAXIMUM COVERAGE preset. Turns on: --vuln-scan, --deep, "
                         "--use-nmap, --use-searchsploit, --aggressive. "
@@ -291,13 +322,18 @@ def main(argv: list[str] | None = None) -> int:
         args.epss_kev = True
         args.unmask = True
         args.udp_probe = True
+        args.web_crawl = True
+        args.shodan = True
+        args.ssh_enum = True
+        args.dns_enum = True
         args.aggressive = True
         if args.ports == "top100":  # only override the default
             args.ports = "top1000"
         console.print(
             "[bold magenta]--full-coverage:[/bold magenta] enabling "
             "--vuln-scan --deep --use-nmap --use-searchsploit --rich-intel "
-            "--epss-kev --unmask --udp-probe --aggressive, "
+            "--epss-kev --unmask --udp-probe --web-crawl --shodan "
+            "--ssh-enum --dns-enum --aggressive, "
             f"--ports={args.ports}"
         )
 
@@ -406,6 +442,10 @@ def main(argv: list[str] | None = None) -> int:
                     epss_kev=args.epss_kev,
                     unmask=args.unmask,
                     udp_probe=args.udp_probe,
+                    web_crawl_enabled=args.web_crawl,
+                    shodan_enabled=args.shodan,
+                    ssh_enum_enabled=args.ssh_enum,
+                    dns_enum_enabled=args.dns_enum,
                     nmap_timeout=args.nmap_timeout,
                     progress=progress,
                 )
@@ -505,6 +545,10 @@ def main(argv: list[str] | None = None) -> int:
                 epss_kev=args.epss_kev,
                 unmask=args.unmask,
                 udp_probe=args.udp_probe,
+                web_crawl_enabled=args.web_crawl,
+                shodan_enabled=args.shodan,
+                ssh_enum_enabled=args.ssh_enum,
+                dns_enum_enabled=args.dns_enum,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )
@@ -529,7 +573,9 @@ def main(argv: list[str] | None = None) -> int:
     show_vulns = (args.vuln_scan or args.use_nmap or args.deep
                   or args.auto_fallback or args.use_searchsploit
                   or args.rich_intel or args.epss_kev
-                  or args.unmask or args.udp_probe)
+                  or args.unmask or args.udp_probe
+                  or args.web_crawl or args.shodan or args.ssh_enum
+                  or args.dns_enum)
     console.print(render_result(result, show_vulns=show_vulns))
 
     if show_vulns:
@@ -579,6 +625,28 @@ def main(argv: list[str] | None = None) -> int:
                     f"(actively exploited), "
                     f"[yellow]{high_epss}[/yellow] high-EPSS (>=0.5 exploitation likelihood)"
                 )
+
+    # Phase 12 summary lines
+    if args.shodan:
+        shodan_hits = sum(1 for h in result.hosts
+                          if h.udp_services and h.udp_services.get("shodan"))
+        if shodan_hits:
+            console.print(
+                f"[bold]Shodan InternetDB:[/bold] {shodan_hits} public host(s) "
+                f"with cached data"
+            )
+
+    if result.dns_info:
+        di = result.dns_info
+        rec_count = sum(len(v) for v in di.get("records", {}).values())
+        console.print(
+            f"[bold]DNS:[/bold] {len(di.get('records', {}))} record type(s) "
+            f"({rec_count} answers), "
+            f"{len(di.get('subdomains_found', []))} subdomain(s) found"
+        )
+        if di.get("axfr_attempts"):
+            console.print("[bold red]⚠ AXFR succeeded on:[/bold red] "
+                          + ", ".join(a["ns"] for a in di["axfr_attempts"]))
         else:
             console.print(
                 "[dim]No CVEs matched. Try [bold]--deep[/bold] for active "

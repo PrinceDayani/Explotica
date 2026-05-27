@@ -16,6 +16,7 @@ from . import __version__
 from .banners import grab_banner
 from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
 from .models import Host, Port, ScanResult
+from .dns_enum import enum_dns
 from .epss_kev import enrich_hosts_with_epss_kev
 from .http_scan import scan_http
 from .nmap_wrap import (enrich_host_with_nmap, enrich_hosts_with_nmap,
@@ -23,9 +24,12 @@ from .nmap_wrap import (enrich_host_with_nmap, enrich_hosts_with_nmap,
 from .protocol_probes import unmask_port, unmask_ports
 from .searchsploit_wrap import (enrich_host_with_exploits,
                                 searchsploit_available)
+from .shodan_lite import enrich_hosts_with_shodan
 from .smb_scan import scan_smb
+from .ssh_enum import enum_ssh
 from .tls_scan import scan_tls
 from .udp_probes import probe_all_udp
+from .web_crawler import crawl as web_crawl
 from .oui import lookup as oui_lookup
 from .ports import TOP_100_PORTS, scan_ports
 from .service_fp import deepen_host
@@ -81,6 +85,40 @@ _HTTP_PORTS = frozenset({80, 81, 88, 591, 800, 1080, 3000, 4000, 4080, 5000,
                           5050, 7001, 8000, 8008, 8080, 8081, 8088, 8888,
                           9000, 9090})
 _HTTPS_PORTS = frozenset({443, 4443, 8443, 9443})
+
+
+def _ssh_enum_host(host: Host) -> None:
+    """Enumerate SSH algorithms on any port serving SSH."""
+    for p in host.ports:
+        # SSH usually runs on 22 but can be anywhere; detect from banner
+        if p.number == 22 or (p.banner and p.banner.startswith(("SSH-", "deep: SSH-"))):
+            try:
+                info = enum_ssh(host.ip, p.number)
+                if info:
+                    p.ssh_info = info
+            except Exception as e:
+                log.debug("ssh_enum %s:%d failed: %s", host.ip, p.number, e)
+
+
+_HTTP_LIKE_PORTS = frozenset({80, 81, 88, 591, 800, 1080, 3000, 4000, 4080,
+                               5000, 5050, 7001, 8000, 8008, 8080, 8081,
+                               8088, 8888, 9000, 9090, 443, 4443, 8443, 9443})
+_HTTPS_PORTS_CRAWL = frozenset({443, 4443, 8443, 9443})
+
+
+def _web_crawl_host(host: Host) -> None:
+    """Crawl every HTTP/HTTPS port on this host."""
+    for p in host.ports:
+        if p.number not in _HTTP_LIKE_PORTS:
+            continue
+        try:
+            info = web_crawl(host.ip, p.number,
+                              tls=(p.number in _HTTPS_PORTS_CRAWL),
+                              max_pages=15, depth=1, timeout=4.0)
+            if info and info.get("total_pages"):
+                p.crawl_info = info
+        except Exception as e:
+            log.debug("crawl %s:%d failed: %s", host.ip, p.number, e)
 
 
 def _unmask_host(host: Host) -> None:
@@ -252,6 +290,10 @@ def run_scan(
     epss_kev: bool = False,
     unmask: bool = False,
     udp_probe: bool = False,
+    web_crawl_enabled: bool = False,
+    shodan_enabled: bool = False,
+    ssh_enum_enabled: bool = False,
+    dns_enum_enabled: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -307,6 +349,10 @@ def run_scan(
                 _udp_probe_host(h)
             if rich_intel and h.ports:
                 _rich_intel_host(h)
+            if ssh_enum_enabled and h.ports:
+                _ssh_enum_host(h)
+            if web_crawl_enabled and h.ports:
+                _web_crawl_host(h)
             if vuln_scan and h.ports:
                 vuln_enrich_host(h)
         except Exception as e:  # one bad host shouldn't kill the scan
@@ -382,6 +428,31 @@ def run_scan(
             except Exception as e:
                 log.warning("EPSS/KEV enrichment failed: %s", e)
 
+    # ── Phase 6: Shodan InternetDB (public IPs only) ────────────────────
+    if shodan_enabled and hosts:
+        if progress:
+            progress(f"Shodan InternetDB lookup for {len(hosts)} host(s)…")
+        try:
+            enrich_hosts_with_shodan(hosts)
+        except Exception as e:
+            log.warning("Shodan enrichment failed: %s", e)
+
+    # ── Phase 7: DNS enumeration (target-level, when target is a domain) ─
+    dns_info = None
+    if dns_enum_enabled:
+        # Only run DNS enum if the original target looks like a domain
+        is_domain = bool(target and target.replace(".", "").replace("-", "").isalnum()
+                          is False) and not any(c.isdigit() for c in target.split(".")[0])
+        # Simpler heuristic: contains a letter and no slashes
+        is_domain = any(c.isalpha() for c in target) and "/" not in target
+        if is_domain:
+            if progress:
+                progress(f"DNS enumeration for {target}…")
+            try:
+                dns_info = enum_dns(target, brute_subdomains=True)
+            except Exception as e:
+                log.warning("DNS enum failed: %s", e)
+
     return ScanResult(
         target=target,
         started_at=started_iso,
@@ -389,4 +460,5 @@ def run_scan(
         duration_s=round(time.perf_counter() - t0, 2),
         hosts=hosts,
         scanner_version=__version__,
+        dns_info=dns_info,
     )
