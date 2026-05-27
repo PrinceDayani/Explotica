@@ -370,6 +370,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="Maximum speed: 256 workers, 0.15s port timeout, "
                         "0.5s banner timeout. Implies --aggressive. Use on "
                         "fast LANs where you don't mind packet loss.")
+    p.add_argument("--turbo", action="store_true",
+                   help="Reckless speed mode: 384 workers, 0.08s port timeout, "
+                        "0.3s banner timeout. Implies --ultra. Trusted LANs only "
+                        "— may miss slow hosts.")
     p.add_argument("--port-timeout", type=float, default=0.4,
                    help="TCP connect timeout per port (default: 0.4s — LAN tuned)")
     p.add_argument("--banner-timeout", type=float, default=1.0,
@@ -420,8 +424,21 @@ def main(argv: list[str] | None = None) -> int:
             f"--ports={args.ports}"
         )
 
-    # --ultra implies --aggressive but cranks even harder
-    if args.ultra:
+    # --turbo > --ultra > --aggressive (each subsumes the previous)
+    if args.turbo:
+        args.ultra = True
+        args.aggressive = True
+        if args.workers <= 16:
+            args.workers = 384
+        args.port_timeout = 0.08
+        args.banner_timeout = 0.3
+        console.print(
+            f"[bold red]--turbo:[/bold red] workers={args.workers}, "
+            f"port_timeout={args.port_timeout}s, "
+            f"banner_timeout={args.banner_timeout}s "
+            "[dim](reckless — trusted LANs only)[/dim]"
+        )
+    elif args.ultra:
         args.aggressive = True
         if args.workers <= 16:
             args.workers = 256

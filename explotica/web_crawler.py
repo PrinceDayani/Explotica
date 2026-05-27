@@ -154,8 +154,8 @@ def _same_origin(base: str, candidate: str) -> Optional[str]:
 
 
 def crawl(host: str, port: int, *, tls: bool,
-          max_pages: int = 15, depth: int = 1,
-          timeout: float = 4.0) -> Optional[dict]:
+          max_pages: int = 12, depth: int = 1,
+          timeout: float = 2.5) -> Optional[dict]:
     """Crawl a web service, return dict of findings."""
     scheme = "https" if tls else "http"
     base = f"{scheme}://{host}:{port}"

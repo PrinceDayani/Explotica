@@ -59,14 +59,33 @@ def arp_scan(cidr: str, timeout: float = 2.0) -> list[Host]:
 
 
 def icmp_ping(ip: str, timeout: float = 1.0) -> Host | None:
-    """Single ICMP echo. Returns Host if alive, else None."""
+    """Single ICMP echo. Returns Host (with TTL) if alive, else None."""
     s = _import_scapy()
     pkt = s["IP"](dst=ip) / s["ICMP"]()
     start = time.perf_counter()
     reply = s["sr1"](pkt, timeout=timeout, verbose=False)
     elapsed_ms = (time.perf_counter() - start) * 1000
     if reply is not None:
-        return Host(ip=ip, is_up=True, response_ms=round(elapsed_ms, 1))
+        ttl = int(reply.ttl) if hasattr(reply, "ttl") else None
+        h = Host(ip=ip, is_up=True, response_ms=round(elapsed_ms, 1))
+        h.ttl = ttl
+        return h
+    return None
+
+
+def quick_ttl(ip: str, timeout: float = 0.5) -> int | None:
+    """Cheap single ICMP echo just to grab TTL. Returns None on no response."""
+    try:
+        s = _import_scapy()
+    except RuntimeError:
+        return None
+    try:
+        pkt = s["IP"](dst=ip) / s["ICMP"]()
+        reply = s["sr1"](pkt, timeout=timeout, verbose=False)
+        if reply is not None and hasattr(reply, "ttl"):
+            return int(reply.ttl)
+    except Exception:
+        pass
     return None
 
 

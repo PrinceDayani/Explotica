@@ -358,8 +358,8 @@ SERVICE_PROBES = {
 }
 
 
-def probe_service(host: str, port: int, timeout: float = 4.0) -> Optional[dict]:
-    """Dispatch a service-specific probe by port."""
+def probe_service(host: str, port: int, timeout: float = 2.5) -> Optional[dict]:
+    """Dispatch a service-specific probe by port. Default timeout tightened."""
     handler = SERVICE_PROBES.get(port)
     if handler is None:
         return None

@@ -121,15 +121,28 @@ def traceroute_to(target: str, max_hops: int = 20,
     return hops
 
 
-def traceroute_many(targets: list[str], max_hops: int = 15,
-                    timeout: float = 1.5) -> dict[str, list[dict]]:
-    """Sequential traceroute per target (parallel is too noisy/unreliable)."""
+def traceroute_many(targets: list[str], max_hops: int = 12,
+                    timeout: float = 1.0,
+                    workers: int = 8) -> dict[str, list[dict]]:
+    """Parallel traceroute across targets.
+
+    Each target's TTL sweep runs in its own thread. max_hops capped to 12
+    since most LANs have <5 hops and we want to bound worst-case latency.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     out: dict[str, list[dict]] = {}
-    for t in targets[:20]:  # cap target count
+    targets = targets[:20]  # cap target count
+
+    def run(t):
         try:
-            hops = traceroute_to(t, max_hops=max_hops, timeout=timeout)
-            if hops:
-                out[t] = hops
+            return (t, traceroute_to(t, max_hops=max_hops, timeout=timeout))
         except Exception as e:
             log.debug("traceroute %s failed: %s", t, e)
+            return (t, None)
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(targets) or 1)) as pool:
+        for f in as_completed([pool.submit(run, t) for t in targets]):
+            t, hops = f.result()
+            if hops:
+                out[t] = hops
     return out

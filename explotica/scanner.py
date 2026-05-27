@@ -68,21 +68,21 @@ def _enrich(host: Host) -> Host:
 
     Reverse-DNS gets a short timeout (0.3s) because most consumer devices
     don't register reverse DNS and the lookup just wastes wall-clock time.
+
+    TTL is captured during ICMP discovery already (host.ttl). For ARP-discovered
+    hosts we do ONE quick ICMP echo here to fill it in (skip if already set).
     """
     host.hostname = resolve_hostname(host.ip, timeout=0.3)
     host.vendor = oui_lookup(host.mac)
-    # TTL-based OS hint — cheap, just one ICMP echo
-    try:
-        from .discovery import icmp_ping
+    # If TTL wasn't captured during discovery (ARP path), grab it quickly.
+    if host.ttl is None:
+        from .discovery import quick_ttl
+        ttl = quick_ttl(host.ip, timeout=0.5)
+        if ttl is not None:
+            host.ttl = ttl
+    if host.ttl is not None and host.os_hint is None:
         from .os_fingerprint import guess_os_from_ttl
-        from scapy.all import IP, ICMP, sr1, conf
-        conf.verb = 0
-        reply = sr1(IP(dst=host.ip) / ICMP(), timeout=1.0, verbose=False)
-        if reply is not None and hasattr(reply, "ttl"):
-            host.ttl = int(reply.ttl)
-            host.os_hint = guess_os_from_ttl(host.ttl)
-    except Exception as e:
-        log.debug("ttl fingerprint %s failed: %s", host.ip, e)
+        host.os_hint = guess_os_from_ttl(host.ttl)
     return host
 
 
@@ -396,29 +396,57 @@ def run_scan(
     )
 
     def pipeline(h: Host) -> Host:
-        """Per-host pipeline — fast bits only. Nmap runs ONCE for all hosts
-        after this loop finishes (see post-pipeline phase below)."""
+        """Per-host pipeline. Discovery + ports + banners are sequential
+        (downstream phases need the data). Enrichment phases that are
+        INDEPENDENT of each other run in parallel via a sub-pool.
+
+        Nmap runs ONCE for all hosts after this loop (post-pipeline phase).
+        """
         try:
+            # ── Sequential prelude (each step depends on the previous) ──
             _enrich(h)
             _scan_host_ports(h, ports or [], port_timeout)
             if not skip_banners and h.ports:
                 _grab_host_banners(h, banner_timeout, workers=16)
             if deep and h.ports:
                 deepen_host(h.ip, h.ports, workers=8)
-            if unmask and h.ports:
-                _unmask_host(h)
-            if udp_probe:
-                _udp_probe_host(h)
-            if rich_intel and h.ports:
-                _rich_intel_host(h)
-            if ssh_enum_enabled and h.ports:
-                _ssh_enum_host(h)
-            if web_crawl_enabled and h.ports:
-                _web_crawl_host(h)
-            if service_intel_enabled and h.ports:
-                _service_intel_host(h)
-            if http_audit_enabled and h.ports:
-                _http_audit_host(h)
+
+            # ── Parallel enrichment phases (independent of each other) ──
+            if h.ports:
+                enrichment_tasks: list = []
+                if unmask:
+                    enrichment_tasks.append(("unmask",
+                                              lambda: _unmask_host(h)))
+                if udp_probe:
+                    enrichment_tasks.append(("udp", lambda: _udp_probe_host(h)))
+                if rich_intel:
+                    enrichment_tasks.append(("rich_intel",
+                                              lambda: _rich_intel_host(h)))
+                if ssh_enum_enabled:
+                    enrichment_tasks.append(("ssh_enum",
+                                              lambda: _ssh_enum_host(h)))
+                if web_crawl_enabled:
+                    enrichment_tasks.append(("web_crawl",
+                                              lambda: _web_crawl_host(h)))
+                if service_intel_enabled:
+                    enrichment_tasks.append(("service_intel",
+                                              lambda: _service_intel_host(h)))
+                if http_audit_enabled:
+                    enrichment_tasks.append(("http_audit",
+                                              lambda: _http_audit_host(h)))
+                if enrichment_tasks:
+                    with ThreadPoolExecutor(
+                        max_workers=min(8, len(enrichment_tasks))
+                    ) as sub_pool:
+                        futs = [sub_pool.submit(fn) for _, fn in enrichment_tasks]
+                        for i, f in enumerate(futs):
+                            try:
+                                f.result()
+                            except Exception as e:
+                                log.debug("enrichment %s %s failed: %s",
+                                          enrichment_tasks[i][0], h.ip, e)
+
+            # ── Vuln scan runs AFTER enrichment (needs fingerprints) ────
             if vuln_scan and h.ports:
                 vuln_enrich_host(h)
         except Exception as e:  # one bad host shouldn't kill the scan

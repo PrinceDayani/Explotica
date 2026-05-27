@@ -243,7 +243,7 @@ def wordpress_user_enum(host: str, port: int, *, tls: bool,
 # ── Aggregate dispatcher ─────────────────────────────────────────────────
 def audit_http(host: str, port: int, *, tls: bool,
                crawled_paths: Optional[list[str]] = None,
-               timeout: float = 4.0) -> Optional[dict]:
+               timeout: float = 2.5) -> Optional[dict]:
     """Run all four audits against one HTTP(S) port; return aggregated dict."""
     paths_for_methods = ["/"]
     if crawled_paths:

@@ -242,22 +242,46 @@ def run_osint(target: str, hosts) -> dict:
         except Exception as e:
             log.warning("RDAP domain failed: %s", e)
 
-    # Per-host ASN + RDAP IP for public IPs
+    # Per-host ASN + RDAP IP — parallelized across hosts.
     out["asn_per_host"] = {}
     out["rdap_per_host"] = {}
-    seen_prefixes: set[str] = set()
-    for h in hosts:
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _asn(h):
         try:
-            asn = cymru_asn_lookup(h.ip)
-            if asn:
-                out["asn_per_host"][h.ip] = asn
-                # Only do RDAP per unique prefix to avoid hammering
-                prefix = asn.get("prefix", "")
-                if prefix and prefix not in seen_prefixes:
-                    seen_prefixes.add(prefix)
-                    rdap = rdap_lookup(h.ip)
-                    if rdap:
-                        out["rdap_per_host"][h.ip] = rdap
+            return (h.ip, cymru_asn_lookup(h.ip))
         except Exception as e:
-            log.debug("OSINT for %s failed: %s", h.ip, e)
+            log.debug("ASN %s failed: %s", h.ip, e)
+            return (h.ip, None)
+
+    # ASN lookups in parallel — DNS is fast, network-bound
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for f in as_completed([pool.submit(_asn, h) for h in hosts]):
+            ip, asn = f.result()
+            if asn:
+                out["asn_per_host"][ip] = asn
+
+    # RDAP only for unique prefixes (one lookup per /24 of address space)
+    seen_prefixes: set[str] = set()
+    rdap_targets: list[str] = []
+    for ip, asn in out["asn_per_host"].items():
+        prefix = asn.get("prefix", "")
+        if prefix and prefix not in seen_prefixes:
+            seen_prefixes.add(prefix)
+            rdap_targets.append(ip)
+
+    def _rdap(ip):
+        try:
+            return (ip, rdap_lookup(ip))
+        except Exception as e:
+            log.debug("RDAP %s failed: %s", ip, e)
+            return (ip, None)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for f in as_completed([pool.submit(_rdap, ip) for ip in rdap_targets]):
+            ip, rdap = f.result()
+            if rdap:
+                out["rdap_per_host"][ip] = rdap
+
     return out
