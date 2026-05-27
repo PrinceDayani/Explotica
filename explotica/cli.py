@@ -480,8 +480,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("-i", "--interactive", action="store_true",
                    help="Interactive wizard mode — guided scan setup")
+    p.add_argument("--shell", action="store_true",
+                   help="Launch the interactive REPL shell — stays alive, "
+                        "scan/query/save commands at a prompt")
     p.add_argument("--version", action="version", version=f"explotica {__version__}")
     args = p.parse_args(argv)
+
+    # --shell launches the REPL
+    if args.shell:
+        from .shell import launch_shell
+        return launch_shell()
 
     # If --interactive (or no target given), run the wizard then re-enter
     # main() with the wizard-built argv. The wizard returns the full arg list.
