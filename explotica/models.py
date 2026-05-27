@@ -16,6 +16,10 @@ class CVE:
     summary: Optional[str] = None
     published: Optional[str] = None
     source: str = "NVD"             # NVD / nmap / manual
+    # Prioritization signals (Phase 10):
+    epss_score: Optional[float] = None      # 0.0-1.0; probability of exploitation in next 30 days
+    epss_percentile: Optional[float] = None # rank among all CVEs
+    in_kev: bool = False                    # CISA Known Exploited Vulnerabilities catalog
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -51,6 +55,11 @@ class Port:
     product_version: Optional[str] = None  # e.g. "1.3.6"
     cves: list[CVE] = field(default_factory=list)
     exploits: list[Exploit] = field(default_factory=list)
+    # Rich intel (Phase 10) — dict to keep the schema flexible:
+    tls_info: Optional[dict] = None         # cipher list, cert, protocols, weak flags
+    http_info: Optional[dict] = None        # headers, tech stack, paths, sec headers
+    smb_info: Optional[dict] = None         # shares, signing, dialect, NULL session
+    tech_stack: list[str] = field(default_factory=list)  # human-readable tech labels
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +73,10 @@ class Port:
             "product_version": self.product_version,
             "cves": [c.to_dict() for c in self.cves],
             "exploits": [e.to_dict() for e in self.exploits],
+            "tls_info": self.tls_info,
+            "http_info": self.http_info,
+            "smb_info": self.smb_info,
+            "tech_stack": self.tech_stack,
         }
 
 
@@ -140,9 +153,16 @@ class ScanResult:
                                 summary=c.get("summary"),
                                 published=c.get("published"),
                                 source=c.get("source", "NVD"),
+                                epss_score=c.get("epss_score"),
+                                epss_percentile=c.get("epss_percentile"),
+                                in_kev=c.get("in_kev", False),
                             )
                             for c in p.get("cves", [])
                         ],
+                        tls_info=p.get("tls_info"),
+                        http_info=p.get("http_info"),
+                        smb_info=p.get("smb_info"),
+                        tech_stack=p.get("tech_stack", []),
                         exploits=[
                             Exploit(
                                 title=e["title"],

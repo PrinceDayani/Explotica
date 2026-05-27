@@ -20,6 +20,8 @@ from .models import ScanResult
 from .ports import TOP_100_PORTS
 from .scanner import run_scan
 
+log = logging.getLogger(__name__)
+
 console = Console()
 
 
@@ -84,19 +86,60 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
             else:
                 ports_cell.append("\n")
 
+            # Tech stack labels show up in the ports cell
+            if p.tech_stack:
+                ports_cell.append(
+                    f"  tech: {', '.join(p.tech_stack[:4])}\n", style="cyan"
+                )
+            # TLS issues
+            if p.tls_info and p.tls_info.get("issues"):
+                for iss in p.tls_info["issues"][:2]:
+                    ports_cell.append(f"  ⚠ TLS: {iss}\n", style="bold yellow")
+            # HTTP sensitive paths
+            if p.http_info:
+                paths = p.http_info.get("paths_found", [])
+                if paths:
+                    sample = ", ".join(
+                        f"{x['path']}({x['status']})" for x in paths[:3]
+                    )
+                    ports_cell.append(f"  paths: {sample}\n", style="dim cyan")
+                if p.http_info.get("title"):
+                    ports_cell.append(
+                        f"  title: {p.http_info['title'][:60]}\n", style="dim"
+                    )
+            # SMB findings
+            if p.smb_info and p.smb_info.get("recommendations"):
+                for rec in p.smb_info["recommendations"][:2]:
+                    ports_cell.append(f"  ⚠ SMB: {rec}\n", style="bold yellow")
+
             if show_vulns:
-                if p.cves:
-                    # Top 3 CVEs per port, sorted by CVSS (already sorted by lookup)
-                    for cve in p.cves[:3]:
+                # Sort by KEV first, then EPSS/CVSS
+                sorted_cves = sorted(
+                    p.cves,
+                    key=lambda c: (
+                        not c.in_kev,
+                        -(c.epss_score or 0),
+                        -(c.cvss or 0),
+                    ),
+                )
+                if sorted_cves:
+                    # Top 3 CVEs per port, prioritized
+                    for cve in sorted_cves[:3]:
                         style = _SEVERITY_STYLE.get(cve.severity, "white")
                         score = f"{cve.cvss:.1f}" if cve.cvss is not None else "?"
+                        markers = []
+                        if cve.in_kev:
+                            markers.append("[bold red]KEV[/bold red]")
+                        if cve.epss_score is not None and cve.epss_score >= 0.5:
+                            markers.append(f"EPSS={cve.epss_score:.2f}")
+                        marker_str = (" " + " ".join(markers)) if markers else ""
                         vulns_cell.append(
-                            f"{cve.id} ({cve.severity} {score}) @{p.number}\n",
+                            f"{cve.id} ({cve.severity} {score}){marker_str} @{p.number}\n",
                             style=style,
                         )
-                    if len(p.cves) > 3:
+                    if len(sorted_cves) > 3:
                         vulns_cell.append(
-                            f"+{len(p.cves) - 3} more @{p.number}\n", style="dim"
+                            f"+{len(sorted_cves) - 3} more @{p.number}\n", style="dim"
                         )
                 if p.exploits:
                     # Up to 3 exploits per port
@@ -165,6 +208,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="After fingerprinting, query local Exploit-DB via "
                         "`searchsploit` for known exploits per product. "
                         "Requires `searchsploit` (apt install exploitdb).")
+    p.add_argument("--rich-intel", action="store_true",
+                   help="Run per-port deep intel: TLS analysis (ciphers, "
+                        "cert chain, weak crypto), HTTP fingerprinting "
+                        "(tech stack, paths, security headers), SMB enum.")
+    p.add_argument("--epss-kev", action="store_true",
+                   help="Enrich CVEs with EPSS scores (exploit prediction) "
+                        "and CISA KEV catalog membership (known-exploited).")
     p.add_argument("--full-coverage", action="store_true",
                    help="MAXIMUM COVERAGE preset. Turns on: --vuln-scan, --deep, "
                         "--use-nmap, --use-searchsploit, --aggressive. "
@@ -206,12 +256,15 @@ def main(argv: list[str] | None = None) -> int:
         args.deep = True
         args.use_nmap = True
         args.use_searchsploit = True
+        args.rich_intel = True
+        args.epss_kev = True
         args.aggressive = True
         if args.ports == "top100":  # only override the default
             args.ports = "top1000"
         console.print(
             "[bold magenta]--full-coverage:[/bold magenta] enabling "
-            "--vuln-scan --deep --use-nmap --use-searchsploit --aggressive, "
+            "--vuln-scan --deep --use-nmap --use-searchsploit --rich-intel "
+            "--epss-kev --aggressive, "
             f"--ports={args.ports}"
         )
 
@@ -316,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
                     use_nmap=args.use_nmap,
                     auto_fallback=args.auto_fallback,
                     use_searchsploit=args.use_searchsploit,
+                    rich_intel=args.rich_intel,
+                    epss_kev=args.epss_kev,
                     nmap_timeout=args.nmap_timeout,
                     progress=progress,
                 )
@@ -353,8 +408,11 @@ def main(argv: list[str] | None = None) -> int:
             f"[cyan]{args.from_json}[/cyan] (target was [cyan]{result.target}[/cyan])"
         )
         # Re-enrich if requested
-        if args.vuln_scan or args.deep or args.use_nmap or args.use_searchsploit:
+        if (args.vuln_scan or args.deep or args.use_nmap or args.use_searchsploit
+                or args.rich_intel or args.epss_kev):
+            from .epss_kev import enrich_hosts_with_epss_kev
             from .nmap_wrap import enrich_host_with_nmap, nmap_available
+            from .scanner import _rich_intel_host
             from .searchsploit_wrap import (enrich_host_with_exploits,
                                             searchsploit_available)
             from .service_fp import deepen_host
@@ -363,6 +421,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.deep and h.ports:
                     progress(f"deep probe {h.ip}…")
                     deepen_host(h.ip, h.ports)
+                if args.rich_intel and h.ports:
+                    progress(f"rich intel (TLS/HTTP/SMB) {h.ip}…")
+                    _rich_intel_host(h)
                 if args.vuln_scan and h.ports:
                     progress(f"NVD lookup {h.ip}…")
                     vuln_enrich_host(h)
@@ -372,6 +433,12 @@ def main(argv: list[str] | None = None) -> int:
                 if args.use_searchsploit and h.ports and searchsploit_available():
                     progress(f"searchsploit {h.ip}…")
                     enrich_host_with_exploits(h)
+            if args.epss_kev:
+                progress("EPSS+KEV CVE prioritization…")
+                try:
+                    enrich_hosts_with_epss_kev(result.hosts)
+                except Exception as e:
+                    log.warning("EPSS/KEV enrichment failed: %s", e)
     # ── Branch B: live scan ───────────────────────────────────────────
     else:
         try:
@@ -399,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
                 use_nmap=args.use_nmap,
                 auto_fallback=args.auto_fallback,
                 use_searchsploit=args.use_searchsploit,
+                rich_intel=args.rich_intel,
+                epss_kev=args.epss_kev,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )
@@ -421,7 +490,8 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     show_vulns = (args.vuln_scan or args.use_nmap or args.deep
-                  or args.auto_fallback or args.use_searchsploit)
+                  or args.auto_fallback or args.use_searchsploit
+                  or args.rich_intel or args.epss_kev)
     console.print(render_result(result, show_vulns=show_vulns))
 
     if show_vulns:
@@ -457,6 +527,20 @@ def main(argv: list[str] | None = None) -> int:
                     parts.append(f"[{_SEVERITY_STYLE[sev]}]"
                                  f"{sev_counts[sev]} {sev}[/]")
             console.print("[bold]CVE summary:[/bold] " + ", ".join(parts))
+
+            # Priority: KEV-listed + high-EPSS
+            kev_count = sum(1 for h in result.hosts for p in h.ports
+                            for c in p.cves if c.in_kev)
+            high_epss = sum(1 for h in result.hosts for p in h.ports
+                            for c in p.cves
+                            if c.epss_score is not None and c.epss_score >= 0.5)
+            if kev_count or high_epss:
+                console.print(
+                    f"[bold]Prioritize:[/bold] "
+                    f"[bold red]{kev_count}[/bold red] KEV-listed "
+                    f"(actively exploited), "
+                    f"[yellow]{high_epss}[/yellow] high-EPSS (>=0.5 exploitation likelihood)"
+                )
         else:
             console.print(
                 "[dim]No CVEs matched. Try [bold]--deep[/bold] for active "

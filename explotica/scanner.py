@@ -16,10 +16,14 @@ from . import __version__
 from .banners import grab_banner
 from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
 from .models import Host, Port, ScanResult
+from .epss_kev import enrich_hosts_with_epss_kev
+from .http_scan import scan_http
 from .nmap_wrap import (enrich_host_with_nmap, enrich_hosts_with_nmap,
                          nmap_available)
 from .searchsploit_wrap import (enrich_host_with_exploits,
                                 searchsploit_available)
+from .smb_scan import scan_smb
+from .tls_scan import scan_tls
 from .oui import lookup as oui_lookup
 from .ports import TOP_100_PORTS, scan_ports
 from .service_fp import deepen_host
@@ -57,6 +61,50 @@ def _enrich(host: Host) -> Host:
     host.hostname = resolve_hostname(host.ip, timeout=0.3)
     host.vendor = oui_lookup(host.mac)
     return host
+
+
+_HTTP_PORTS = frozenset({80, 81, 88, 591, 800, 1080, 3000, 4000, 4080, 5000,
+                          5050, 7001, 8000, 8008, 8080, 8081, 8088, 8888,
+                          9000, 9090})
+_HTTPS_PORTS = frozenset({443, 4443, 8443, 9443})
+
+
+def _rich_intel_host(host: Host) -> None:
+    """Run TLS / HTTP / SMB deep scans on this host's open ports.
+
+    Per-port enrichment happens in parallel within the host. Each port's
+    result lands on the Port object (tls_info / http_info / smb_info /
+    tech_stack).
+    """
+    if not host.ports:
+        return
+
+    def enrich_port(p: Port) -> None:
+        try:
+            if p.number in _HTTPS_PORTS:
+                tls = scan_tls(host.ip, p.number, timeout=3.0)
+                if tls:
+                    p.tls_info = tls
+                http = scan_http(host.ip, p.number, tls=True, timeout=3.0)
+                if http:
+                    p.http_info = http
+                    if http.get("tech_stack"):
+                        p.tech_stack = http["tech_stack"]
+            elif p.number in _HTTP_PORTS:
+                http = scan_http(host.ip, p.number, tls=False, timeout=3.0)
+                if http:
+                    p.http_info = http
+                    if http.get("tech_stack"):
+                        p.tech_stack = http["tech_stack"]
+            elif p.number == 445:
+                smb = scan_smb(host.ip, p.number, timeout=3.0)
+                if smb:
+                    p.smb_info = smb
+        except Exception as e:
+            log.debug("rich-intel %s:%d failed: %s", host.ip, p.number, e)
+
+    with ThreadPoolExecutor(max_workers=min(8, len(host.ports))) as pool:
+        list(pool.map(enrich_port, host.ports))
 
 
 def _scan_host_ports(host: Host, ports: list[int], port_timeout: float) -> Host:
@@ -143,6 +191,8 @@ def run_scan(
     use_nmap: bool = False,
     auto_fallback: bool = False,
     use_searchsploit: bool = False,
+    rich_intel: bool = False,
+    epss_kev: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -192,6 +242,8 @@ def run_scan(
                 _grab_host_banners(h, banner_timeout, workers=16)
             if deep and h.ports:
                 deepen_host(h.ip, h.ports, workers=8)
+            if rich_intel and h.ports:
+                _rich_intel_host(h)
             if vuln_scan and h.ports:
                 vuln_enrich_host(h)
         except Exception as e:  # one bad host shouldn't kill the scan
@@ -255,6 +307,17 @@ def run_scan(
                     f.result()
                 except Exception as e:
                     log.debug("searchsploit host enrich error: %s", e)
+
+    # ── Phase 5: EPSS + KEV CVE prioritization ──────────────────────────
+    if epss_kev and hosts:
+        total_cves = sum(len(p.cves) for h in hosts for p in h.ports)
+        if total_cves:
+            if progress:
+                progress(f"EPSS+KEV enrichment for {total_cves} CVE(s)…")
+            try:
+                enrich_hosts_with_epss_kev(hosts)
+            except Exception as e:
+                log.warning("EPSS/KEV enrichment failed: %s", e)
 
     return ScanResult(
         target=target,
