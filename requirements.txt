@@ -6,3 +6,8 @@ uvloop>=0.19.0; sys_platform != "win32"
 # Optional — required only for the --dashboard web UI.
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
+# Optional — required only for the TUI (textual library).
+textual>=0.50.0
+# Optional — required only for --browser-crawl (Playwright).
+# After install run: playwright install chromium
+playwright>=1.40.0
