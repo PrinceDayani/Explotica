@@ -156,8 +156,13 @@ def run_nmap_multi(ips: list[str], ports: list[int],
         "nmap",
         "-Pn",                  # skip ping — we already verified up
         "-n",                   # no DNS
-        "-sV",                  # service/version
-        "--script", "vuln",     # NSE vuln category
+        "-sV",                  # service/version detection
+        # Run BOTH category scripts and the standalone vulners script.
+        # vulners.com aggregates NVD + ExploitDB + Metasploit + vendor advisories.
+        "--script", "vuln,vulners",
+        # mincvss=0 → don't filter out lower-severity findings. We want
+        # EVERYTHING, then sort by severity ourselves.
+        "--script-args", "vulners.mincvss=0",
         "--version-intensity", "5",
         "-T4",                  # aggressive timing template
         "--min-parallelism", "32",

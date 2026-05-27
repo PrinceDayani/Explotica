@@ -18,6 +18,8 @@ from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
 from .models import Host, Port, ScanResult
 from .nmap_wrap import (enrich_host_with_nmap, enrich_hosts_with_nmap,
                          nmap_available)
+from .searchsploit_wrap import (enrich_host_with_exploits,
+                                searchsploit_available)
 from .oui import lookup as oui_lookup
 from .ports import TOP_100_PORTS, scan_ports
 from .service_fp import deepen_host
@@ -140,6 +142,7 @@ def run_scan(
     deep: bool = False,
     use_nmap: bool = False,
     auto_fallback: bool = False,
+    use_searchsploit: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -195,6 +198,12 @@ def run_scan(
             log.warning("pipeline failed for %s: %s", h.ip, e)
         return h
 
+    # Check searchsploit availability once
+    if use_searchsploit and not searchsploit_available():
+        log.warning("--use-searchsploit requested but `searchsploit` not "
+                    "on PATH; skipping. (Install: apt install exploitdb)")
+        use_searchsploit = False
+
     completed = 0
     with ThreadPoolExecutor(max_workers=host_workers) as pool:
         futures = {pool.submit(pipeline, h): h for h in hosts}
@@ -233,6 +242,19 @@ def run_scan(
             enrich_hosts_with_nmap(
                 fallback_hosts, ports_per_host=per_host, timeout=nmap_timeout
             )
+
+    # ── Phase 4: searchsploit (after nmap so we have richest fingerprints) ─
+    if use_searchsploit and hosts:
+        if progress:
+            num_fp_ports = sum(1 for h in hosts for p in h.ports if p.product_name)
+            progress(f"searchsploit lookup for {num_fp_ports} fingerprinted port(s)…")
+        with ThreadPoolExecutor(max_workers=min(host_workers, 16)) as pool:
+            futs = [pool.submit(enrich_host_with_exploits, h) for h in hosts]
+            for f in as_completed(futs):
+                try:
+                    f.result()
+                except Exception as e:
+                    log.debug("searchsploit host enrich error: %s", e)
 
     return ScanResult(
         target=target,

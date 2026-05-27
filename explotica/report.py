@@ -96,6 +96,29 @@ def render_report(scan: ScanResult) -> str:
             else:
                 cve_html = '<span class="dim">—</span>'
 
+            # Exploits section — rendered below CVEs
+            exploit_html = ""
+            if p.exploits:
+                exp_items: list[str] = []
+                for ex in p.exploits[:10]:
+                    label = f"EDB-{_esc(ex.edb_id)}" if ex.edb_id else "exploit"
+                    link = (f'<a href="{_esc(ex.url)}" target="_blank">{label}</a>'
+                            if ex.url else label)
+                    meta = " · ".join(filter(None, [
+                        _esc(ex.type) if ex.type else "",
+                        _esc(ex.platform) if ex.platform else "",
+                    ]))
+                    exp_items.append(
+                        f'<li class="exploit">💥 {link} '
+                        f'<span class="exploit-title">{_esc(ex.title[:120])}</span>'
+                        + (f' <span class="dim">({meta})</span>' if meta else '')
+                        + '</li>'
+                    )
+                more_exp = (f'<li class="more">+{len(p.exploits) - 10} more</li>'
+                            if len(p.exploits) > 10 else "")
+                exploit_html = (f'<ul class="exploits">{"".join(exp_items)}'
+                                f'{more_exp}</ul>')
+
             product_str = ""
             if p.product_name and p.product_version:
                 product_str = (f' <span class="product">'
@@ -109,7 +132,7 @@ def render_report(scan: ScanResult) -> str:
                 f'<tr>'
                 f'<td class="port-num">{p.number}/{_esc(p.protocol)}</td>'
                 f'<td>{_esc(p.service or "-")}{product_str}{banner_str}</td>'
-                f'<td>{cve_html}</td>'
+                f'<td>{cve_html}{exploit_html}</td>'
                 f'</tr>'
             )
 
@@ -168,6 +191,13 @@ ul.cves li { padding:3px 0; font-size:12px; }
 ul.cves code { background:#0d1117; padding:1px 6px; border-radius:3px;
                color:#79c0ff; font-family:"SF Mono", Consolas, monospace; }
 .cve-summary { color:#8b949e; font-size:11px; margin-left:6px; }
+ul.exploits { list-style:none; padding:0; margin:8px 0 0 0;
+              border-top:1px solid #21262d; padding-top:6px; }
+ul.exploits li.exploit { padding:2px 0; font-size:12px; }
+ul.exploits a { color:#d29922; text-decoration:none; font-weight:600;
+                font-family:"SF Mono", Consolas, monospace; }
+ul.exploits a:hover { text-decoration:underline; }
+.exploit-title { color:#e6edf3; margin-left:6px; }
 .more { color:#8b949e; font-style:italic; }
 .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:10px;
         font-weight:700; color:#000; min-width:64px; text-align:center; }

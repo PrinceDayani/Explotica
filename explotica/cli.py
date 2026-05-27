@@ -98,6 +98,19 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
                         vulns_cell.append(
                             f"+{len(p.cves) - 3} more @{p.number}\n", style="dim"
                         )
+                if p.exploits:
+                    # Up to 3 exploits per port
+                    for ex in p.exploits[:3]:
+                        edb = f"EDB-{ex.edb_id}" if ex.edb_id else "exploit"
+                        vulns_cell.append(
+                            f"💥 {edb}: {ex.title[:60]} @{p.number}\n",
+                            style="bold magenta",
+                        )
+                    if len(p.exploits) > 3:
+                        vulns_cell.append(
+                            f"+{len(p.exploits) - 3} more exploits @{p.number}\n",
+                            style="dim",
+                        )
 
         row = [
             host.ip,
@@ -148,6 +161,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="With --vuln-scan: auto-run nmap on ports whose banner "
                         "couldn't be fingerprinted. Off by default because "
                         "nmap is slow — opt in when you want maximum coverage.")
+    p.add_argument("--use-searchsploit", action="store_true",
+                   help="After fingerprinting, query local Exploit-DB via "
+                        "`searchsploit` for known exploits per product. "
+                        "Requires `searchsploit` (apt install exploitdb).")
+    p.add_argument("--full-coverage", action="store_true",
+                   help="MAXIMUM COVERAGE preset. Turns on: --vuln-scan, --deep, "
+                        "--use-nmap, --use-searchsploit, --aggressive. "
+                        "Defaults --ports to top1000 if not set.")
     p.add_argument("--nmap-timeout", type=int, default=120,
                    help="Per-host nmap timeout in seconds (default: 120)")
     p.add_argument("--workers", type=int, default=16,
@@ -178,6 +199,21 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+    # --full-coverage preset: maximum vuln discovery
+    if args.full_coverage:
+        args.vuln_scan = True
+        args.deep = True
+        args.use_nmap = True
+        args.use_searchsploit = True
+        args.aggressive = True
+        if args.ports == "top100":  # only override the default
+            args.ports = "top1000"
+        console.print(
+            "[bold magenta]--full-coverage:[/bold magenta] enabling "
+            "--vuln-scan --deep --use-nmap --use-searchsploit --aggressive, "
+            f"--ports={args.ports}"
+        )
 
     # --ultra implies --aggressive but cranks even harder
     if args.ultra:
@@ -278,6 +314,8 @@ def main(argv: list[str] | None = None) -> int:
                     vuln_scan=args.vuln_scan,
                     deep=args.deep,
                     use_nmap=args.use_nmap,
+                    auto_fallback=args.auto_fallback,
+                    use_searchsploit=args.use_searchsploit,
                     nmap_timeout=args.nmap_timeout,
                     progress=progress,
                 )
@@ -315,8 +353,10 @@ def main(argv: list[str] | None = None) -> int:
             f"[cyan]{args.from_json}[/cyan] (target was [cyan]{result.target}[/cyan])"
         )
         # Re-enrich if requested
-        if args.vuln_scan or args.deep or args.use_nmap:
+        if args.vuln_scan or args.deep or args.use_nmap or args.use_searchsploit:
             from .nmap_wrap import enrich_host_with_nmap, nmap_available
+            from .searchsploit_wrap import (enrich_host_with_exploits,
+                                            searchsploit_available)
             from .service_fp import deepen_host
             from .vulnscan import enrich_host as vuln_enrich_host
             for h in result.hosts:
@@ -329,6 +369,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.use_nmap and h.ports and nmap_available():
                     progress(f"nmap NSE {h.ip}…")
                     enrich_host_with_nmap(h.ip, h.ports, timeout=args.nmap_timeout)
+                if args.use_searchsploit and h.ports and searchsploit_available():
+                    progress(f"searchsploit {h.ip}…")
+                    enrich_host_with_exploits(h)
     # ── Branch B: live scan ───────────────────────────────────────────
     else:
         try:
@@ -355,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
                 deep=args.deep,
                 use_nmap=args.use_nmap,
                 auto_fallback=args.auto_fallback,
+                use_searchsploit=args.use_searchsploit,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )
@@ -376,7 +420,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
-    show_vulns = args.vuln_scan or args.use_nmap or args.deep or args.auto_fallback
+    show_vulns = (args.vuln_scan or args.use_nmap or args.deep
+                  or args.auto_fallback or args.use_searchsploit)
     console.print(render_result(result, show_vulns=show_vulns))
 
     if show_vulns:

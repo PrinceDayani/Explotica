@@ -22,6 +22,23 @@ class CVE:
 
 
 @dataclass
+class Exploit:
+    """A weaponized vulnerability — links to Exploit-DB / Metasploit."""
+    title: str                       # Human-readable name
+    edb_id: Optional[str] = None     # Exploit-DB ID, e.g. "49908"
+    path: Optional[str] = None       # Local path inside searchsploit DB
+    type: Optional[str] = None       # "remote" / "local" / "dos" / "webapps"
+    platform: Optional[str] = None   # "linux" / "windows" / "multiple"
+    author: Optional[str] = None
+    date: Optional[str] = None
+    url: Optional[str] = None        # External link (exploit-db.com URL)
+    source: str = "searchsploit"     # searchsploit / msf / manual
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class Port:
     number: int
     protocol: str = "tcp"
@@ -33,6 +50,7 @@ class Port:
     product_name: Optional[str] = None     # e.g. "proftpd"
     product_version: Optional[str] = None  # e.g. "1.3.6"
     cves: list[CVE] = field(default_factory=list)
+    exploits: list[Exploit] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +63,7 @@ class Port:
             "product_name": self.product_name,
             "product_version": self.product_version,
             "cves": [c.to_dict() for c in self.cves],
+            "exploits": [e.to_dict() for e in self.exploits],
         }
 
 
@@ -123,6 +142,20 @@ class ScanResult:
                                 source=c.get("source", "NVD"),
                             )
                             for c in p.get("cves", [])
+                        ],
+                        exploits=[
+                            Exploit(
+                                title=e["title"],
+                                edb_id=e.get("edb_id"),
+                                path=e.get("path"),
+                                type=e.get("type"),
+                                platform=e.get("platform"),
+                                author=e.get("author"),
+                                date=e.get("date"),
+                                url=e.get("url"),
+                                source=e.get("source", "searchsploit"),
+                            )
+                            for e in p.get("exploits", [])
                         ],
                     )
                     for p in h.get("ports", [])
