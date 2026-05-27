@@ -365,6 +365,19 @@ def run_scan(
     netfabric_enabled: bool = False,
     async_io: bool = False,
     syn_scan_enabled: bool = False,
+    # Phase 35: passive-analysis modules (safe to auto-enable)
+    honeypot_check: bool = False,
+    web_security_check: bool = False,
+    ics_check: bool = False,
+    prioritize_scores: bool = False,
+    # Phase 35: active opt-in modules
+    check_default_creds: bool = False,
+    check_takeover: bool = False,
+    check_cloud: bool = False,
+    cloud_keyword: Optional[str] = None,
+    ad_enum_domain: Optional[str] = None,
+    asrep_roast: bool = False,
+    smtp_audit: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -688,6 +701,147 @@ def run_scan(
         if not netfabric_info:
             netfabric_info = None
 
+    # ── Phase 10: Extra-finding modules (Phase 35) ──────────────────────
+    extra_findings: dict = {}
+
+    if ics_check and hosts:
+        if progress:
+            progress("ICS protocol probes (Modbus/BACnet/DNP3/S7/EthIP)…")
+        try:
+            from .ics import probe_ics_host
+            ics_results = {}
+            for h in hosts:
+                if not h.ports:
+                    continue
+                r = probe_ics_host(h.ip, [p.number for p in h.ports])
+                if r:
+                    ics_results[h.ip] = r
+            if ics_results:
+                extra_findings["ics"] = ics_results
+        except Exception as e:
+            log.warning("ICS check failed: %s", e)
+
+    if web_security_check and hosts:
+        if progress:
+            progress("Web security analysis (JWT/CSP/cookies)…")
+        try:
+            from .web_security import analyze_response
+            ws_results: dict = {}
+            for h in hosts:
+                host_ws: list = []
+                for p in h.ports:
+                    if not p.http_info:
+                        continue
+                    headers = p.http_info.get("headers", {})
+                    ws_result = analyze_response(headers, b"",
+                                                  url_was_https=(p.number in (443, 8443)))
+                    if ws_result.get("issue_count"):
+                        host_ws.append({"port": p.number, **ws_result})
+                if host_ws:
+                    ws_results[h.ip] = host_ws
+            if ws_results:
+                extra_findings["web_security"] = ws_results
+        except Exception as e:
+            log.warning("web security check failed: %s", e)
+
+    if check_default_creds and hosts:
+        if progress:
+            progress("Default credential checks…")
+        try:
+            from .default_creds import check_host_defaults
+            dc_results: dict = {}
+            for h in hosts:
+                ports = [p.number for p in h.ports]
+                if ports:
+                    found = check_host_defaults(h.ip, ports)
+                    if found:
+                        dc_results[h.ip] = found
+            if dc_results:
+                extra_findings["default_creds"] = dc_results
+        except Exception as e:
+            log.warning("default_creds failed: %s", e)
+
+    if smtp_audit and hosts:
+        if progress:
+            progress("SMTP audits (open relay + VRFY/EXPN)…")
+        try:
+            from .smtp_test import audit_smtp
+            smtp_results: dict = {}
+            for h in hosts:
+                for p in h.ports:
+                    if p.number in (25, 587, 465):
+                        r = audit_smtp(h.ip, p.number)
+                        if r:
+                            smtp_results.setdefault(h.ip, {})[p.number] = r
+            if smtp_results:
+                extra_findings["smtp_audit"] = smtp_results
+        except Exception as e:
+            log.warning("smtp_audit failed: %s", e)
+
+    if check_takeover and dns_info:
+        if progress:
+            progress("Subdomain takeover detection…")
+        try:
+            from .takeover import check_subdomains
+            subdomains = [s["name"] for s in dns_info.get("subdomains_found", [])]
+            if subdomains:
+                takeovers = check_subdomains(subdomains)
+                if takeovers:
+                    extra_findings["takeover"] = takeovers
+        except Exception as e:
+            log.warning("takeover check failed: %s", e)
+
+    if check_cloud and cloud_keyword:
+        if progress:
+            progress(f"Cloud asset discovery for '{cloud_keyword}'…")
+        try:
+            from .cloud_assets import discover_cloud_assets
+            cloud = discover_cloud_assets(cloud_keyword)
+            if cloud:
+                extra_findings["cloud_assets"] = cloud
+        except Exception as e:
+            log.warning("cloud asset discovery failed: %s", e)
+
+    if ad_enum_domain:
+        if progress:
+            progress(f"AD enumeration for {ad_enum_domain}…")
+        try:
+            from .ad_enum import run_ad_enum
+            extra_findings["ad_enum"] = run_ad_enum(ad_enum_domain)
+        except Exception as e:
+            log.warning("AD enum failed: %s", e)
+
+    if asrep_roast and ad_enum_domain:
+        if progress:
+            progress(f"AS-REP roasting for {ad_enum_domain}…")
+        try:
+            from .kerberoast import run_roast
+            extra_findings["asrep_roast"] = run_roast(ad_enum_domain)
+        except Exception as e:
+            log.warning("AS-REP roast failed: %s", e)
+
+    if honeypot_check and hosts:
+        if progress:
+            progress("Honeypot detection (Cowrie/Kippo/Dionaea/Conpot)…")
+        try:
+            from .honeypot import detect_honeypot_in_scan
+            scan_dict = {"hosts": [h.to_dict() for h in hosts]}
+            hp = detect_honeypot_in_scan(scan_dict)
+            if hp:
+                extra_findings["honeypot_indicators"] = hp
+        except Exception as e:
+            log.warning("honeypot detection failed: %s", e)
+
+    if prioritize_scores and hosts:
+        if progress:
+            progress("Computing prioritization scores…")
+        try:
+            from .prioritize import score_scan_result
+            scan_dict = {"hosts": [h.to_dict() for h in hosts]}
+            extra_findings["prioritization"] = score_scan_result(scan_dict)
+        except Exception as e:
+            log.warning("prioritization failed: %s", e)
+
     return ScanResult(
         target=target,
         started_at=started_iso,
@@ -698,4 +852,5 @@ def run_scan(
         dns_info=dns_info,
         osint_info=osint_info,
         netfabric_info=netfabric_info,
+        extra_findings=extra_findings or None,
     )

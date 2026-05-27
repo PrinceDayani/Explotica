@@ -130,6 +130,10 @@ class ScanResult:
     dns_info: Optional[dict] = None  # populated when target is a domain
     osint_info: Optional[dict] = None  # crt.sh + ASN + RDAP WHOIS
     netfabric_info: Optional[dict] = None  # DHCP discover + traceroute hops
+    # Generic catch-all for additional modules (honeypot detection,
+    # prioritization, AD enum, AS-REP roast, default creds, takeover,
+    # cloud assets, ICS, web security analysis, etc.)
+    extra_findings: Optional[dict] = None
 
     @staticmethod
     def now_iso() -> str:
@@ -146,6 +150,7 @@ class ScanResult:
             "dns_info": self.dns_info,
             "osint_info": self.osint_info,
             "netfabric_info": self.netfabric_info,
+            "extra_findings": self.extra_findings,
         }
 
     @classmethod
@@ -223,4 +228,5 @@ class ScanResult:
             dns_info=data.get("dns_info"),
             osint_info=data.get("osint_info"),
             netfabric_info=data.get("netfabric_info"),
+            extra_findings=data.get("extra_findings"),
         )

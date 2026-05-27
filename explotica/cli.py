@@ -365,6 +365,34 @@ def main(argv: list[str] | None = None) -> int:
                         "given JSON (or the one just written). Requires fastapi.")
     p.add_argument("--dashboard-port", type=int, default=8765,
                    help="Dashboard listen port (default 8765)")
+    # ── Phase 35: extra-finding modules ──────────────────────────────
+    p.add_argument("--honeypot-check", action="store_true",
+                   help="Detect honeypots (Cowrie/Kippo/Dionaea/Conpot) in scan results")
+    p.add_argument("--web-security", action="store_true",
+                   help="Audit JWT/CSP/cookies on captured HTTP responses")
+    p.add_argument("--ics", action="store_true",
+                   help="Probe industrial control protocols (Modbus/BACnet/DNP3/S7/EthIP)")
+    p.add_argument("--prioritize", action="store_true",
+                   help="Compute smart vuln prioritization scores (CVSS+EPSS+KEV+exploit+exposure)")
+    # ── Phase 35: active opt-in modules ──────────────────────────────
+    p.add_argument("--check-default-creds", action="store_true",
+                   help="Test default/anonymous creds on FTP/HTTP/Redis/Mongo/memcached/SNMP. "
+                        "One attempt per service — opt-in for account-lockout safety.")
+    p.add_argument("--check-takeover", action="store_true",
+                   help="Check discovered subdomains for takeover (S3/GitHub Pages/Heroku/etc.)")
+    p.add_argument("--check-cloud", metavar="KEYWORD",
+                   help="Discover S3/Azure/GCP buckets matching KEYWORD permutations")
+    p.add_argument("--ad-enum", metavar="DOMAIN",
+                   help="Active Directory enumeration: DC discovery + Kerberos user enum + "
+                        "BloodHound JSON export")
+    p.add_argument("--asrep-roast", action="store_true",
+                   help="AS-REP roast: extract hashcat-format hashes from users without "
+                        "preauth. Requires --ad-enum DOMAIN.")
+    p.add_argument("--smtp-audit", action="store_true",
+                   help="SMTP open-relay test + VRFY/EXPN user enum on port 25/587")
+    p.add_argument("--all-the-things", action="store_true",
+                   help="EVERYTHING — full-coverage + ALL active opt-in checks. "
+                        "Requires authorized engagement (account lockout / login attempts).")
     p.add_argument("--netfabric", action="store_true",
                    help="Network-fabric intel: DHCP DISCOVER broadcast + "
                         "traceroute hop discovery to live hosts.")
@@ -426,10 +454,53 @@ def main(argv: list[str] | None = None) -> int:
         args.osint = True
         args.netfabric = True
         args.async_io = True
+        # Passive-analysis modules (safe — operate on existing scan data)
+        args.honeypot_check = True
+        args.web_security = True
+        args.ics = True
+        args.prioritize = True
         # NOTE: --syn-scan deliberately NOT included in --full-coverage.
         # Per-packet L3 routing in scapy makes it slower than async TCP on
         # most LANs. Opt in explicitly via --syn-scan when you want it.
         args.aggressive = True
+
+    # --all-the-things turns on everything including active opt-in modules
+    if args.all_the_things:
+        args.full_coverage = True
+        # Re-run the full-coverage block to inherit all settings
+        args.vuln_scan = True
+        args.deep = True
+        args.use_nmap = True
+        args.use_searchsploit = True
+        args.rich_intel = True
+        args.epss_kev = True
+        args.unmask = True
+        args.udp_probe = True
+        args.web_crawl = True
+        args.shodan = True
+        args.ssh_enum = True
+        args.dns_enum = True
+        args.service_intel = True
+        args.http_audit = True
+        args.osint = True
+        args.netfabric = True
+        args.async_io = True
+        args.honeypot_check = True
+        args.web_security = True
+        args.ics = True
+        args.prioritize = True
+        args.aggressive = True
+        # PLUS active opt-in modules:
+        args.check_default_creds = True
+        args.check_takeover = True
+        args.smtp_audit = True
+        if args.ports == "top100":
+            args.ports = "top1000"
+        console.print(
+            "[bold red]⚠ --all-the-things:[/bold red] enabling ALL active "
+            "checks (default creds, takeover, SMTP audit). "
+            "ENSURE AUTHORIZED ENGAGEMENT."
+        )
         if args.ports == "top100":  # only override the default
             args.ports = "top1000"
         console.print(
@@ -678,6 +749,17 @@ def main(argv: list[str] | None = None) -> int:
                 netfabric_enabled=args.netfabric,
                 async_io=args.async_io,
                 syn_scan_enabled=args.syn_scan,
+                honeypot_check=args.honeypot_check,
+                web_security_check=args.web_security,
+                ics_check=args.ics,
+                prioritize_scores=args.prioritize,
+                check_default_creds=args.check_default_creds,
+                check_takeover=args.check_takeover,
+                check_cloud=bool(args.check_cloud),
+                cloud_keyword=args.check_cloud,
+                ad_enum_domain=args.ad_enum,
+                asrep_roast=args.asrep_roast,
+                smtp_audit=args.smtp_audit,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )
@@ -811,6 +893,77 @@ def main(argv: list[str] | None = None) -> int:
                 "vuln scripts. Also check `-v` output for banner patterns "
                 "we couldn't parse.[/dim]"
             )
+
+    # Extra findings summary
+    ef = result.extra_findings or {}
+    if ef:
+        console.print()
+        console.print("[bold]Extra findings:[/bold]")
+        if ef.get("ics"):
+            console.print(
+                f"  ⚠ [bold yellow]ICS protocols[/bold yellow] detected on "
+                f"{len(ef['ics'])} host(s)"
+            )
+        if ef.get("default_creds"):
+            for ip, found in ef["default_creds"].items():
+                for f in found:
+                    console.print(
+                        f"  💥 [bold red]Default creds[/bold red] {ip}: "
+                        f"{f['service']} ({f['credentials']}) — {f.get('severity')}"
+                    )
+        if ef.get("smtp_audit"):
+            for ip, ports in ef["smtp_audit"].items():
+                for port, audit in ports.items():
+                    rt = audit.get("relay_test", {})
+                    if rt.get("finding") == "OPEN_RELAY":
+                        console.print(
+                            f"  💥 [bold red]Open SMTP relay[/bold red] "
+                            f"{ip}:{port}"
+                        )
+        if ef.get("takeover"):
+            console.print(
+                f"  💥 [bold red]Subdomain takeover candidates:[/bold red] "
+                f"{len(ef['takeover'])}"
+            )
+            for t in ef["takeover"][:3]:
+                console.print(f"    {t['subdomain']} → {t['service']}")
+        if ef.get("cloud_assets"):
+            console.print(
+                f"  ☁ [bold]Cloud assets found:[/bold] {len(ef['cloud_assets'])}"
+            )
+        if ef.get("ad_enum"):
+            ade = ef["ad_enum"]
+            console.print(
+                f"  🏢 [bold]AD enum:[/bold] {len(ade.get('dcs', []))} DC(s), "
+                f"{len(ade.get('users_found', []))} user(s) confirmed, "
+                f"{len(ade.get('asreproastable', []))} AS-REP roastable"
+            )
+        if ef.get("asrep_roast"):
+            hashes = ef["asrep_roast"].get("asrep_hashes", [])
+            if hashes:
+                console.print(
+                    f"  🔥 [bold red]AS-REP HASHES EXTRACTED:[/bold red] "
+                    f"{len(hashes)} (crack with hashcat -m 18200)"
+                )
+        if ef.get("honeypot_indicators"):
+            console.print(
+                f"  🎭 Honeypot indicators on "
+                f"{len(ef['honeypot_indicators'])} host(s)"
+            )
+        if ef.get("web_security"):
+            issues = sum(len(items) for items in ef["web_security"].values())
+            console.print(
+                f"  🔓 [bold]Web security issues:[/bold] {issues} on "
+                f"{len(ef['web_security'])} host(s)"
+            )
+        if ef.get("prioritization"):
+            tp = ef["prioritization"]["top_priorities"]
+            if tp:
+                console.print(
+                    f"  📊 [bold]Top priority:[/bold] "
+                    f"{tp[0]['cve_id']} on {tp[0]['host_ip']} "
+                    f"(score {tp[0]['score']:.0f}/100, {tp[0]['bucket']})"
+                )
 
     if args.json:
         out = Path(args.json)
