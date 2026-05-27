@@ -127,25 +127,44 @@ class ExploticaShell(cmd.Cmd):
         t.add_column("Command", style="cyan")
         t.add_column("What it does")
         rows = [
-            ("scan <target> [opts]", "Run a fresh scan (e.g. `scan 192.168.1.0/24 --full-coverage --turbo`)"),
-            ("load <file.json>", "Load a previous scan from JSON into memory"),
-            ("save [<file.json>]", "Save current scan to JSON (uses last path if omitted)"),
-            ("status", "Show current loaded scan summary"),
-            ("hosts [--up-only] [--has-cves]", "List discovered hosts"),
-            ("host <ip>", "Show one host in detail (ports, CVEs, intel)"),
-            ("cves [--severity X] [--kev]", "List all CVEs, optionally filter"),
-            ("cve <CVE-ID>", "Show one CVE in detail + which hosts have it"),
-            ("ports [--service X]", "List all open ports across all hosts"),
-            ("port <num>", "Show every host with that port open"),
-            ("priorities", "Top 10 prioritized findings by smart score"),
-            ("compliance <cis|pci|hipaa>", "Run compliance evaluation"),
-            ("report html|pdf|md <file>", "Write a report"),
-            ("dashboard", "Launch web dashboard"),
-            ("tui", "Launch textual TUI"),
-            ("extra", "Show extra_findings (honeypot/AD/cloud/etc.)"),
-            ("clear", "Drop the loaded scan"),
-            ("history", "Show command history"),
-            ("quit / exit / q", "Leave the shell"),
+            ("─── Scan setup ───", ""),
+            ("scan <target> [opts]", "Fresh scan (e.g. `scan 192.168.1.0/24 --full-coverage --turbo`)"),
+            ("auto [opts]", "Auto-discover & scan all local subnets"),
+            ("wizard", "Guided setup wizard"),
+            ("listnet", "List local subnets without scanning"),
+            ("spider <cidr> [--depth N]", "Recursive subnet discovery (network spider)"),
+            ("load <file.json>", "Load previous scan"),
+            ("save [<file.json>]", "Save current scan"),
+            ("clear", "Drop loaded scan"),
+            ("─── Browse / query ───", ""),
+            ("status", "Current scan summary"),
+            ("hosts [--up-only] [--has-cves]", "List hosts"),
+            ("host <ip>", "Host detail"),
+            ("cves [--severity X] [--kev]", "List CVEs"),
+            ("cve <CVE-ID>", "CVE detail + affected hosts"),
+            ("ports [--service X]", "List all open ports"),
+            ("port <num>", "Hosts with that port open"),
+            ("priorities", "Top 10 by smart score"),
+            ("extra", "Show extra_findings"),
+            ("─── Active checks ───", ""),
+            ("ad <domain>", "Active Directory enumeration"),
+            ("asrep <domain>", "AS-REP roast hash extraction"),
+            ("sshcreds user:pass [--key F]", "Credentialed SSH scan"),
+            ("winrm user:pass", "Credentialed WinRM (Windows) scan"),
+            ("defaultcreds", "Test default creds against scan"),
+            ("verify", "Run verify probes (Heartbleed/MS17/etc.)"),
+            ("fuzz [--sqli-time]", "Active web fuzzing on HTTP services"),
+            ("takeover [sub1 sub2 …]", "Subdomain takeover check"),
+            ("cloud <keyword>", "Cloud asset discovery"),
+            ("smtp <host>", "SMTP open relay + VRFY/EXPN audit"),
+            ("─── Output / view ───", ""),
+            ("compliance <cis|pci|hipaa>", "Compliance evaluation"),
+            ("report html|pdf|md <file>", "Write report"),
+            ("dashboard", "Web dashboard"),
+            ("tui", "Textual TUI"),
+            ("plugins", "List loaded plugins"),
+            ("history", "Command history"),
+            ("quit / exit / q", "Leave"),
         ]
         for cmd_name, desc in rows:
             t.add_row(cmd_name, desc)
@@ -616,6 +635,307 @@ class ExploticaShell(cmd.Cmd):
                 console.print(f"  {i:3d}  {readline.get_history_item(i)}")
         except ImportError:
             console.print("[dim]readline not available[/dim]")
+        return False
+
+    # ────────────────────────────────────────────────────────────────────
+    # Module command surface — every major capability accessible from REPL
+    # ────────────────────────────────────────────────────────────────────
+
+    def do_wizard(self, arg: str) -> bool:
+        """Launch the interactive setup wizard from inside the shell."""
+        from .interactive import run_wizard
+        wiz_args = run_wizard()
+        if wiz_args:
+            self.do_scan(" ".join(wiz_args))
+        return False
+
+    def do_auto(self, arg: str) -> bool:
+        """Auto-discover all local subnets and scan each. `auto [extra flags]`"""
+        args = "--auto " + arg
+        self.do_scan(args.strip())
+        return False
+
+    def do_listnet(self, arg: str) -> bool:
+        """List discovered local subnets without scanning."""
+        try:
+            from .enumerate import list_subnets, format_summary
+            net = list_subnets()
+            console.print(format_summary(net))
+        except Exception as e:
+            console.print(f"[red]Failed:[/red] {e}")
+        return False
+
+    def do_spider(self, arg: str) -> bool:
+        """Recursive network spider: `spider <seed_cidr> [--depth N]`"""
+        parts = arg.split()
+        if not parts:
+            console.print("[red]Usage:[/red] spider <seed_cidr> [--depth N]")
+            return False
+        seed = parts[0]
+        depth = 2
+        for i, p in enumerate(parts):
+            if p == "--depth" and i + 1 < len(parts):
+                try:
+                    depth = int(parts[i + 1])
+                except ValueError:
+                    pass
+        from .network_spider import spider
+        console.print(f"[bold]Spidering[/bold] from [cyan]{seed}[/cyan] (depth={depth})…")
+        result = spider(seed, max_depth=depth,
+                          progress=lambda m: console.print(f"  [dim]·[/dim] {m}"))
+        console.print(Panel.fit(
+            f"Subnets found:  {result['subnet_count']}\n"
+            f"Routers found:  {result['router_count']}\n"
+            f"Depth reached:  {result['depth_reached']}",
+            title="Spider results", border_style="green",
+        ))
+        for s in result["subnets"]:
+            console.print(f"  📡 {s}")
+        for e in result["edges"]:
+            console.print(f"  🔗 {e['router']} routes to {e['subnet']}")
+        return False
+
+    def do_ad(self, arg: str) -> bool:
+        """Active Directory enumeration: `ad <domain>`"""
+        domain = arg.strip()
+        if not domain:
+            console.print("[red]Usage:[/red] ad <domain>")
+            return False
+        from .ad_enum import run_ad_enum
+        console.print(f"[bold]AD enum:[/bold] {domain}")
+        result = run_ad_enum(domain)
+        console.print(f"  DCs found: {len(result.get('dcs', []))}")
+        for dc in result.get("dcs", []):
+            console.print(f"    {dc.get('target')} (port {dc.get('port')})")
+        console.print(f"  Users confirmed: {len(result.get('users_found', []))}")
+        roastable = result.get("asreproastable", [])
+        if roastable:
+            console.print(f"  [bold red]AS-REP roastable:[/bold red] "
+                          f"{len(roastable)} (run `asrep {domain}` to extract)")
+            for u in roastable:
+                console.print(f"    {u['username']}")
+        return False
+
+    def do_asrep(self, arg: str) -> bool:
+        """AS-REP roast: `asrep <domain>` (extracts hashcat-format hashes)"""
+        domain = arg.strip()
+        if not domain:
+            console.print("[red]Usage:[/red] asrep <domain>")
+            return False
+        from .kerberoast import run_roast
+        result = run_roast(domain)
+        hashes = result.get("asrep_hashes", [])
+        if not hashes:
+            console.print("[dim]No AS-REP roastable accounts found.[/dim]")
+            return False
+        console.print(f"[bold red]🔥 {len(hashes)} hash(es) extracted![/bold red]")
+        for h in hashes:
+            console.print(f"\n  [bold cyan]{h['username']}@{domain}[/bold cyan] "
+                          f"(etype {h['etype_name']})")
+            console.print(f"  [dim]{h['hashcat_format'][:120]}…[/dim]")
+        console.print(f"\n[dim]Crack with: hashcat -m {hashes[0]['hashcat_mode']} <hashfile> <wordlist>[/dim]")
+        return False
+
+    def do_takeover(self, arg: str) -> bool:
+        """Check loaded scan's discovered subdomains for takeover."""
+        if not self._require_scan():
+            return False
+        from .takeover import check_subdomains
+        # Pull subdomains from the dns_info of the scan
+        di = self.scan_result.dns_info or {}
+        subs = [s["name"] for s in di.get("subdomains_found", [])]
+        if not subs:
+            arg_subs = arg.split()
+            if arg_subs:
+                subs = arg_subs
+        if not subs:
+            console.print("[yellow]No subdomains to check.[/yellow]")
+            console.print("  Either scan a domain first OR pass subdomains: takeover sub.example.com sub2.example.com")
+            return False
+        console.print(f"[bold]Checking {len(subs)} subdomain(s) for takeover…[/bold]")
+        findings = check_subdomains(subs)
+        if not findings:
+            console.print("[green]No takeover candidates found.[/green]")
+            return False
+        for f in findings:
+            console.print(f"  💥 [bold red]{f['subdomain']}[/bold red] → "
+                          f"{f['service']} ({f['severity']})")
+            console.print(f"     [dim]{f.get('note', '')}[/dim]")
+        return False
+
+    def do_cloud(self, arg: str) -> bool:
+        """Cloud asset discovery: `cloud <keyword>`"""
+        keyword = arg.strip()
+        if not keyword:
+            console.print("[red]Usage:[/red] cloud <keyword>")
+            console.print("[dim]Example: cloud mycompany — searches mycompany-prod, mycompany-backup, etc.[/dim]")
+            return False
+        from .cloud_assets import discover_cloud_assets
+        console.print(f"[bold]Discovering cloud assets for '{keyword}'…[/bold]")
+        findings = discover_cloud_assets(keyword)
+        if not findings:
+            console.print("[dim]No accessible cloud assets found.[/dim]")
+            return False
+        for f in findings:
+            console.print(f"  ☁ [bold]{f['provider']}[/bold] "
+                          f"[cyan]{f.get('bucket', f.get('account'))}[/cyan] "
+                          f"({f['status']}, {f['severity']})")
+            console.print(f"     [dim]{f.get('url', '')}[/dim]")
+        return False
+
+    def do_smtp(self, arg: str) -> bool:
+        """SMTP audit (open relay + VRFY/EXPN): `smtp <host>`"""
+        host = arg.strip()
+        if not host:
+            console.print("[red]Usage:[/red] smtp <host>")
+            return False
+        from .smtp_test import audit_smtp
+        console.print(f"[bold]SMTP audit:[/bold] {host}")
+        result = audit_smtp(host)
+        rt = result.get("relay_test", {})
+        if rt.get("finding") == "OPEN_RELAY":
+            console.print("[bold red]💥 OPEN RELAY[/bold red]")
+        else:
+            console.print(f"  Relay: {rt.get('finding', '?')}")
+        vrfy = result.get("vrfy_expn", {})
+        if vrfy.get("users_found"):
+            console.print(f"  Users enumerated: {len(vrfy['users_found'])}")
+            for u in vrfy["users_found"][:10]:
+                console.print(f"    {u['user']} ({u['via']})")
+        return False
+
+    def do_defaultcreds(self, arg: str) -> bool:
+        """Test default credentials against loaded scan's open services."""
+        if not self._require_scan():
+            return False
+        from .default_creds import check_host_defaults
+        console.print("[bold]Testing default credentials…[/bold]")
+        any_found = False
+        for h in self.scan_result.hosts:
+            ports = [p.number for p in h.ports]
+            findings = check_host_defaults(h.ip, ports)
+            for f in findings:
+                any_found = True
+                console.print(f"  💥 [bold red]{h.ip}[/bold red] "
+                              f"{f['service']}: {f['credentials']} "
+                              f"({f.get('severity')})")
+        if not any_found:
+            console.print("[green]No default credentials accepted.[/green]")
+        return False
+
+    def do_verify(self, arg: str) -> bool:
+        """Run verification probes (Heartbleed, MS17, Shellshock, etc.) on loaded scan."""
+        if not self._require_scan():
+            return False
+        from .verify_probes import verify_scan
+        from .verify_probes_v2 import verify_scan_v2
+        scan_dict = {"hosts": [h.to_dict() for h in self.scan_result.hosts]}
+        console.print("[bold]Running verify probes…[/bold]")
+        v1 = verify_scan(scan_dict)
+        v2 = verify_scan_v2(scan_dict)
+        all_findings = {**v1, **v2}
+        if not all_findings:
+            console.print("[green]No verified vulnerabilities found.[/green]")
+            return False
+        for ip, findings in all_findings.items():
+            for f in findings:
+                cve = f.get("cve", f.get("name", "?"))
+                console.print(f"  💥 [bold red]{ip}[/bold red] "
+                              f"{cve} - {f.get('name', '')} "
+                              f"({f.get('severity', 'INFO')})")
+                if f.get("note"):
+                    console.print(f"     [dim]{f['note']}[/dim]")
+        return False
+
+    def do_fuzz(self, arg: str) -> bool:
+        """Active web fuzzing on loaded scan's HTTP services."""
+        if not self._require_scan():
+            return False
+        from .web_fuzz import fuzz_scan
+        include_sqli = "--sqli-time" in arg
+        console.print("[bold]Web fuzzing…[/bold]")
+        scan_dict = {"hosts": [h.to_dict() for h in self.scan_result.hosts]}
+        results = fuzz_scan(scan_dict, include_sqli_time=include_sqli)
+        if not results:
+            console.print("[green]No web vulns found via fuzz.[/green]")
+            return False
+        for ip, findings in results.items():
+            for f in findings:
+                console.print(f"  💥 [bold red]{ip}:{f.get('port', '?')}[/bold red] "
+                              f"{f['vuln']} ({f['severity']})")
+                if f.get("evidence"):
+                    console.print(f"     [dim]{f['evidence'][:100]}[/dim]")
+        return False
+
+    def do_sshcreds(self, arg: str) -> bool:
+        """Credentialed SSH scan: `sshcreds user:password [--key keyfile]`"""
+        if not self._require_scan():
+            return False
+        if not arg.strip():
+            console.print("[red]Usage:[/red] sshcreds user:password [--key keyfile]")
+            return False
+        parts = arg.split()
+        creds_str = parts[0]
+        key = None
+        if "--key" in parts:
+            idx = parts.index("--key")
+            if idx + 1 < len(parts):
+                key = parts[idx + 1]
+        if ":" in creds_str:
+            user, pw = creds_str.split(":", 1)
+        else:
+            user, pw = creds_str, None
+        from .creds_scan import credentialed_scan_hosts
+        creds = {"username": user, "password": pw, "key_filename": key}
+        console.print(f"[bold]Credentialed SSH scan ({user}@…)[/bold]")
+        results = credentialed_scan_hosts(self.scan_result.hosts, creds)
+        for ip, data in results.items():
+            console.print(f"\n  [bold cyan]{ip}[/bold cyan]")
+            console.print(f"    Packages: {data.get('system_package_count', 0)}")
+            console.print(f"    CVEs found: {data.get('total_cves', 0)}")
+            for cve in data.get("cve_findings", [])[:5]:
+                console.print(f"      {cve['package']} {cve['version']}: "
+                              f"{cve['cve_count']} CVE(s)")
+        if not self.scan_result.extra_findings:
+            self.scan_result.extra_findings = {}
+        self.scan_result.extra_findings["credentialed"] = results
+        return False
+
+    def do_winrm(self, arg: str) -> bool:
+        """Credentialed WinRM scan: `winrm user:password`"""
+        if not self._require_scan():
+            return False
+        if not arg.strip():
+            console.print("[red]Usage:[/red] winrm user:password")
+            return False
+        creds_str = arg.split()[0]
+        if ":" in creds_str:
+            user, pw = creds_str.split(":", 1)
+        else:
+            user, pw = creds_str, ""
+        from .winrm_scan import winrm_scan_hosts
+        creds = {"username": user, "password": pw, "transport": "ntlm"}
+        console.print(f"[bold]Credentialed WinRM scan ({user}@…)[/bold]")
+        results = winrm_scan_hosts(self.scan_result.hosts, creds)
+        for ip, data in results.items():
+            console.print(f"\n  [bold cyan]{ip}[/bold cyan]")
+            console.print(f"    Products: {data.get('product_count', 0)}")
+            console.print(f"    Hotfixes: {data.get('hotfix_count', 0)}")
+            console.print(f"    CVEs: {data.get('total_cves', 0)}")
+        return False
+
+    def do_plugins(self, arg: str) -> bool:
+        """List discovered probe plugins."""
+        from .plugins import discover_plugins, all_probes, all_reports
+        loaded = discover_plugins()
+        probes = all_probes()
+        reports = all_reports()
+        console.print(f"[bold]Plugins loaded:[/bold] "
+                      f"{len(probes)} probe(s), {len(reports)} report(s)")
+        for p in probes:
+            console.print(f"  probe: {p.name} (ports: {p.ports})")
+        for r in reports:
+            console.print(f"  report: {r.name}")
         return False
 
     def do_quit(self, arg: str) -> bool:
