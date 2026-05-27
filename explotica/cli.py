@@ -426,7 +426,9 @@ def main(argv: list[str] | None = None) -> int:
         args.osint = True
         args.netfabric = True
         args.async_io = True
-        args.syn_scan = True
+        # NOTE: --syn-scan deliberately NOT included in --full-coverage.
+        # Per-packet L3 routing in scapy makes it slower than async TCP on
+        # most LANs. Opt in explicitly via --syn-scan when you want it.
         args.aggressive = True
         if args.ports == "top100":  # only override the default
             args.ports = "top1000"

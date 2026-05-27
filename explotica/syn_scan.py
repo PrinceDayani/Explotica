@@ -85,13 +85,27 @@ def syn_scan(targets: Iterable[str], ports: list[int], *,
     # responses if the OS thinks the port is in use.
     src_port_base = random.randint(20000, 60000)
 
-    # Send rate-limited
+    # Hard wall-clock cap. If we hit this, we stop sending and just collect
+    # whatever responses came back. Prevents the 25-minute-hang failure
+    # mode when MAC resolution is failing per-packet.
+    max_wall_s = max(30.0, 0.05 * len(targets) * len(ports))  # 0.05s/probe budget
+    start_wall = time.perf_counter()
+
     inter = 1.0 / rate_pps if rate_pps > 0 else 0
+    aborted_early = False
     for attempt in range(retries):
+        if aborted_early:
+            break
         for t in targets:
+            if time.perf_counter() - start_wall > max_wall_s:
+                log.warning("SYN scan: wall-clock budget exceeded (%.0fs), "
+                            "stopping sender", max_wall_s)
+                aborted_early = True
+                break
             for p in ports:
                 pkt = IP(dst=t) / TCP(sport=src_port_base, dport=p,
-                                       flags="S", seq=random.randint(0, 2**32 - 1))
+                                       flags="S",
+                                       seq=random.randint(0, 2**32 - 1))
                 try:
                     send(pkt, verbose=False)
                 except Exception as e:
@@ -99,8 +113,10 @@ def syn_scan(targets: Iterable[str], ports: list[int], *,
                 if inter:
                     time.sleep(inter)
 
-    # Give responses time to come back
-    time.sleep(timeout)
+    # Drain time (but capped — never wait longer than the budget remainder)
+    drain = min(timeout, max(1.0, max_wall_s
+                              - (time.perf_counter() - start_wall)))
+    time.sleep(drain)
     sniffer.stop()
 
     out = {ip: sorted(ports) for ip, ports in open_ports.items()}
