@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from .tui_config import config_path, load_actions
+
 log = logging.getLogger(__name__)
 
 
@@ -44,13 +46,21 @@ class ScanProcess:
     started_at: float
     status: str = "running"     # running / done / failed / killed
     ended_at: Optional[float] = None
-    error: Optional[str] = None
+    error: Optional[str] = None        # short one-line summary
+    stderr_full: str = ""              # full captured stderr
+    stdout_full: str = ""              # full captured stdout (often empty/banner)
+    exit_code: Optional[int] = None    # subprocess returncode (None on timeout/exc)
     json_out: Optional[str] = None  # path to temp JSON
 
     @property
     def elapsed(self) -> float:
         end = self.ended_at or time.time()
         return end - self.started_at
+
+    def short_error(self) -> str:
+        """One-line summary for the tracker."""
+        return self.error or (f"exit {self.exit_code}" if self.exit_code is not None
+                              else "failed")
 
 
 class WorkerPool:
@@ -83,6 +93,10 @@ class WorkerPool:
         try:
             result = subprocess.run(proc.cmd, capture_output=True,
                                      timeout=900, check=False)
+            # Always capture full stdout/stderr for diagnostics — even on success
+            proc.stdout_full = (result.stdout or b"").decode("utf-8", "ignore")
+            proc.stderr_full = (result.stderr or b"").decode("utf-8", "ignore")
+            proc.exit_code = result.returncode
             if result.returncode == 0 and proc.json_out and Path(proc.json_out).exists():
                 try:
                     new_data = json.loads(
@@ -99,19 +113,31 @@ class WorkerPool:
                     self.on_change()
             else:
                 proc.status = "failed"
-                proc.error = (result.stderr[:200].decode("utf-8", "ignore")
-                                if result.stderr else
-                                f"exit code {result.returncode}")
+                # Short one-liner for the tracker; full text stays in stderr_full
+                last_line = ""
+                if proc.stderr_full:
+                    for ln in reversed(proc.stderr_full.splitlines()):
+                        if ln.strip():
+                            last_line = ln.strip()
+                            break
+                proc.error = (last_line[:120] if last_line
+                              else f"exit code {result.returncode}")
                 proc.ended_at = time.time()
                 self.on_change()
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             proc.status = "failed"
             proc.error = "timeout (15min)"
+            # subprocess may have captured partial output before the timeout
+            if getattr(e, "stdout", None):
+                proc.stdout_full = e.stdout.decode("utf-8", "ignore") if isinstance(e.stdout, bytes) else str(e.stdout)
+            if getattr(e, "stderr", None):
+                proc.stderr_full = e.stderr.decode("utf-8", "ignore") if isinstance(e.stderr, bytes) else str(e.stderr)
             proc.ended_at = time.time()
             self.on_change()
         except Exception as e:
             proc.status = "failed"
             proc.error = str(e)
+            proc.stderr_full = f"{type(e).__name__}: {e}"
             proc.ended_at = time.time()
             self.on_change()
 
@@ -222,34 +248,33 @@ def run(scan_json_path: str) -> int:
         def on_input_submitted(self, event) -> None:
             self.dismiss(event.value)
 
-    # ── Modal: host action checklist ─────────────────────────────────────
-    # Available actions a user can trigger against a single host. Each is a
-    # tuple of (action_key, label, default_flags_for_explotica_cli).
-    HOST_ACTIONS = [
-        ("a", "🔥 Full re-scan (all the things)",
-         ["--ports", "top1000", "--all-the-things", "--turbo"]),
-        ("v", "✅ Verify probes (Heartbleed/MS17/Shellshock/+19)",
-         ["--ports", "top1000", "--verify-cves", "--verify-cves-v2",
-          "--no-arp"]),
-        ("d", "🔎 Deep scan (vuln + nmap + searchsploit)",
-         ["--ports", "top1000", "--vuln-scan", "--deep", "--use-nmap",
-          "--use-searchsploit", "--epss-kev", "--no-arp"]),
-        ("r", "🏷️ Rich intel only (TLS/HTTP/SMB)",
-         ["--ports", "top1000", "--rich-intel", "--deep", "--no-arp"]),
-        ("c", "🔓 Default credential check",
-         ["--ports", "top1000", "--check-default-creds", "--no-arp"]),
-        ("f", "💉 Web fuzz (path traversal/XSS/CRLF/SSRF)",
-         ["--ports", "top100", "--web-fuzz", "--no-arp"]),
-        ("p", "📊 Compute priorities (CVSS+EPSS+KEV)",
-         ["--from-json-merge", "--prioritize"]),
-        ("o", "🎯 OS fingerprint (deep)",
-         ["--ports", "top1000", "--os-fp-db", "--rich-intel", "--no-arp"]),
-        ("s", "🔍 Quick scan (top 100 ports only)",
-         ["--ports", "top100", "--vuln-scan", "--no-arp"]),
-        ("F", "🌐 Full-coverage everything",
-         ["--ports", "top1000", "--full-coverage", "--ultra", "--no-arp"]),
-        ("x", "⚙️ Custom flags…", None),  # special — prompts for flag string
-    ]
+    # ── Host actions ─ loaded from user-editable JSON config ────────────
+    # Source: ~/.config/explotica/actions.json (see tui_config.py).
+    # First run seeds defaults; user can edit/add/remove afterwards.
+    #
+    # Loaded as list of dicts: {"key", "label", "flags", "description"}.
+    # `flags = None` means "prompt for free-form flag string" (custom).
+    # Tokens of the form "{prompt:NAME}" inside flags get resolved at
+    # dispatch time — user is asked for each placeholder value.
+    try:
+        _RAW_HOST_ACTIONS = load_actions()
+    except Exception as _e:
+        log.warning("load_actions failed: %s — using empty list", _e)
+        _RAW_HOST_ACTIONS = []
+
+    # Normalize into the tuple form the existing modal code expects:
+    # (key, label, flags_or_None, description)
+    HOST_ACTIONS = []
+    for _a in _RAW_HOST_ACTIONS:
+        if not isinstance(_a, dict):
+            continue
+        _k = _a.get("key", "")
+        _lbl = _a.get("label", "?")
+        _flg = _a.get("flags")  # may be None for custom
+        _desc = _a.get("description", "")
+        if _k:
+            HOST_ACTIONS.append((_k, _lbl, _flg, _desc))
+    _HOST_ACTIONS_CFG_PATH = str(config_path())
 
     class HostActionModal(ModalScreen[tuple[str, list[str]]]):
         """Pops up when user activates a host. Lets them pick which scan
@@ -291,16 +316,55 @@ def run(scan_json_path: str) -> int:
                     id="action-subtitle",
                 )
                 with VerticalScroll(id="action-list"):
-                    for key, label, _flags in HOST_ACTIONS:
+                    if not HOST_ACTIONS:
                         yield Static(
-                            f"  [bold accent]{key}[/bold accent]  {label}",
+                            "[red]No actions configured.[/red]\n"
+                            f"[dim]Edit {_HOST_ACTIONS_CFG_PATH}[/dim]",
                             classes="action-row",
                         )
-                yield Label("[dim]Esc to cancel[/dim]", id="action-footer")
+                    for key, label, _flags, desc in HOST_ACTIONS:
+                        line = f"  [bold accent]{key}[/bold accent]  {label}"
+                        if desc:
+                            line += f"\n      [dim]{desc}[/dim]"
+                        yield Static(line, classes="action-row")
+                yield Label(
+                    f"[dim]Esc to cancel · config: {_HOST_ACTIONS_CFG_PATH}[/dim]",
+                    id="action-footer",
+                )
+
+        def _resolve_and_dismiss(self, label: str, flags: list[str]) -> None:
+            """Walk flags looking for {prompt:NAME} placeholders. For each one
+            push a CommandModal asking for the value, then substitute in-place.
+            When all placeholders are resolved, dismiss with the final flags."""
+            # Find next unresolved placeholder
+            idx = next(
+                (i for i, f in enumerate(flags)
+                 if isinstance(f, str) and f.startswith("{prompt:")
+                 and f.endswith("}")),
+                None,
+            )
+            if idx is None:
+                self.dismiss((label, flags))
+                return
+            name = flags[idx][len("{prompt:"):-1].strip() or "value"
+
+            def cb(answer: Optional[str]) -> None:
+                if answer is None:
+                    self.dismiss(None)
+                    return
+                flags[idx] = answer.strip()
+                # Recurse for the next placeholder
+                self._resolve_and_dismiss(label, flags)
+
+            self.app.push_screen(CommandModal(
+                f"Enter {name} for {label}",
+                f"value for {{prompt:{name}}}",
+                "",
+            ), cb)
 
         def on_key(self, event) -> None:
             ch = event.key
-            for k, label, flags in HOST_ACTIONS:
+            for k, label, flags, _desc in HOST_ACTIONS:
                 if ch == k:
                     if flags is None:
                         # Custom — push another modal asking for flags
@@ -315,7 +379,8 @@ def run(scan_json_path: str) -> int:
                             "--ports top1000 --vuln-scan --deep --no-arp",
                         ), cb)
                         return
-                    self.dismiss((label, list(flags)))
+                    # Resolve any {prompt:NAME} placeholders before dispatching
+                    self._resolve_and_dismiss(label, list(flags))
                     return
 
     # ── Modal: full scan setup screen ────────────────────────────────────
@@ -739,6 +804,10 @@ def run(scan_json_path: str) -> int:
 [b]Live process tracker (bottom-right)[/b]
   Shows every running/recent scan — IP, action, elapsed time, status.
   Multiple scans run concurrently in their own subprocesses.
+  [b]E[/b]      open last error (full stderr / command / exit code)
+  [b]click[/b]  on a failed entry → open ErrorModal for THAT scan
+  [b]Ctrl-L[/b] clear completed/failed entries
+  [b]G[/b]      show path to editable actions.json config
 
 [b]Global actions[/b]
   s    [b]s[/b]can — new full scan
@@ -762,6 +831,112 @@ def run(scan_json_path: str) -> int:
   q    [b]q[/b]uit
 """
             yield Static(help_text, id="help-box")
+
+    # ── Modal: failed-scan diagnostics ──────────────────────────────────
+    class ErrorModal(ModalScreen):
+        """Shows the full subprocess output for a failed (or completed) scan.
+
+        Displays: action label, target IP, joined command, exit code or
+        timeout reason, full stderr (scrollable), and full stdout if any.
+        """
+        CSS = """
+        ErrorModal { align: center middle; }
+        #err-box {
+            background: $surface; border: thick $error;
+            padding: 1 2; min-width: 90; max-width: 120;
+            max-height: 38;
+        }
+        #err-title { color: $error; text-style: bold; margin-bottom: 1; }
+        .err-section { color: $accent; text-style: bold; margin-top: 1; }
+        #err-stream {
+            background: $boost; padding: 0 1; margin-top: 1;
+            height: 22; overflow-y: auto;
+        }
+        .err-meta { color: $text; }
+        .err-cmd { color: #79c0ff; }
+        .err-stderr { color: #ff7b72; }
+        .err-stdout { color: #8b949e; }
+        Button { margin: 0 1; }
+        """
+        BINDINGS = [
+            Binding("escape,q", "dismiss", "Close"),
+            Binding("c", "copy_cmd", "Copy command", show=True),
+        ]
+
+        def __init__(self, proc: "ScanProcess"):
+            super().__init__()
+            self.proc = proc
+
+        def compose(self) -> ComposeResult:
+            p = self.proc
+            with VerticalScroll(id="err-box"):
+                title = (f"✗ {p.action}  on  {p.ip}"
+                         if p.status == "failed"
+                         else f"{p.status.upper()}: {p.action}  on  {p.ip}")
+                yield Label(title, id="err-title")
+
+                # Meta block (status, elapsed, exit code)
+                exit_str = (str(p.exit_code) if p.exit_code is not None
+                            else "n/a (timeout or exception)")
+                yield Static(
+                    f"[b]Status:[/b] {p.status}    "
+                    f"[b]Elapsed:[/b] {p.elapsed:.1f}s    "
+                    f"[b]Exit code:[/b] {exit_str}",
+                    classes="err-meta",
+                )
+                if p.error:
+                    yield Static(f"[b]Summary:[/b] [red]{p.error}[/red]",
+                                  classes="err-meta")
+
+                yield Label("COMMAND", classes="err-section")
+                # Shell-quote anything containing spaces for copy-paste friendliness
+                quoted = []
+                for tok in p.cmd:
+                    if " " in tok or "*" in tok or "?" in tok:
+                        quoted.append(f'"{tok}"')
+                    else:
+                        quoted.append(tok)
+                yield Static(" ".join(quoted), classes="err-cmd")
+
+                if p.stderr_full:
+                    yield Label("STDERR", classes="err-section")
+                    # Cap absurdly large blobs in the renderer to keep Textual happy
+                    txt = p.stderr_full
+                    if len(txt) > 32000:
+                        txt = txt[:32000] + "\n[…truncated, full text on disk only…]"
+                    yield Static(txt, classes="err-stderr")
+
+                if p.stdout_full.strip():
+                    yield Label("STDOUT", classes="err-section")
+                    txt = p.stdout_full
+                    if len(txt) > 32000:
+                        txt = txt[:32000] + "\n[…truncated…]"
+                    yield Static(txt, classes="err-stdout")
+
+                if not p.stderr_full and not p.stdout_full.strip():
+                    yield Static(
+                        "[dim](subprocess produced no output)[/dim]",
+                        classes="err-stderr",
+                    )
+
+                with Horizontal():
+                    yield Button("Close (Esc)", id="err-close",
+                                  variant="default")
+
+        def on_button_pressed(self, event) -> None:
+            if event.button.id == "err-close":
+                self.dismiss(None)
+
+        def action_copy_cmd(self) -> None:
+            """Copy the failing command to the system clipboard if possible."""
+            try:
+                import shlex
+                quoted = " ".join(shlex.quote(t) for t in self.proc.cmd)
+                # Textual has copy_to_clipboard on App
+                self.app.copy_to_clipboard(quoted)
+                self.app.notify("Command copied to clipboard", timeout=2)
+            except Exception as e:
+                self.app.notify(f"Copy failed: {e}", timeout=3)
 
     # ── Main app ─────────────────────────────────────────────────────────
     class ExploticaTUI(App):
@@ -825,7 +1000,7 @@ def run(scan_json_path: str) -> int:
             Binding("ctrl+p", "open_palette", "Palette", show=True),
             Binding("P", "open_palette", "Palette", show=False),
             Binding("l", "action_load", "Load"),
-            Binding("S", "action_save", "Save", show=False),
+            Binding("ctrl+s", "action_save", "Save", show=False),
             Binding("v", "action_verify", "Verify"),
             Binding("c", "action_sshcreds", "SSH creds"),
             Binding("W", "action_winrm", "WinRM", show=False),
@@ -840,6 +1015,10 @@ def run(scan_json_path: str) -> int:
             Binding("e", "action_extra", "Extra"),
             Binding("r", "action_report", "Report"),
             Binding("d", "action_dashboard", "Dashboard"),
+            # Diagnostics
+            Binding("E", "show_last_error", "Show error", show=True),
+            Binding("G", "edit_actions_cfg", "Edit actions", show=False),
+            Binding("ctrl+l", "clear_process_log", "Clear log", show=False),
             # Tab quick-keys
             Binding("1", "switch_tab('hosts')", "Hosts", show=False),
             Binding("2", "switch_tab('cves')", "CVEs", show=False),
@@ -944,11 +1123,15 @@ def run(scan_json_path: str) -> int:
                 f"[yellow]{active} running[/yellow] · "
                 f"[green]{done} done[/green] · "
                 f"[red]{failed} failed[/red]"
+                + (f"   [dim](press [b]E[/b] for last error · "
+                   f"Ctrl-L clears)[/dim]" if failed else "")
             ))
             if not procs:
                 pane.mount(Static("[dim]No scans running. "
                                     "Enter on a host to start one.[/dim]"))
                 return
+            # Index procs so click handler can find them by id
+            self._proc_by_widget_id: dict[str, ScanProcess] = {}
             # Most recent first, cap at 12
             for p in reversed(procs[-12:]):
                 if p.status == "running":
@@ -962,12 +1145,32 @@ def run(scan_json_path: str) -> int:
                 else:
                     cls = "proc-failed"
                     icon = "✗"
-                    tail = f"({p.error or 'failed'})"
+                    tail = f"({p.short_error()})"
+                hint = ""
+                if p.status == "failed" or p.stderr_full:
+                    hint = "  [dim](click for details)[/dim]"
+                widget_id = f"proc-{p.id}"
+                self._proc_by_widget_id[widget_id] = p
                 pane.mount(Static(
                     f"  {icon} [{cls}]{p.ip:<16}[/{cls}] "
-                    f"{p.action[:40]:<40} {tail}",
+                    f"{p.action[:40]:<40} {tail}{hint}",
                     classes=cls,
+                    id=widget_id,
                 ))
+
+        def on_click(self, event) -> None:
+            """Open ErrorModal when user clicks a process tracker entry."""
+            try:
+                widget = event.widget
+                wid = getattr(widget, "id", None) or ""
+                if wid.startswith("proc-"):
+                    by_id = getattr(self, "_proc_by_widget_id", {})
+                    p = by_id.get(wid)
+                    if p is not None and (p.status == "failed" or p.stderr_full):
+                        self.push_screen(ErrorModal(p))
+            except Exception:
+                # Don't let click handling crash the app
+                pass
 
         def on_mount(self) -> None:
             # Title (live stats)
@@ -1473,6 +1676,32 @@ def run(scan_json_path: str) -> int:
 
         def action_show_help(self) -> None:
             self.push_screen(HelpModal())
+
+        # ── Diagnostics ──────────────────────────────────────────────────
+        def action_show_last_error(self) -> None:
+            """Open ErrorModal for the most-recent failed/completed process."""
+            procs = self.pool.all_processes()
+            # Prefer the most recent failure; fall back to most recent overall
+            failed = [p for p in procs if p.status == "failed"]
+            target = failed[-1] if failed else (procs[-1] if procs else None)
+            if not target:
+                self.notify("No scans have run yet in this session.",
+                              timeout=3)
+                return
+            self.push_screen(ErrorModal(target))
+
+        def action_edit_actions_cfg(self) -> None:
+            """Tell the user where the actions.json file lives."""
+            self.notify(
+                f"Edit your actions at:  {_HOST_ACTIONS_CFG_PATH}  "
+                f"(restart TUI to pick up changes)",
+                timeout=8,
+            )
+
+        def action_clear_process_log(self) -> None:
+            """Clear completed/failed entries from the process tracker."""
+            self.pool.clear_completed()
+            self.notify("Process tracker cleared.", timeout=2)
 
         def action_open_setup(self) -> None:
             """Open the full ScanSetupScreen, then run the built argv."""
