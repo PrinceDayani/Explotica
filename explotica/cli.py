@@ -10,6 +10,8 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
+from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn,
+                            TimeElapsedColumn)
 from rich.table import Table
 from rich.text import Text
 
@@ -142,15 +144,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--use-nmap", action="store_true",
                    help="Run `nmap -sV --script vuln` per host and merge findings. "
                         "Requires `nmap` on PATH. Slow but thorough.")
-    p.add_argument("--nmap-timeout", type=int, default=180,
-                   help="Per-host nmap timeout in seconds (default: 180)")
+    p.add_argument("--auto-fallback", action="store_true",
+                   help="With --vuln-scan: auto-run nmap on ports whose banner "
+                        "couldn't be fingerprinted. Off by default because "
+                        "nmap is slow — opt in when you want maximum coverage.")
+    p.add_argument("--nmap-timeout", type=int, default=120,
+                   help="Per-host nmap timeout in seconds (default: 120)")
     p.add_argument("--workers", type=int, default=16,
                    help="Parallel host workers (default: 16)")
     p.add_argument("--aggressive", action="store_true",
-                   help="Crank parallelism: host workers 16 → 48, parallel banner "
-                        "and deep probes within each host. Faster but noisier.")
-    p.add_argument("--port-timeout", type=float, default=0.8)
-    p.add_argument("--banner-timeout", type=float, default=1.5)
+                   help="Crank parallelism: host workers 16 → 128, lower "
+                        "timeouts, parallel banner/deep probes. Faster but noisier.")
+    p.add_argument("--port-timeout", type=float, default=0.4,
+                   help="TCP connect timeout per port (default: 0.4s — LAN tuned)")
+    p.add_argument("--banner-timeout", type=float, default=1.0,
+                   help="Banner read timeout per port (default: 1.0s)")
     p.add_argument("--json", metavar="PATH",
                    help="Also write results as JSON to PATH")
     p.add_argument("--from-json", metavar="PATH",
@@ -167,11 +175,19 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
-    # Aggressive mode: bump host workers (other parallelism is per-host and
-    # already happens inside the scanner/banners modules).
-    if args.aggressive and args.workers <= 16:
-        args.workers = 48
-        console.print("[yellow]--aggressive: host workers bumped to 48[/yellow]")
+    # Aggressive mode: bump host workers + tighten timeouts.
+    if args.aggressive:
+        if args.workers <= 16:
+            args.workers = 128
+        if args.port_timeout >= 0.4:
+            args.port_timeout = 0.25
+        if args.banner_timeout >= 1.0:
+            args.banner_timeout = 0.7
+        console.print(
+            f"[yellow]--aggressive:[/yellow] workers={args.workers}, "
+            f"port_timeout={args.port_timeout}s, "
+            f"banner_timeout={args.banner_timeout}s"
+        )
 
     # ── --list-network: read-only enumeration, no scanning ───────────
     if args.list_network:
@@ -186,12 +202,27 @@ def main(argv: list[str] | None = None) -> int:
                       "or `--auto`.[/red]")
         return 2
 
-    status_line = ""
+    # Progress: when verbose, use a streaming log style so messages don't
+    # collide with INFO logs. Otherwise a single live status line.
+    progress_obj = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=None),
+        TimeElapsedColumn(),
+        TextColumn("{task.fields[detail]}"),
+        console=console,
+        transient=False,
+    )
+    progress_task = progress_obj.add_task(
+        "scanning", total=None, detail=""
+    )
+    progress_obj.start()
 
     def progress(msg: str) -> None:
-        nonlocal status_line
-        status_line = msg
-        console.print(f"  [dim]·[/dim] {msg}")
+        if args.verbose:
+            console.print(f"  [dim]·[/dim] {msg}")
+        else:
+            progress_obj.update(progress_task, detail=msg)
 
     # ── Branch 0: --auto — enumerate then scan each subnet ────────────
     if args.auto and not args.from_json:
@@ -308,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
                 vuln_scan=args.vuln_scan,
                 deep=args.deep,
                 use_nmap=args.use_nmap,
+                auto_fallback=args.auto_fallback,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )
@@ -322,7 +354,14 @@ def main(argv: list[str] | None = None) -> int:
                           "On Windows, ARP needs Administrator + Npcap installed.")
             return 1
 
-    show_vulns = args.vuln_scan or args.use_nmap or args.deep
+    # Stop the progress bar before printing the final table so they don't
+    # collide on the same TTY rows.
+    try:
+        progress_obj.stop()
+    except Exception:
+        pass
+
+    show_vulns = args.vuln_scan or args.use_nmap or args.deep or args.auto_fallback
     console.print(render_result(result, show_vulns=show_vulns))
 
     if show_vulns:

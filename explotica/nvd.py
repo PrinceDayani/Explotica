@@ -17,7 +17,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Semaphore
 from typing import Optional
 
 from .models import CVE
@@ -34,31 +34,43 @@ CACHE_DIR = Path(
 )
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Rate limiting — global mutex + sliding window for anonymous tier.
-_rate_lock = Lock()
-_recent_calls: list[float] = []
-_MAX_PER_WINDOW = 5
+# Rate limiting — semaphore lets multiple HTTPS calls be in-flight up to the
+# quota, instead of serializing them through a lock. The bookkeeping lock is
+# only held during quota math, not during the actual network call.
 _WINDOW = 30.0
-
-# Optional API key from env to lift rate limit.
+_MAX_PER_WINDOW = 5  # anonymous tier
 NVD_API_KEY = os.environ.get("NVD_API_KEY")
 if NVD_API_KEY:
     _MAX_PER_WINDOW = 50
 
+_quota = Semaphore(_MAX_PER_WINDOW)
+_book_lock = Lock()
+_call_history: list[float] = []  # timestamps of calls released back
 
-def _rate_limit() -> None:
-    """Block until we're under the rolling-window quota."""
-    with _rate_lock:
-        now = time.time()
-        global _recent_calls
-        _recent_calls = [t for t in _recent_calls if now - t < _WINDOW]
-        if len(_recent_calls) >= _MAX_PER_WINDOW:
-            wait = _WINDOW - (now - _recent_calls[0]) + 0.1
-            log.debug("NVD rate limit reached, sleeping %.1fs", wait)
-            time.sleep(max(0.0, wait))
-            now = time.time()
-            _recent_calls = [t for t in _recent_calls if now - t < _WINDOW]
-        _recent_calls.append(now)
+
+def _acquire_quota_slot() -> None:
+    """Block until a slot in the rolling window is free, then take it."""
+    _quota.acquire()  # blocks if all slots in use
+
+
+def _release_quota_slot() -> None:
+    """Schedule the slot to be released after WINDOW elapsed since the call.
+
+    Releasing immediately would allow burst-of-N then nothing for 30s. We
+    instead delay release so the *rolling* window holds.
+    """
+    def _delayed_release(ts: float) -> None:
+        # Sleep until WINDOW seconds have passed since the call started
+        elapsed = time.time() - ts
+        if elapsed < _WINDOW:
+            time.sleep(_WINDOW - elapsed)
+        _quota.release()
+
+    import threading as _t
+    ts = time.time()
+    with _book_lock:
+        _call_history.append(ts)
+    _t.Thread(target=_delayed_release, args=(ts,), daemon=True).start()
 
 
 def _cache_path(cpe: str) -> Path:
@@ -93,24 +105,32 @@ def _build_cpe(vendor: str, product: str, version: str) -> str:
 
 
 def _fetch(cpe: str, timeout: float = 8.0) -> Optional[dict]:
-    """One HTTP request to NVD. Returns parsed JSON or None on failure."""
-    _rate_limit()
-    params = urllib.parse.urlencode({"cpeName": cpe})
-    url = f"{NVD_URL}?{params}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "explotica/0.1 (network-recon-toolkit)",
-        **({"apiKey": NVD_API_KEY} if NVD_API_KEY else {}),
-    })
+    """One HTTP request to NVD. Returns parsed JSON or None on failure.
+
+    Concurrency: acquires a quota slot before the HTTP call, releases it
+    asynchronously after WINDOW elapsed. Multiple threads can be in-flight
+    simultaneously up to _MAX_PER_WINDOW.
+    """
+    _acquire_quota_slot()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            total = data.get("totalResults", 0)
-            log.info("NVD: %s → %d CVE(s)%s", cpe, total,
-                     "" if NVD_API_KEY else "  [no api key — rate limited]")
-            return data
-    except Exception as e:
-        log.warning("NVD fetch FAILED for %s: %s", cpe, e)
-        return None
+        params = urllib.parse.urlencode({"cpeName": cpe})
+        url = f"{NVD_URL}?{params}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "explotica/0.1 (network-recon-toolkit)",
+            **({"apiKey": NVD_API_KEY} if NVD_API_KEY else {}),
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                total = data.get("totalResults", 0)
+                log.info("NVD: %s → %d CVE(s)%s", cpe, total,
+                         "" if NVD_API_KEY else "  [no api key — rate limited]")
+                return data
+        except Exception as e:
+            log.warning("NVD fetch FAILED for %s: %s", cpe, e)
+            return None
+    finally:
+        _release_quota_slot()
 
 
 def _severity_from_score(score: float) -> str:

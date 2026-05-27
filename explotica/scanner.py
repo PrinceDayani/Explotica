@@ -106,13 +106,14 @@ def run_scan(
     use_arp: bool = True,
     ports: list[int] | None = None,
     discover_timeout: float = 2.0,
-    port_timeout: float = 0.8,
-    banner_timeout: float = 1.5,
+    port_timeout: float = 0.4,
+    banner_timeout: float = 1.0,
     host_workers: int = 16,
     skip_banners: bool = False,
     vuln_scan: bool = False,
     deep: bool = False,
     use_nmap: bool = False,
+    auto_fallback: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -145,10 +146,12 @@ def run_scan(
         log.warning("--use-nmap requested but `nmap` binary not on PATH; skipping.")
         use_nmap = False
 
-    # If --vuln-scan was requested and nmap is available, automatically use it
-    # as the fallback for ports we can't fingerprint from banners. This is
-    # what "scan all findings" means — every open port gets a CVE attempt.
-    auto_nmap_fallback = vuln_scan and nmap_available() and not use_nmap
+    # Auto-fallback is OPT-IN now (--auto-fallback flag). When enabled,
+    # ports without a parsed product/version get handed to nmap NSE. Disabled
+    # by default because nmap is slow and a /24 can spawn 60+ nmap processes.
+    auto_nmap_fallback = (
+        auto_fallback and vuln_scan and nmap_available() and not use_nmap
+    )
 
     def pipeline(h: Host) -> Host:
         try:
