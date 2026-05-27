@@ -41,7 +41,17 @@ def parse_ports(spec: str) -> list[int]:
     return out
 
 
-def render_result(result: ScanResult) -> Table:
+_SEVERITY_STYLE = {
+    "CRITICAL": "bold red",
+    "HIGH":     "red",
+    "MEDIUM":   "yellow",
+    "LOW":      "cyan",
+    "NONE":     "dim",
+    "UNKNOWN":  "dim",
+}
+
+
+def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
     table = Table(
         title=f"Explotica scan — {result.target}",
         caption=f"{len(result.hosts)} host(s) in {result.duration_s:.2f}s",
@@ -52,25 +62,51 @@ def render_result(result: ScanResult) -> Table:
     table.add_column("MAC", style="dim")
     table.add_column("Vendor")
     table.add_column("Open ports / services", overflow="fold")
+    if show_vulns:
+        table.add_column("Vulns (top CVEs)", overflow="fold")
 
     for host in sorted(result.hosts, key=lambda h: tuple(int(o) for o in h.ip.split("."))):
         ports_cell = Text()
+        vulns_cell = Text()
         for p in host.ports:
             label = f"{p.number}"
             if p.service:
                 label += f"/{p.service}"
             ports_cell.append(label + " ", style="bold green")
+            if p.product_name and p.product_version:
+                ports_cell.append(
+                    f"[{p.product_name} {p.product_version}] ", style="bold yellow"
+                )
             if p.banner:
                 ports_cell.append(f"({p.banner[:60]})\n", style="dim")
             else:
                 ports_cell.append("\n")
-        table.add_row(
+
+            if show_vulns:
+                if p.cves:
+                    # Top 3 CVEs per port, sorted by CVSS (already sorted by lookup)
+                    for cve in p.cves[:3]:
+                        style = _SEVERITY_STYLE.get(cve.severity, "white")
+                        score = f"{cve.cvss:.1f}" if cve.cvss is not None else "?"
+                        vulns_cell.append(
+                            f"{cve.id} ({cve.severity} {score}) @{p.number}\n",
+                            style=style,
+                        )
+                    if len(p.cves) > 3:
+                        vulns_cell.append(
+                            f"+{len(p.cves) - 3} more @{p.number}\n", style="dim"
+                        )
+
+        row = [
             host.ip,
             host.hostname or "-",
             host.mac or "-",
             host.vendor or "-",
             ports_cell or Text("-", style="dim"),
-        )
+        ]
+        if show_vulns:
+            row.append(vulns_cell or Text("-", style="dim"))
+        table.add_row(*row)
     return table
 
 
@@ -87,6 +123,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="Skip ARP (use ICMP sweep). Use for non-LAN targets.")
     p.add_argument("--no-banners", action="store_true",
                    help="Skip banner grabbing (faster).")
+    p.add_argument("--vuln-scan", action="store_true",
+                   help="Match service banners against the NVD CVE database. "
+                        "Adds network calls to nvd.nist.gov.")
     p.add_argument("--workers", type=int, default=16,
                    help="Parallel host workers (default: 16)")
     p.add_argument("--port-timeout", type=float, default=0.8)
@@ -129,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
             banner_timeout=args.banner_timeout,
             host_workers=args.workers,
             skip_banners=args.no_banners,
+            vuln_scan=args.vuln_scan,
             progress=progress,
         )
     except NotImplementedError as e:
@@ -142,7 +182,25 @@ def main(argv: list[str] | None = None) -> int:
                       "On Windows, ARP needs Administrator + Npcap installed.")
         return 1
 
-    console.print(render_result(result))
+    console.print(render_result(result, show_vulns=args.vuln_scan))
+
+    if args.vuln_scan:
+        # Quick severity summary across all hosts
+        sev_counts: dict[str, int] = {}
+        for h in result.hosts:
+            for p in h.ports:
+                for c in p.cves:
+                    sev_counts[c.severity] = sev_counts.get(c.severity, 0) + 1
+        if sev_counts:
+            parts = []
+            for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+                if sev_counts.get(sev):
+                    parts.append(f"[{_SEVERITY_STYLE[sev]}]"
+                                 f"{sev_counts[sev]} {sev}[/]")
+            console.print("[bold]CVE summary:[/bold] " + ", ".join(parts))
+        else:
+            console.print("[dim]No CVEs matched from banner data. "
+                          "Try --deep (coming) for active version probes.[/dim]")
 
     if args.json:
         out = Path(args.json)

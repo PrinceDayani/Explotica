@@ -30,7 +30,7 @@ def _http_probe(host: str, port: int, tls: bool, timeout: float) -> str | None:
         sock.sendall(req.encode())
         data = sock.recv(2048)
         sock.close()
-        return _clean(data)
+        return _clean_http(data)
     except (socket.timeout, OSError, ssl.SSLError):
         try:
             raw.close()
@@ -60,6 +60,35 @@ def _generic_probe(host: str, port: int, timeout: float) -> str | None:
         return _clean(data)
     except (socket.timeout, OSError):
         return None
+
+
+def _clean_http(data: bytes) -> str | None:
+    """For HTTP responses, keep the status line + Server/X-Powered-By headers.
+
+    This is critical for vuln matching: the version we care about lives in
+    `Server:` (e.g. 'Server: nginx/1.18.0'), not in the status line.
+    """
+    if not data:
+        return None
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        return _clean(data)
+    keep: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            if keep:  # blank line after headers — body starts, stop
+                break
+            continue
+        if line.startswith("HTTP/"):
+            keep.append(line)
+        elif line.lower().startswith(("server:", "x-powered-by:",
+                                       "x-aspnet-version:", "x-generator:")):
+            keep.append(line)
+        if len(keep) >= 4:
+            break
+    return " | ".join(keep)[:240] if keep else None
 
 
 def _clean(data: bytes) -> str | None:

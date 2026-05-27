@@ -8,15 +8,44 @@ from typing import Optional
 
 
 @dataclass
+class CVE:
+    """One vulnerability matched against a service version."""
+    id: str                         # e.g. CVE-2021-44228
+    severity: str = "UNKNOWN"       # CRITICAL / HIGH / MEDIUM / LOW / UNKNOWN
+    cvss: Optional[float] = None    # numeric base score, e.g. 9.8
+    summary: Optional[str] = None
+    published: Optional[str] = None
+    source: str = "NVD"             # NVD / nmap / manual
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class Port:
     number: int
     protocol: str = "tcp"
     state: str = "open"
     service: Optional[str] = None
     banner: Optional[str] = None
+    # Version + vuln data (populated by --vuln-scan / --deep / --use-nmap)
+    product_vendor: Optional[str] = None   # e.g. "proftpd"
+    product_name: Optional[str] = None     # e.g. "proftpd"
+    product_version: Optional[str] = None  # e.g. "1.3.6"
+    cves: list[CVE] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {
+            "number": self.number,
+            "protocol": self.protocol,
+            "state": self.state,
+            "service": self.service,
+            "banner": self.banner,
+            "product_vendor": self.product_vendor,
+            "product_name": self.product_name,
+            "product_version": self.product_version,
+            "cves": [c.to_dict() for c in self.cves],
+        }
 
 
 @dataclass

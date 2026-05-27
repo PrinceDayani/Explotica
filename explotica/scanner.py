@@ -18,6 +18,7 @@ from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
 from .models import Host, Port, ScanResult
 from .oui import lookup as oui_lookup
 from .ports import TOP_100_PORTS, scan_ports
+from .vulnscan import enrich_host as vuln_enrich_host
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ def run_scan(
     banner_timeout: float = 1.5,
     host_workers: int = 16,
     skip_banners: bool = False,
+    vuln_scan: bool = False,
     progress: ProgressCb = None,
 ) -> ScanResult:
     """Run a full scan and return a ScanResult.
@@ -129,6 +131,8 @@ def run_scan(
             _scan_host_ports(h, ports or [], port_timeout)
             if not skip_banners and h.ports:
                 _grab_host_banners(h, banner_timeout)
+            if vuln_scan and h.ports:
+                vuln_enrich_host(h)
         except Exception as e:  # one bad host shouldn't kill the scan
             log.warning("pipeline failed for %s: %s", h.ip, e)
         return h
