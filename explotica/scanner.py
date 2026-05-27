@@ -100,11 +100,56 @@ def run_scan(
 ) -> ScanResult:
     """Run a full scan and return a ScanResult.
 
-    TODO(you): Implement the orchestration. See requirements in the comment
-    block above. Use the _discover / _enrich / _scan_host_ports /
-    _grab_host_banners helpers.
+    Concurrency model: each host's enrich → port-scan → banner pipeline runs
+    sequentially within one worker thread; multiple hosts run in parallel.
+    Tunable via host_workers.
     """
-    raise NotImplementedError(
-        "run_scan() is intentionally left for you to implement — "
-        "see the comment block above scanner.run_scan in scanner.py"
+    started_iso = ScanResult.now_iso()
+    t0 = time.perf_counter()
+
+    # ── Phase 1: discovery ──────────────────────────────────────────────
+    hosts = _discover(target, use_arp, discover_timeout, progress)
+    if progress:
+        progress(f"Found {len(hosts)} live host(s); enriching…")
+
+    if not hosts:
+        return ScanResult(
+            target=target,
+            started_at=started_iso,
+            finished_at=ScanResult.now_iso(),
+            duration_s=round(time.perf_counter() - t0, 2),
+            hosts=[],
+            scanner_version=__version__,
+        )
+
+    # ── Phase 2: per-host pipeline (parallel across hosts) ──────────────
+    def pipeline(h: Host) -> Host:
+        try:
+            _enrich(h)
+            _scan_host_ports(h, ports or [], port_timeout)
+            if not skip_banners and h.ports:
+                _grab_host_banners(h, banner_timeout)
+        except Exception as e:  # one bad host shouldn't kill the scan
+            log.warning("pipeline failed for %s: %s", h.ip, e)
+        return h
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=host_workers) as pool:
+        futures = {pool.submit(pipeline, h): h for h in hosts}
+        for f in as_completed(futures):
+            completed += 1
+            h = f.result()
+            if progress:
+                progress(
+                    f"[{completed}/{len(hosts)}] {h.ip} "
+                    f"— {len(h.ports)} open port(s)"
+                )
+
+    return ScanResult(
+        target=target,
+        started_at=started_iso,
+        finished_at=ScanResult.now_iso(),
+        duration_s=round(time.perf_counter() - t0, 2),
+        hosts=hosts,
+        scanner_version=__version__,
     )
