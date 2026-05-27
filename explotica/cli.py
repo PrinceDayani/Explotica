@@ -36,6 +36,15 @@ def _parse_ssh_creds(creds_str: str, key_filename: str = None) -> dict:
         "key_filename": key_filename,
     }
 
+
+def _parse_winrm_creds(creds_str: str, transport: str = "ntlm") -> dict:
+    """Parse user:password for WinRM credentialed scan."""
+    if ":" in creds_str:
+        user, password = creds_str.split(":", 1)
+    else:
+        user, password = creds_str, ""
+    return {"username": user, "password": password, "transport": transport}
+
 console = Console()
 
 
@@ -414,6 +423,24 @@ def main(argv: list[str] | None = None) -> int:
                         "match against NVD. Format: user:pass (or user with --ssh-key)")
     p.add_argument("--ssh-key", metavar="KEYFILE",
                    help="SSH private key for credentialed scan (use with --ssh-creds USER)")
+    p.add_argument("--winrm-creds", metavar="USER:PASSWORD",
+                   help="Run credentialed WinRM scan on Windows hosts (5985/5986)")
+    p.add_argument("--winrm-transport", default="ntlm",
+                   choices=["ntlm", "kerberos", "basic", "ssl"],
+                   help="WinRM auth transport (default: ntlm)")
+    p.add_argument("--compliance", default=None,
+                   help="Comma-separated compliance frameworks to evaluate "
+                        "(cis,pci,hipaa). Default: none.")
+    p.add_argument("--verify-cves-v2", action="store_true",
+                   help="Extended verification probes (Citrix, Confluence, "
+                        "Spring4Shell, F5, ProxyLogon, GitLab, ConnectWise, "
+                        "TeamCity, Zoho, JBoss, Jenkins)")
+    p.add_argument("--web-fuzz", action="store_true",
+                   help="Active web fuzzing (path traversal, open redirect, "
+                        "CRLF, XSS reflection, SSRF hints). OPT-IN.")
+    p.add_argument("--sqli-time", action="store_true",
+                   help="Include time-based blind SQLi (adds 5s delay per param). "
+                        "Use with --web-fuzz.")
     p.add_argument("--all-the-things", action="store_true",
                    help="EVERYTHING — full-coverage + ALL active opt-in checks. "
                         "Requires authorized engagement (account lockout / login attempts).")
@@ -486,6 +513,10 @@ def main(argv: list[str] | None = None) -> int:
         # Phase 36-38: deep scanning side
         args.os_fp_db = True
         args.verify_cves = True
+        # Phase 39-42: deeper scan + verification + compliance
+        args.verify_cves_v2 = True
+        if args.compliance is None:
+            args.compliance = "cis"  # default to CIS Benchmarks
         # NOTE: --syn-scan deliberately NOT included in --full-coverage.
         # Per-packet L3 routing in scapy makes it slower than async TCP on
         # most LANs. Opt in explicitly via --syn-scan when you want it.
@@ -794,6 +825,15 @@ def main(argv: list[str] | None = None) -> int:
                 credentialed_scan_enabled=bool(args.ssh_creds),
                 ssh_credentials=_parse_ssh_creds(args.ssh_creds, args.ssh_key)
                                   if args.ssh_creds else None,
+                winrm_credentialed=bool(args.winrm_creds),
+                winrm_credentials=_parse_winrm_creds(args.winrm_creds,
+                                                      args.winrm_transport)
+                                    if args.winrm_creds else None,
+                compliance_frameworks=(args.compliance.split(",")
+                                       if args.compliance else None),
+                verify_cves_v2=args.verify_cves_v2,
+                web_fuzz_enabled=args.web_fuzz,
+                sqli_time_based=args.sqli_time,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )

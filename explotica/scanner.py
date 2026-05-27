@@ -383,6 +383,13 @@ def run_scan(
     verify_cve_probes: bool = False,
     credentialed_scan_enabled: bool = False,
     ssh_credentials: Optional[dict] = None,
+    # Phase 39-42
+    winrm_credentialed: bool = False,
+    winrm_credentials: Optional[dict] = None,
+    compliance_frameworks: Optional[list[str]] = None,
+    verify_cves_v2: bool = False,
+    web_fuzz_enabled: bool = False,
+    sqli_time_based: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -870,6 +877,41 @@ def run_scan(
         except Exception as e:
             log.warning("credentialed scan failed: %s", e)
 
+    if winrm_credentialed and winrm_credentials and hosts:
+        if progress:
+            progress("Credentialed WinRM scan (Windows hosts)…")
+        try:
+            from .winrm_scan import winrm_scan_hosts
+            winrm_results = winrm_scan_hosts(hosts, winrm_credentials)
+            if winrm_results:
+                extra_findings["winrm_credentialed"] = winrm_results
+        except Exception as e:
+            log.warning("WinRM scan failed: %s", e)
+
+    if verify_cves_v2 and hosts:
+        if progress:
+            progress("Extended verification probes (Citrix/Confluence/Spring4Shell/MOVEit/F5/…)")
+        try:
+            from .verify_probes_v2 import verify_scan_v2
+            scan_dict = {"hosts": [h.to_dict() for h in hosts]}
+            v2_results = verify_scan_v2(scan_dict)
+            if v2_results:
+                extra_findings["verified_cves_v2"] = v2_results
+        except Exception as e:
+            log.warning("v2 verify probes failed: %s", e)
+
+    if web_fuzz_enabled and hosts:
+        if progress:
+            progress("Active web fuzzing (SQLi/XSS/path-traversal/SSRF/CRLF)…")
+        try:
+            from .web_fuzz import fuzz_scan
+            scan_dict = {"hosts": [h.to_dict() for h in hosts]}
+            fuzz_results = fuzz_scan(scan_dict, include_sqli_time=sqli_time_based)
+            if fuzz_results:
+                extra_findings["web_fuzz"] = fuzz_results
+        except Exception as e:
+            log.warning("web fuzzing failed: %s", e)
+
     if prioritize_scores and hosts:
         if progress:
             progress("Computing prioritization scores…")
@@ -879,6 +921,24 @@ def run_scan(
             extra_findings["prioritization"] = score_scan_result(scan_dict)
         except Exception as e:
             log.warning("prioritization failed: %s", e)
+
+    if compliance_frameworks and hosts:
+        if progress:
+            progress(f"Compliance check: {', '.join(compliance_frameworks)}…")
+        try:
+            from .compliance import evaluate, ALL_FRAMEWORKS
+            scan_dict = {
+                "hosts": [h.to_dict() for h in hosts],
+                "extra_findings": extra_findings,
+            }
+            comp: dict = {}
+            for fw in compliance_frameworks:
+                if fw.lower() in ALL_FRAMEWORKS:
+                    comp[fw] = evaluate(scan_dict, framework=fw)
+            if comp:
+                extra_findings["compliance"] = comp
+        except Exception as e:
+            log.warning("compliance check failed: %s", e)
 
     return ScanResult(
         target=target,

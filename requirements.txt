@@ -15,3 +15,5 @@ playwright>=1.40.0
 weasyprint>=60.0
 # Optional — required for --ssh-creds credentialed scanning.
 paramiko>=3.0.0
+# Optional — required for --winrm-creds Windows credentialed scanning.
+pywinrm>=0.4.3
