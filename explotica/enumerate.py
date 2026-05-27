@@ -105,6 +105,67 @@ def _is_useful_subnet(cidr: ipaddress.IPv4Network) -> bool:
 # ── Public API ────────────────────────────────────────────────────────────
 
 
+def _route_entries_from_scapy(conf) -> list:
+    """Get route table from scapy, reinitializing if needed."""
+    # On some setups (especially when scapy logging was suppressed before
+    # init), conf.route is None or empty. Try to force a re-read.
+    if conf.route is None or not getattr(conf.route, "routes", None):
+        try:
+            from scapy.route import Route
+            conf.route = Route()
+        except Exception as e:
+            log.warning("scapy Route() init failed: %s", e)
+            return []
+    return getattr(conf.route, "routes", []) or []
+
+
+def _route_entries_from_shell() -> list:
+    """Fallback: parse `ip route` output for routing entries.
+
+    Returns list of tuples: (network_int, netmask_int, gateway_str, iface, output_ip, metric)
+    to match scapy's format.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["ip", "-4", "route"], capture_output=True,
+                              text=True, timeout=4)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    routes = []
+    for line in out.stdout.splitlines():
+        # Examples:
+        #   default via 192.168.1.1 dev eth0 ...
+        #   192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.42
+        parts = line.split()
+        if not parts:
+            continue
+        dest = parts[0]
+        gw = "0.0.0.0"
+        iface = ""
+        out_ip = ""
+        for i, tok in enumerate(parts):
+            if tok == "via" and i + 1 < len(parts):
+                gw = parts[i + 1]
+            elif tok == "dev" and i + 1 < len(parts):
+                iface = parts[i + 1]
+            elif tok == "src" and i + 1 < len(parts):
+                out_ip = parts[i + 1]
+        # Convert dest → (network_int, netmask_int)
+        try:
+            if dest == "default":
+                net = ipaddress.IPv4Network("0.0.0.0/0", strict=False)
+            else:
+                net = ipaddress.IPv4Network(dest, strict=False)
+        except (ValueError, ipaddress.AddressValueError):
+            continue
+        net_int = int(net.network_address)
+        mask_int = int(net.netmask)
+        routes.append((net_int, mask_int, gw, iface, out_ip, 0))
+    return routes
+
+
 def list_subnets(max_hosts_per_subnet: int = 4096) -> LocalNetwork:
     """Inspect the host's routing table and return all directly-reachable subnets.
 
@@ -112,13 +173,25 @@ def list_subnets(max_hosts_per_subnet: int = 4096) -> LocalNetwork:
       max_hosts_per_subnet: refuse subnets bigger than this (safety).
         Set high to allow /16, low to restrict to /20 and smaller.
     """
-    conf = _import_scapy_conf()
     net = LocalNetwork(hostname=socket.gethostname())
 
-    # scapy route format: list of tuples
-    # (network_int, netmask_int, gateway_str, iface_name, output_ip_str, metric_int)
+    # Try scapy first; fall back to `ip route` if it failed
+    route_entries: list = []
+    try:
+        conf = _import_scapy_conf()
+        route_entries = _route_entries_from_scapy(conf)
+    except Exception as e:
+        log.debug("scapy route lookup failed (%s) — falling back to shell", e)
+    if not route_entries:
+        log.info("Using `ip route` for subnet enumeration")
+        route_entries = _route_entries_from_shell()
+    if not route_entries:
+        log.warning("Could not read routing table from any source")
+        return net
+
+    # Route format: (network_int, netmask_int, gateway_str, iface, output_ip, metric)
     seen: set[str] = set()
-    for entry in conf.route.routes:
+    for entry in route_entries:
         try:
             net_int, mask_int, gw, iface, out_ip, metric = entry[:6]
         except (ValueError, TypeError):

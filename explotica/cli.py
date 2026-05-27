@@ -653,6 +653,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     progress_obj.start()
 
+    # Defensive cleanup: ensure the spinner stops even if everything below crashes
+    import atexit
+    def _cleanup_progress():
+        try:
+            progress_obj.stop()
+        except Exception:
+            pass
+    atexit.register(_cleanup_progress)
+
     def progress(msg: str) -> None:
         if args.verbose:
             console.print(f"  [dim]·[/dim] {msg}")
@@ -663,11 +672,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.auto and not args.from_json:
         from .enumerate import list_subnets, format_summary
         from .models import ScanResult
-        net = list_subnets(max_hosts_per_subnet=args.max_hosts_per_subnet)
+        try:
+            net = list_subnets(max_hosts_per_subnet=args.max_hosts_per_subnet)
+        except Exception as e:
+            progress_obj.stop()
+            console.print(f"[red]Could not enumerate local subnets:[/red] {e}")
+            console.print("[dim]Tip: pass an explicit target like 192.168.1.0/24 "
+                          "instead of --auto.[/dim]")
+            return 2
         console.print("[bold]Auto-discovered network position:[/bold]")
         console.print(format_summary(net))
         if not net.subnets:
+            progress_obj.stop()
             console.print("[red]No reachable subnets found to scan.[/red]")
+            console.print("[dim]Tip: pass an explicit target like 192.168.1.0/24 "
+                          "instead of --auto.[/dim]")
             return 2
 
         try:
