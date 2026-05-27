@@ -139,7 +139,7 @@ def run(scan_json_path: str) -> int:
 [b]Navigation[/b]
   Tab / Shift-Tab    Switch tabs
   j / k / ↑ / ↓      Move in lists
-  Enter              Select / drill-down
+  Enter              Drill-down on host
   /                  Filter / search
   Esc                Clear filter / close modal
 
@@ -147,8 +147,17 @@ def run(scan_json_path: str) -> int:
   1 Hosts            2 CVEs            3 Ports
   4 Exploits         5 Compliance      6 Extra
 
-[b]Actions[/b]
-  s    [b]s[/b]can — new scan
+[b]Selection & per-host actions (Hosts tab)[/b]
+  [b]space[/b]              toggle select on host under cursor
+  [b]*[/b] (Shift-8)        select all visible hosts
+  [b]n[/b]                  clear selection
+  [b]g[/b]                  configure custom scan flags for host under cursor
+  [b]R[/b]                  re-scan selected hosts (or host under cursor)
+                     — uses per-host config if set, else default flags
+  [b]B[/b]                  bulk action (alias for R)
+
+[b]Global actions[/b]
+  s    [b]s[/b]can — new full scan
   l    [b]l[/b]oad another JSON file
   S    [b]S[/b]ave current scan
   v    [b]v[/b]erify probes (Heartbleed/MS17/etc.)
@@ -204,6 +213,15 @@ def run(scan_json_path: str) -> int:
             Binding("?", "show_help", "Help"),
             Binding("/", "search", "Search"),
             Binding("escape", "clear_search", "Clear", show=False),
+            # Selection + per-host rescan (Phase 49)
+            Binding("space", "toggle_select", "Select", show=True),
+            Binding("R", "rescan", "Rescan host(s)", show=True),
+            Binding("g", "config_host", "Configure", show=True),
+            Binding("B", "bulk_action", "Bulk", show=False),
+            Binding("asterisk", "select_all", "Select all", show=False),
+            Binding("n", "clear_selection", "Clear sel.", show=False),
+            Binding("enter", "rescan_current", "Rescan this", show=False),
+            # Scan setup actions
             Binding("s", "action_scan", "Scan"),
             Binding("l", "action_load", "Load"),
             Binding("S", "action_save", "Save", show=False),
@@ -238,6 +256,9 @@ def run(scan_json_path: str) -> int:
             self.scan_path = scan_path
             self.hosts = sorted(scan_data.get("hosts", []), key=_ip_sort_key)
             self.current_host = None
+            # Per-host selection + custom-flag state
+            self.selected_hosts: set[str] = set()
+            self.per_host_config: dict[str, list[str]] = {}
 
         def compose(self) -> ComposeResult:
             yield Header(name=f"🛰️  Explotica  •  {self.scan_data.get('target', '?')}")
@@ -307,7 +328,8 @@ def run(scan_json_path: str) -> int:
         def _populate_hosts(self) -> None:
             t = self.host_table
             t.clear(columns=True)
-            t.add_columns("IP", "Hostname", "Vendor", "Ports", "CVEs", "Worst")
+            t.add_columns("Sel", "Cfg", "IP", "Hostname", "Vendor",
+                           "Ports", "CVEs", "Worst")
             q = self.filter_text.lower()
             for h in self.hosts:
                 if q:
@@ -324,7 +346,10 @@ def run(scan_json_path: str) -> int:
                 ports = h.get("ports", [])
                 cves = sum(len(p.get("cves", [])) for p in ports)
                 worst_text = f"[{color}]{sev.upper()}[/{color}]" if sev != "none" else "-"
+                sel_mark = "[green]✓[/green]" if h["ip"] in self.selected_hosts else " "
+                cfg_mark = "[yellow]⚙[/yellow]" if h["ip"] in self.per_host_config else " "
                 t.add_row(
+                    sel_mark, cfg_mark,
                     f"[cyan]{h['ip']}[/cyan]",
                     (h.get("hostname") or "-")[:24],
                     (h.get("vendor") or "-")[:18],
@@ -452,9 +477,17 @@ def run(scan_json_path: str) -> int:
         def _update_status(self) -> None:
             try:
                 status = self.query_one("#status-bar", Static)
+                sel = len(self.selected_hosts)
+                cfg = len(self.per_host_config)
+                sel_str = (f"[green]{sel} selected[/green] · " if sel
+                            else "")
+                cfg_str = (f"[yellow]{cfg} custom-cfg[/yellow] · " if cfg
+                            else "")
                 status.update(
-                    f"[dim]Source: {self.scan_path} · "
-                    f"Press [b]?[/b] for help, [b]q[/b] to quit, [b]/[/b] to search[/dim]"
+                    f"[dim]{sel_str}{cfg_str}"
+                    f"Source: {self.scan_path} · "
+                    f"[b]space[/b] select  [b]R[/b] rescan  [b]g[/b] config  "
+                    f"[b]?[/b] help  [b]q[/b] quit[/dim]"
                 )
             except Exception:
                 pass
@@ -766,6 +799,218 @@ def run(scan_json_path: str) -> int:
 
         def action_show_help(self) -> None:
             self.push_screen(HelpModal())
+
+        # ── Phase 49: selection + per-host rescan ────────────────────────
+        def _current_row_ip(self) -> Optional[str]:
+            """Return the IP under the cursor in the host table, or None."""
+            try:
+                row_key = self.host_table.coordinate_to_cell_key(
+                    self.host_table.cursor_coordinate
+                ).row_key
+                return str(row_key.value)
+            except Exception:
+                return None
+
+        def action_toggle_select(self) -> None:
+            ip = self._current_row_ip()
+            if not ip:
+                return
+            if ip in self.selected_hosts:
+                self.selected_hosts.discard(ip)
+            else:
+                self.selected_hosts.add(ip)
+            # Repopulate keeping cursor position
+            cur = self.host_table.cursor_coordinate
+            self._populate_hosts()
+            try:
+                self.host_table.cursor_coordinate = cur
+            except Exception:
+                pass
+            self._update_status()
+
+        def action_select_all(self) -> None:
+            q = self.filter_text.lower()
+            for h in self.hosts:
+                if q:
+                    hay = (h["ip"] + " " + (h.get("hostname") or "")).lower()
+                    if q not in hay:
+                        continue
+                self.selected_hosts.add(h["ip"])
+            self._populate_hosts()
+            self._update_status()
+            self.notify(f"Selected {len(self.selected_hosts)} host(s)", timeout=2)
+
+        def action_clear_selection(self) -> None:
+            self.selected_hosts.clear()
+            self._populate_hosts()
+            self._update_status()
+
+        def action_config_host(self) -> None:
+            """Set custom scan flags for the host under cursor."""
+            ip = self._current_row_ip()
+            if not ip:
+                self.notify("No host selected.", timeout=2)
+                return
+            current = " ".join(self.per_host_config.get(ip, []))
+
+            def callback(flags: Optional[str]) -> None:
+                if flags is None:
+                    return
+                if flags.strip():
+                    self.per_host_config[ip] = flags.split()
+                    self.notify(f"Saved config for {ip}: {flags[:60]}",
+                                  timeout=3)
+                else:
+                    self.per_host_config.pop(ip, None)
+                    self.notify(f"Cleared config for {ip}", timeout=2)
+                self._populate_hosts()
+                self._update_status()
+
+            self.push_screen(CommandModal(
+                f"⚙ Configure scan flags for {ip}",
+                "e.g. --ports top1000 --vuln-scan --deep --verify-cves",
+                current or "--ports top1000 --vuln-scan --deep --verify-cves",
+            ), callback)
+
+        def action_rescan_current(self) -> None:
+            """Enter key — rescan host under cursor (or open detail if none selected)."""
+            ip = self._current_row_ip()
+            if not ip:
+                return
+            # If multi-selection active, R behavior; otherwise just show detail
+            if self.selected_hosts:
+                self.action_rescan()
+            else:
+                # Show host detail (already happens on row click)
+                host = next((h for h in self.hosts if h["ip"] == ip), None)
+                if host:
+                    self._show_host_detail(host)
+
+        def action_rescan(self) -> None:
+            """Re-scan selected hosts (or host under cursor if no selection)."""
+            if self.selected_hosts:
+                ips = sorted(self.selected_hosts, key=lambda x: tuple(int(o) for o in x.split(".")))
+            else:
+                ip = self._current_row_ip()
+                if not ip:
+                    self.notify("No host to rescan.", timeout=2)
+                    return
+                ips = [ip]
+
+            def confirm_callback(answer: Optional[str]) -> None:
+                if not answer or answer.strip().lower() not in ("y", "yes", ""):
+                    return
+                self._rescan_hosts(ips)
+
+            target_desc = f"{len(ips)} host(s)" if len(ips) > 1 else ips[0]
+            self.push_screen(CommandModal(
+                f"🔄 Re-scan {target_desc}?  (per-host configs will be used "
+                "where set; otherwise default flags)",
+                "press Enter to confirm, Esc to cancel",
+                "y"
+            ), confirm_callback)
+
+        def action_bulk_action(self) -> None:
+            """Alias for rescan against multiple selected hosts."""
+            self.action_rescan()
+
+        DEFAULT_RESCAN_FLAGS = [
+            "--ports", "top1000",
+            "--vuln-scan", "--deep", "--epss-kev",
+            "--rich-intel", "--use-searchsploit",
+            "--no-arp",  # we already know the host is alive
+        ]
+
+        def _rescan_hosts(self, ips: list[str]) -> None:
+            """Background worker: rescan each IP (using per-host config or defaults),
+            merge results back into self.scan_data, write JSON, refresh tables."""
+            import tempfile
+
+            self.notify(f"Rescanning {len(ips)} host(s)…", timeout=3)
+
+            def worker():
+                for i, ip in enumerate(ips, 1):
+                    flags = self.per_host_config.get(ip, self.DEFAULT_RESCAN_FLAGS)
+                    self.call_from_thread(
+                        self.notify,
+                        f"[{i}/{len(ips)}] scanning {ip} with "
+                        f"{' '.join(flags[:6])}…", timeout=4
+                    )
+                    with tempfile.NamedTemporaryFile(suffix=".json",
+                                                       delete=False) as tmp:
+                        tmp_path = tmp.name
+                    cmd = ([sys.executable, "-m", "explotica", ip]
+                            + list(flags)
+                            + ["--json", tmp_path])
+                    # Ensure --no-arp is in flags for single-host scans
+                    if "--no-arp" not in cmd and "/" not in ip:
+                        cmd.append("--no-arp")
+                    try:
+                        proc = subprocess.run(cmd, capture_output=True,
+                                                timeout=600, check=False)
+                        if Path(tmp_path).exists():
+                            new_data = json.loads(
+                                Path(tmp_path).read_text(encoding="utf-8")
+                            )
+                            self.call_from_thread(self._merge_rescan_result,
+                                                    new_data)
+                        else:
+                            self.call_from_thread(
+                                self.notify,
+                                f"{ip} rescan: no output. stderr={proc.stderr[:100].decode('utf-8', 'ignore')}",
+                                timeout=4
+                            )
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except subprocess.TimeoutExpired:
+                        self.call_from_thread(
+                            self.notify, f"{ip} rescan timed out", timeout=4
+                        )
+                    except Exception as e:
+                        self.call_from_thread(
+                            self.notify, f"{ip} rescan failed: {e}", timeout=4
+                        )
+                # All done — persist + refresh
+                self.call_from_thread(self._save_scan)
+                self.call_from_thread(self._populate_hosts)
+                self.call_from_thread(self._populate_cves)
+                self.call_from_thread(self._populate_ports)
+                self.call_from_thread(self._populate_exploits)
+                self.call_from_thread(self._populate_extra)
+                self.call_from_thread(
+                    self.notify, f"Rescan of {len(ips)} host(s) complete.",
+                    timeout=4
+                )
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _merge_rescan_result(self, new_scan: dict) -> None:
+            """Merge a fresh scan's hosts into self.scan_data."""
+            new_hosts_by_ip = {h["ip"]: h for h in new_scan.get("hosts", [])}
+            if not new_hosts_by_ip:
+                return
+            updated = []
+            seen = set()
+            for h in self.scan_data.get("hosts", []):
+                if h["ip"] in new_hosts_by_ip:
+                    updated.append(new_hosts_by_ip[h["ip"]])
+                    seen.add(h["ip"])
+                else:
+                    updated.append(h)
+            for ip, h in new_hosts_by_ip.items():
+                if ip not in seen:
+                    updated.append(h)
+            self.scan_data["hosts"] = updated
+            self.hosts = sorted(updated, key=_ip_sort_key)
+
+        def _save_scan(self) -> None:
+            """Persist self.scan_data to self.scan_path."""
+            try:
+                Path(self.scan_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(self.scan_path).write_text(
+                    json.dumps(self.scan_data, indent=2), encoding="utf-8"
+                )
+            except Exception as e:
+                self.notify(f"Save failed: {e}", timeout=3)
 
     app = ExploticaTUI(scan, scan_json_path)
     app.run()
