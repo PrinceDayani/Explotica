@@ -3,3 +3,6 @@ rich>=13.7.0
 # Optional but recommended on Linux/macOS — 2-4× faster asyncio event loop.
 # Not available on Windows. The --async-io flag still works without it.
 uvloop>=0.19.0; sys_platform != "win32"
+# Optional — required only for the --dashboard web UI.
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0

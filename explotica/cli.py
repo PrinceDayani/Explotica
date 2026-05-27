@@ -356,6 +356,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="Use asyncio (with uvloop if available) for the "
                         "port-scan + banner-grab phase. 20-40x more concurrent "
                         "connections than the thread-based default.")
+    p.add_argument("--syn-scan", action="store_true",
+                   help="Use stateless raw-socket SYN scanning (masscan-class). "
+                        "Requires root + scapy. Falls back to TCP connect on "
+                        "unavailable.")
+    p.add_argument("--dashboard", metavar="PATH",
+                   help="After scanning, launch the web dashboard serving the "
+                        "given JSON (or the one just written). Requires fastapi.")
+    p.add_argument("--dashboard-port", type=int, default=8765,
+                   help="Dashboard listen port (default 8765)")
     p.add_argument("--netfabric", action="store_true",
                    help="Network-fabric intel: DHCP DISCOVER broadcast + "
                         "traceroute hop discovery to live hosts.")
@@ -417,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         args.osint = True
         args.netfabric = True
         args.async_io = True
+        args.syn_scan = True
         args.aggressive = True
         if args.ports == "top100":  # only override the default
             args.ports = "top1000"
@@ -556,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
                     osint_enabled=args.osint,
                     netfabric_enabled=args.netfabric,
                     async_io=args.async_io,
+                    syn_scan_enabled=args.syn_scan,
                     nmap_timeout=args.nmap_timeout,
                     progress=progress,
                 )
@@ -664,6 +675,7 @@ def main(argv: list[str] | None = None) -> int:
                 osint_enabled=args.osint,
                 netfabric_enabled=args.netfabric,
                 async_io=args.async_io,
+                syn_scan_enabled=args.syn_scan,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )
@@ -808,6 +820,31 @@ def main(argv: list[str] | None = None) -> int:
         from .report import write_report
         out = write_report(result, args.report_html)
         console.print(f"[green]✓[/green] HTML report at [cyan]{out}[/cyan]")
+
+    # ── Optional dashboard launch ───────────────────────────────────────
+    if args.dashboard is not None:
+        from .dashboard import serve, fastapi_available
+        if not fastapi_available():
+            console.print(
+                "[yellow]--dashboard requested but fastapi/uvicorn not "
+                "installed. Run: pip install fastapi uvicorn[/yellow]"
+            )
+            return 0
+        # Use the path the user gave us OR the JSON we just wrote
+        dash_json = args.dashboard if args.dashboard else args.json
+        if not dash_json:
+            console.print(
+                "[yellow]--dashboard needs a path: either pass one to "
+                "--dashboard or use --json to write one first.[/yellow]"
+            )
+            return 0
+        if not Path(dash_json).exists():
+            console.print(f"[red]Dashboard JSON not found: {dash_json}[/red]")
+            return 1
+        try:
+            serve(dash_json, host="127.0.0.1", port=args.dashboard_port)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Dashboard stopped.[/dim]")
 
     return 0
 

@@ -106,8 +106,25 @@ def parse_banner(banner: Optional[str]) -> Optional[tuple[str, str, str]]:
 
 
 def enrich_port(ip: str, port: Port) -> Port:
-    """Fill in product/version/cves on a Port if banner can be parsed."""
+    """Fill in product/version/cves on a Port. Tries:
+       1. Original regex set (banner parser)
+       2. Service fingerprint DB (port + response → service)
+    """
     match = parse_banner(port.banner)
+    if not match:
+        # Fallback: try the new fingerprint DB
+        try:
+            from .service_fp_db import match_response
+            banner_bytes = (port.banner or "").encode("utf-8", "ignore")
+            fp = match_response(port.number, banner_bytes)
+            if fp and fp.get("vendor") and fp.get("product"):
+                match = (fp["vendor"], fp["product"], fp.get("version") or "")
+                log.info("vulnscan %s:%d — matched via fp_db: %s/%s/%s",
+                         ip, port.number, fp["vendor"], fp["product"],
+                         fp.get("version"))
+        except Exception as e:
+            log.debug("fp_db lookup failed for %s:%d: %s",
+                      ip, port.number, e)
     if not match:
         log.debug("vulnscan %s:%d — no banner pattern matched (%s)",
                   ip, port.number, (port.banner or "")[:80])

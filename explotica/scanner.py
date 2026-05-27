@@ -31,8 +31,10 @@ from .searchsploit_wrap import (enrich_host_with_exploits,
 from .service_probes_v2 import (probe_service, probe_udp_ntp,
                                  SERVICE_PROBES)
 from .shodan_lite import enrich_hosts_with_shodan
+from .service_fp_db import match_response as fpdb_match
 from .smb_scan import scan_smb
 from .ssh_enum import enum_ssh
+from .syn_scan import syn_scan, syn_scan_available
 from .tls_scan import scan_tls
 from .udp_probes import probe_all_udp
 from .web_crawler import crawl as web_crawl
@@ -358,6 +360,7 @@ def run_scan(
     osint_enabled: bool = False,
     netfabric_enabled: bool = False,
     async_io: bool = False,
+    syn_scan_enabled: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -385,6 +388,43 @@ def run_scan(
             scanner_version=__version__,
         )
 
+    # ── Phase 2-pre: stateless SYN scan (when --syn-scan and we can) ────
+    syn_results: dict[str, list[int]] = {}
+    if syn_scan_enabled and hosts and ports:
+        if syn_scan_available():
+            if progress:
+                progress(f"stateless SYN scan: {len(hosts)} hosts × {len(ports)} ports…")
+            try:
+                syn_results = syn_scan(
+                    [h.ip for h in hosts], ports,
+                    timeout=4.0,
+                    rate_pps=5000 if host_workers >= 128 else 2000,
+                    retries=1,
+                )
+                if syn_results:
+                    from .models import Port
+                    from .ports import COMMON_SERVICE_NAMES
+                    for h in hosts:
+                        open_ports = syn_results.get(h.ip, [])
+                        h.ports = [
+                            Port(
+                                number=p,
+                                protocol="tcp",
+                                state="open",
+                                service=COMMON_SERVICE_NAMES.get(p),
+                            )
+                            for p in open_ports
+                        ]
+                    if progress:
+                        total = sum(len(h.ports) for h in hosts)
+                        progress(f"SYN scan found {total} open port(s)")
+            except Exception as e:
+                log.warning("SYN scan failed (%s) — falling back to TCP connect", e)
+                syn_results = {}
+        else:
+            log.warning("--syn-scan requested but raw sockets unavailable "
+                        "(need root + scapy). Falling back to TCP connect.")
+
     # ── Phase 2a: async I/O port + banner pre-pass (when --async-io) ─────
     # Single event loop scans ALL hosts × ALL ports + banners in one go.
     # The thread-based per-host pipeline below then skips port_scan +
@@ -396,8 +436,14 @@ def run_scan(
                      "one event loop…")
         try:
             from .models import Port
+            # If SYN already found open ports, scan only those (faster banner phase)
+            if syn_results:
+                # Build per-host port list = SYN's findings (skip closed)
+                ports_to_use = ports  # async scan will validate
+            else:
+                ports_to_use = ports
             async_results = run_async_scan(
-                [h.ip for h in hosts], ports,
+                [h.ip for h in hosts], ports_to_use,
                 use_uvloop=True,
                 port_timeout=port_timeout,
                 banner_timeout=banner_timeout if not skip_banners else 0,
@@ -405,10 +451,16 @@ def run_scan(
                 host_concurrency=min(host_workers * 2, 64),
                 port_concurrency=2000 if host_workers >= 128 else 1000,
             )
-            # Populate Host.ports from the async results
+            # Populate Host.ports from the async results — merge with SYN if present
             from .ports import COMMON_SERVICE_NAMES
             for h in hosts:
                 open_ports, banners = async_results.get(h.ip, ([], {}))
+                # Union with SYN-found ports (in case async missed some)
+                if syn_results:
+                    syn_ports = set(syn_results.get(h.ip, []))
+                    all_open = sorted(set(open_ports) | syn_ports)
+                else:
+                    all_open = open_ports
                 h.ports = [
                     Port(
                         number=p,
@@ -417,7 +469,7 @@ def run_scan(
                         service=COMMON_SERVICE_NAMES.get(p),
                         banner=banners.get(p),
                     )
-                    for p in open_ports
+                    for p in all_open
                 ]
             if progress:
                 total_open = sum(len(h.ports) for h in hosts)
@@ -439,8 +491,8 @@ def run_scan(
         auto_fallback and vuln_scan and nmap_available() and not use_nmap
     )
 
-    # When async_io ran, ports + banners are already populated.
-    async_populated = bool(async_results)
+    # When async_io OR syn_scan ran, ports are already populated.
+    async_populated = bool(async_results) or bool(syn_results)
 
     def pipeline(h: Host) -> Host:
         """Per-host pipeline. Discovery + ports + banners are sequential
