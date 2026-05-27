@@ -478,8 +478,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--report-html", metavar="PATH",
                    help="Write a self-contained HTML report to PATH.")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="Interactive wizard mode — guided scan setup")
     p.add_argument("--version", action="version", version=f"explotica {__version__}")
     args = p.parse_args(argv)
+
+    # If --interactive (or no target given), run the wizard then re-enter
+    # main() with the wizard-built argv. The wizard returns the full arg list.
+    if args.interactive or (not args.target and not args.from_json
+                              and not args.auto and not args.list_network
+                              and argv is None):
+        from .interactive import run_wizard
+        wiz_args = run_wizard()
+        if wiz_args is None:
+            return 0
+        # Re-enter main() with the wizard's argv
+        return main(wiz_args)
 
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
