@@ -20,10 +20,12 @@ from .epss_kev import enrich_hosts_with_epss_kev
 from .http_scan import scan_http
 from .nmap_wrap import (enrich_host_with_nmap, enrich_hosts_with_nmap,
                          nmap_available)
+from .protocol_probes import unmask_port, unmask_ports
 from .searchsploit_wrap import (enrich_host_with_exploits,
                                 searchsploit_available)
 from .smb_scan import scan_smb
 from .tls_scan import scan_tls
+from .udp_probes import probe_all_udp
 from .oui import lookup as oui_lookup
 from .ports import TOP_100_PORTS, scan_ports
 from .service_fp import deepen_host
@@ -53,13 +55,25 @@ def _discover(target: str, use_arp: bool, timeout: float,
 
 
 def _enrich(host: Host) -> Host:
-    """Cheap enrichment — hostname (reverse DNS) + MAC vendor lookup.
+    """Cheap enrichment — hostname (reverse DNS) + MAC vendor lookup + TTL hint.
 
     Reverse-DNS gets a short timeout (0.3s) because most consumer devices
     don't register reverse DNS and the lookup just wastes wall-clock time.
     """
     host.hostname = resolve_hostname(host.ip, timeout=0.3)
     host.vendor = oui_lookup(host.mac)
+    # TTL-based OS hint — cheap, just one ICMP echo
+    try:
+        from .discovery import icmp_ping
+        from .os_fingerprint import guess_os_from_ttl
+        from scapy.all import IP, ICMP, sr1, conf
+        conf.verb = 0
+        reply = sr1(IP(dst=host.ip) / ICMP(), timeout=1.0, verbose=False)
+        if reply is not None and hasattr(reply, "ttl"):
+            host.ttl = int(reply.ttl)
+            host.os_hint = guess_os_from_ttl(host.ttl)
+    except Exception as e:
+        log.debug("ttl fingerprint %s failed: %s", host.ip, e)
     return host
 
 
@@ -67,6 +81,49 @@ _HTTP_PORTS = frozenset({80, 81, 88, 591, 800, 1080, 3000, 4000, 4080, 5000,
                           5050, 7001, 8000, 8008, 8080, 8081, 8088, 8888,
                           9000, 9090})
 _HTTPS_PORTS = frozenset({443, 4443, 8443, 9443})
+
+
+def _unmask_host(host: Host) -> None:
+    """Run protocol-specific probes on this host's UNFINGERPRINTED ports.
+
+    Fills in port.banner + product fields when a probe identifies the service.
+    Parallel across this host's unfingerprinted ports.
+    """
+    if not host.ports:
+        return
+    probe_ports = unmask_ports()
+    candidates = [p for p in host.ports
+                  if p.number in probe_ports and not p.product_name]
+    if not candidates:
+        return
+
+    def probe_one(p: Port) -> None:
+        result = unmask_port(host.ip, p.number)
+        if not result:
+            return
+        banner_str, vendor, product, version = result
+        # Append to banner (preserve any existing data)
+        p.banner = (f"{p.banner} || unmask: {banner_str}"
+                    if p.banner else f"unmask: {banner_str}")[:512]
+        if vendor and not p.product_vendor:
+            p.product_vendor = vendor
+        if product and not p.product_name:
+            p.product_name = product
+        if version and not p.product_version:
+            p.product_version = version
+
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as pool:
+        list(pool.map(probe_one, candidates))
+
+
+def _udp_probe_host(host: Host) -> None:
+    """Run SNMP/mDNS/SSDP/NetBIOS UDP probes; attach result to host.udp_services."""
+    try:
+        results = probe_all_udp(host.ip, timeout=2.0)
+        if results:
+            host.udp_services = results
+    except Exception as e:
+        log.debug("udp probes on %s failed: %s", host.ip, e)
 
 
 def _rich_intel_host(host: Host) -> None:
@@ -193,6 +250,8 @@ def run_scan(
     use_searchsploit: bool = False,
     rich_intel: bool = False,
     epss_kev: bool = False,
+    unmask: bool = False,
+    udp_probe: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -242,6 +301,10 @@ def run_scan(
                 _grab_host_banners(h, banner_timeout, workers=16)
             if deep and h.ports:
                 deepen_host(h.ip, h.ports, workers=8)
+            if unmask and h.ports:
+                _unmask_host(h)
+            if udp_probe:
+                _udp_probe_host(h)
             if rich_intel and h.ports:
                 _rich_intel_host(h)
             if vuln_scan and h.ports:

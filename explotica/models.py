@@ -89,6 +89,10 @@ class Host:
     is_up: bool = True
     response_ms: Optional[float] = None
     ports: list[Port] = field(default_factory=list)
+    # Phase 11 additions:
+    os_hint: Optional[dict] = None         # {os_family, hops_estimate, initial_ttl, observed_ttl}
+    ttl: Optional[int] = None              # raw observed TTL
+    udp_services: Optional[dict] = None    # {snmp, mdns, ssdp, netbios} → result dicts
 
     def to_dict(self) -> dict:
         return {
@@ -99,6 +103,9 @@ class Host:
             "is_up": self.is_up,
             "response_ms": self.response_ms,
             "ports": [p.to_dict() for p in self.ports],
+            "os_hint": self.os_hint,
+            "ttl": self.ttl,
+            "udp_services": self.udp_services,
         }
 
 
@@ -135,6 +142,9 @@ class ScanResult:
                 hostname=h.get("hostname"),
                 is_up=h.get("is_up", True),
                 response_ms=h.get("response_ms"),
+                os_hint=h.get("os_hint"),
+                ttl=h.get("ttl"),
+                udp_services=h.get("udp_services"),
                 ports=[
                     Port(
                         number=p["number"],

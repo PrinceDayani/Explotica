@@ -155,9 +155,33 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
                             style="dim",
                         )
 
+        # Augment hostname column with OS hint when we have it
+        host_display = host.hostname or "-"
+        if host.os_hint:
+            host_display = (
+                f"{host_display}\n"
+                f"[dim]OS: {host.os_hint['os_family']} "
+                f"({host.os_hint['hops_estimate']}h, TTL={host.ttl})[/dim]"
+            )
+        if host.udp_services:
+            udp_summary: list[str] = []
+            if host.udp_services.get("snmp"):
+                sd = host.udp_services["snmp"].get("sysDescr", "")[:40]
+                udp_summary.append(f"SNMP ({sd})" if sd else "SNMP")
+            if host.udp_services.get("mdns"):
+                svcs = host.udp_services["mdns"].get("services", [])
+                udp_summary.append(f"mDNS({len(svcs)})")
+            if host.udp_services.get("ssdp"):
+                udp_summary.append("SSDP/UPnP")
+            if host.udp_services.get("netbios"):
+                ns = host.udp_services["netbios"].get("names", [])
+                udp_summary.append(f"NetBIOS({len(ns)})")
+            if udp_summary:
+                host_display += f"\n[dim cyan]UDP: {', '.join(udp_summary)}[/dim cyan]"
+
         row = [
             host.ip,
-            host.hostname or "-",
+            host_display,
             host.mac or "-",
             host.vendor or "-",
             ports_cell or Text("-", style="dim"),
@@ -215,6 +239,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--epss-kev", action="store_true",
                    help="Enrich CVEs with EPSS scores (exploit prediction) "
                         "and CISA KEV catalog membership (known-exploited).")
+    p.add_argument("--unmask", action="store_true",
+                   help="Send protocol-specific probes to unfingerprinted "
+                        "ports (JetDirect, RTSP, Redis, MongoDB, MySQL, "
+                        "Postgres, SIP, IPP, Elasticsearch, etc.)")
+    p.add_argument("--udp-probe", action="store_true",
+                   help="Send SNMP, mDNS, SSDP, NetBIOS-NS queries to every "
+                        "host. Discovers UDP-only services TCP scans miss.")
     p.add_argument("--full-coverage", action="store_true",
                    help="MAXIMUM COVERAGE preset. Turns on: --vuln-scan, --deep, "
                         "--use-nmap, --use-searchsploit, --aggressive. "
@@ -258,13 +289,15 @@ def main(argv: list[str] | None = None) -> int:
         args.use_searchsploit = True
         args.rich_intel = True
         args.epss_kev = True
+        args.unmask = True
+        args.udp_probe = True
         args.aggressive = True
         if args.ports == "top100":  # only override the default
             args.ports = "top1000"
         console.print(
             "[bold magenta]--full-coverage:[/bold magenta] enabling "
             "--vuln-scan --deep --use-nmap --use-searchsploit --rich-intel "
-            "--epss-kev --aggressive, "
+            "--epss-kev --unmask --udp-probe --aggressive, "
             f"--ports={args.ports}"
         )
 
@@ -371,6 +404,8 @@ def main(argv: list[str] | None = None) -> int:
                     use_searchsploit=args.use_searchsploit,
                     rich_intel=args.rich_intel,
                     epss_kev=args.epss_kev,
+                    unmask=args.unmask,
+                    udp_probe=args.udp_probe,
                     nmap_timeout=args.nmap_timeout,
                     progress=progress,
                 )
@@ -468,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
                 use_searchsploit=args.use_searchsploit,
                 rich_intel=args.rich_intel,
                 epss_kev=args.epss_kev,
+                unmask=args.unmask,
+                udp_probe=args.udp_probe,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )
@@ -491,7 +528,8 @@ def main(argv: list[str] | None = None) -> int:
 
     show_vulns = (args.vuln_scan or args.use_nmap or args.deep
                   or args.auto_fallback or args.use_searchsploit
-                  or args.rich_intel or args.epss_kev)
+                  or args.rich_intel or args.epss_kev
+                  or args.unmask or args.udp_probe)
     console.print(render_result(result, show_vulns=show_vulns))
 
     if show_vulns:
