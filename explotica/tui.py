@@ -183,8 +183,9 @@ def run(scan_json_path: str) -> int:
     from textual.binding import Binding
     from textual.containers import Container, Horizontal, Vertical, VerticalScroll
     from textual.screen import ModalScreen
-    from textual.widgets import (Button, DataTable, Footer, Header, Input,
-                                  Label, Static, TabbedContent, TabPane)
+    from textual.widgets import (Button, Checkbox, DataTable, Footer, Header,
+                                  Input, Label, RadioButton, RadioSet,
+                                  Static, TabbedContent, TabPane)
     from textual.reactive import reactive
 
     scan = json.loads(Path(scan_json_path).read_text(encoding="utf-8"))
@@ -317,6 +318,379 @@ def run(scan_json_path: str) -> int:
                     self.dismiss((label, list(flags)))
                     return
 
+    # ── Modal: full scan setup screen ────────────────────────────────────
+    # ALL scan options as UI controls. No CLI flag memorization required.
+    class ScanSetupScreen(ModalScreen[Optional[list[str]]]):
+        """Full-screen scan setup. Returns argv list or None on cancel."""
+        CSS = """
+        ScanSetupScreen { align: center middle; background: $background; }
+        #setup-box {
+            background: $surface; border: thick $accent;
+            padding: 1 2; min-width: 84; max-width: 100;
+            max-height: 40;
+        }
+        #setup-title { color: $accent; text-style: bold; margin-bottom: 1; }
+        .setup-section-title {
+            color: $accent; text-style: bold;
+            margin-top: 1;
+        }
+        .setup-row { layout: horizontal; height: 3; }
+        .setup-narrow { width: 24; }
+        #cmd-preview {
+            background: $boost; padding: 0 1; margin-top: 1;
+            color: #79c0ff;
+        }
+        Button { margin: 0 1; }
+        """
+        BINDINGS = [
+            Binding("escape", "cancel", "Cancel"),
+            Binding("ctrl+r", "run", "Run scan"),
+        ]
+
+        def __init__(self, default_target: str = "192.168.1.0/24"):
+            super().__init__()
+            self.default_target = default_target
+
+        def compose(self) -> ComposeResult:
+            with VerticalScroll(id="setup-box"):
+                yield Label("🛰️  Scan Setup", id="setup-title")
+
+                yield Label("[b]TARGET[/b]", classes="setup-section-title")
+                with RadioSet(id="target-type"):
+                    yield RadioButton("CIDR range", value=True, id="rb-cidr")
+                    yield RadioButton("Single host (IP/hostname)", id="rb-host")
+                    yield RadioButton("Domain (sets --no-arp)", id="rb-domain")
+                    yield RadioButton("Auto-discover local subnets", id="rb-auto")
+                yield Input(value=self.default_target,
+                             placeholder="e.g. 192.168.1.0/24, example.com",
+                             id="target-input")
+
+                yield Label("[b]PORTS[/b]", classes="setup-section-title")
+                with RadioSet(id="port-range"):
+                    yield RadioButton("Top 100 (fast — ~30s)", id="rb-top100")
+                    yield RadioButton("Top 1000 (recommended)",
+                                       value=True, id="rb-top1000")
+                    yield RadioButton("All 65535 (slow)", id="rb-all")
+                    yield RadioButton("Custom…", id="rb-custom")
+                yield Input(value="", placeholder="custom ports (e.g. 22,80,443 or 1-1024)",
+                             id="custom-ports")
+
+                yield Label("[b]SPEED[/b]", classes="setup-section-title")
+                with RadioSet(id="speed-mode"):
+                    yield RadioButton("Normal", id="rb-normal")
+                    yield RadioButton("Aggressive", id="rb-aggressive")
+                    yield RadioButton("Ultra (256 workers)",
+                                       value=True, id="rb-ultra")
+                    yield RadioButton("Turbo (384 workers, reckless)",
+                                       id="rb-turbo")
+
+                yield Label("[b]PROFILE[/b]", classes="setup-section-title")
+                with RadioSet(id="profile"):
+                    yield RadioButton("Discovery only", id="rb-discover")
+                    yield RadioButton("Standard scan", id="rb-standard")
+                    yield RadioButton("Full Coverage (safe)",
+                                       value=True, id="rb-full")
+                    yield RadioButton("All The Things (active checks)",
+                                       id="rb-all-things")
+                    yield RadioButton("Custom (pick modules below)",
+                                       id="rb-custom-profile")
+
+                yield Label("[b]MODULES[/b] (used if Profile=Custom)",
+                            classes="setup-section-title")
+                with Vertical(id="modules-grid"):
+                    yield Checkbox("vuln-scan (NVD CVE matching)",
+                                    value=True, id="cb-vuln")
+                    yield Checkbox("deep (active version probes)",
+                                    value=True, id="cb-deep")
+                    yield Checkbox("use-nmap (nmap NSE)",
+                                    value=True, id="cb-nmap")
+                    yield Checkbox("use-searchsploit (Exploit-DB)",
+                                    value=True, id="cb-searchsploit")
+                    yield Checkbox("rich-intel (TLS/HTTP/SMB)",
+                                    value=True, id="cb-rich")
+                    yield Checkbox("epss-kev (CVE prioritization)",
+                                    value=True, id="cb-epss")
+                    yield Checkbox("unmask (protocol probes)",
+                                    value=True, id="cb-unmask")
+                    yield Checkbox("udp-probe (SNMP/mDNS/SSDP/NetBIOS)",
+                                    value=True, id="cb-udp")
+                    yield Checkbox("web-crawl (HTTP crawler)",
+                                    value=False, id="cb-crawl")
+                    yield Checkbox("shodan (InternetDB)",
+                                    value=False, id="cb-shodan")
+                    yield Checkbox("ssh-enum (SSH algorithms)",
+                                    value=True, id="cb-ssh-enum")
+                    yield Checkbox("dns-enum (subdomain brute)",
+                                    value=False, id="cb-dns")
+                    yield Checkbox("service-intel (RDP/LDAP/k8s/Docker)",
+                                    value=True, id="cb-service-intel")
+                    yield Checkbox("http-audit (CORS/methods/GraphQL/WP)",
+                                    value=True, id="cb-http-audit")
+                    yield Checkbox("verify-cves (Heartbleed/MS17/+5)",
+                                    value=True, id="cb-verify")
+                    yield Checkbox("verify-cves-v2 (Citrix/Confluence/+12)",
+                                    value=True, id="cb-verify-v2")
+                    yield Checkbox("ics (Modbus/BACnet/DNP3/S7)",
+                                    value=False, id="cb-ics")
+                    yield Checkbox("honeypot-check",
+                                    value=True, id="cb-honeypot")
+                    yield Checkbox("os-fp-db (OS fingerprint)",
+                                    value=True, id="cb-os-fp")
+                    yield Checkbox("prioritize (smart scoring)",
+                                    value=True, id="cb-prioritize")
+                    yield Checkbox("[b red]check-default-creds[/b red] (ACTIVE)",
+                                    value=False, id="cb-defcreds")
+                    yield Checkbox("[b red]check-takeover[/b red] (ACTIVE)",
+                                    value=False, id="cb-takeover")
+                    yield Checkbox("[b red]smtp-audit[/b red] (ACTIVE — open relay test)",
+                                    value=False, id="cb-smtp")
+                    yield Checkbox("[b red]web-fuzz[/b red] (ACTIVE — SQLi/XSS/etc.)",
+                                    value=False, id="cb-fuzz")
+
+                yield Label("[b]CREDENTIALS[/b] (optional)",
+                            classes="setup-section-title")
+                yield Input(value="",
+                             placeholder="SSH user:password (e.g. kali:pass)",
+                             id="ssh-creds")
+                yield Input(value="",
+                             placeholder="WinRM user:password",
+                             id="winrm-creds")
+                yield Input(value="",
+                             placeholder="AD domain (e.g. corp.local)",
+                             id="ad-domain")
+
+                yield Label("[b]COMPLIANCE & EXTRAS[/b]",
+                            classes="setup-section-title")
+                yield Input(value="",
+                             placeholder="Compliance frameworks (cis,pci,hipaa)",
+                             id="compliance")
+                yield Input(value="",
+                             placeholder="Cloud asset keyword (S3/Azure/GCP enum)",
+                             id="cloud-keyword")
+
+                yield Label("[b]OUTPUTS[/b]", classes="setup-section-title")
+                yield Checkbox("Save JSON", value=True, id="cb-out-json")
+                yield Checkbox("HTML report", value=True, id="cb-out-html")
+                yield Checkbox("PDF report", value=False, id="cb-out-pdf")
+                yield Checkbox("Markdown report", value=False, id="cb-out-md")
+                yield Checkbox("Launch dashboard after scan",
+                                value=False, id="cb-out-dashboard")
+
+                yield Label("[b]EQUIVALENT COMMAND[/b]",
+                            classes="setup-section-title")
+                yield Static("(computed on Run)", id="cmd-preview")
+
+                with Horizontal():
+                    yield Button("▶ Run scan (Ctrl-R)",
+                                  id="btn-run", variant="success")
+                    yield Button("Cancel (Esc)", id="btn-cancel",
+                                  variant="default")
+
+        def _radio_value(self, radio_set_id: str) -> str:
+            try:
+                rs = self.query_one(f"#{radio_set_id}", RadioSet)
+                return rs.pressed_button.id if rs.pressed_button else ""
+            except Exception:
+                return ""
+
+        def _build_argv(self) -> list[str]:
+            """Build the argv list from the form state."""
+            args: list[str] = []
+            # Target
+            target_type = self._radio_value("target-type")
+            target_val = self.query_one("#target-input", Input).value.strip()
+            if target_type == "rb-auto":
+                args.append("--auto")
+            elif target_val:
+                args.append(target_val)
+                if target_type == "rb-domain":
+                    args.append("--no-arp")
+                elif target_type == "rb-host" and any(c.isalpha() for c in target_val):
+                    args.append("--no-arp")
+
+            # Ports
+            pr = self._radio_value("port-range")
+            if pr == "rb-top100":
+                args.extend(["--ports", "top100"])
+            elif pr == "rb-top1000":
+                args.extend(["--ports", "top1000"])
+            elif pr == "rb-all":
+                args.extend(["--ports", "all"])
+            elif pr == "rb-custom":
+                cp = self.query_one("#custom-ports", Input).value.strip()
+                if cp:
+                    args.extend(["--ports", cp])
+
+            # Speed
+            sp = self._radio_value("speed-mode")
+            if sp == "rb-aggressive":
+                args.append("--aggressive")
+            elif sp == "rb-ultra":
+                args.append("--ultra")
+            elif sp == "rb-turbo":
+                args.append("--turbo")
+
+            # Profile
+            prof = self._radio_value("profile")
+            if prof == "rb-discover":
+                pass  # nothing extra
+            elif prof == "rb-standard":
+                args.extend(["--vuln-scan", "--deep", "--use-nmap", "--epss-kev"])
+            elif prof == "rb-full":
+                args.append("--full-coverage")
+            elif prof == "rb-all-things":
+                args.append("--all-the-things")
+            elif prof == "rb-custom-profile":
+                # Pick per-module checkboxes
+                module_map = {
+                    "cb-vuln": "--vuln-scan", "cb-deep": "--deep",
+                    "cb-nmap": "--use-nmap",
+                    "cb-searchsploit": "--use-searchsploit",
+                    "cb-rich": "--rich-intel", "cb-epss": "--epss-kev",
+                    "cb-unmask": "--unmask", "cb-udp": "--udp-probe",
+                    "cb-crawl": "--web-crawl", "cb-shodan": "--shodan",
+                    "cb-ssh-enum": "--ssh-enum", "cb-dns": "--dns-enum",
+                    "cb-service-intel": "--service-intel",
+                    "cb-http-audit": "--http-audit",
+                    "cb-verify": "--verify-cves",
+                    "cb-verify-v2": "--verify-cves-v2",
+                    "cb-ics": "--ics", "cb-honeypot": "--honeypot-check",
+                    "cb-os-fp": "--os-fp-db",
+                    "cb-prioritize": "--prioritize",
+                    "cb-defcreds": "--check-default-creds",
+                    "cb-takeover": "--check-takeover",
+                    "cb-smtp": "--smtp-audit", "cb-fuzz": "--web-fuzz",
+                }
+                for cb_id, flag in module_map.items():
+                    if self.query_one(f"#{cb_id}", Checkbox).value:
+                        args.append(flag)
+
+            # Credentials
+            ssh = self.query_one("#ssh-creds", Input).value.strip()
+            if ssh:
+                args.extend(["--ssh-creds", ssh])
+            winrm = self.query_one("#winrm-creds", Input).value.strip()
+            if winrm:
+                args.extend(["--winrm-creds", winrm])
+            ad = self.query_one("#ad-domain", Input).value.strip()
+            if ad:
+                args.extend(["--ad-enum", ad])
+
+            # Compliance / Cloud
+            comp = self.query_one("#compliance", Input).value.strip()
+            if comp:
+                args.extend(["--compliance", comp])
+            cloud = self.query_one("#cloud-keyword", Input).value.strip()
+            if cloud:
+                args.extend(["--check-cloud", cloud])
+
+            # Outputs
+            if self.query_one("#cb-out-json", Checkbox).value:
+                args.extend(["--json", "scans/from_tui.json"])
+            if self.query_one("#cb-out-html", Checkbox).value:
+                args.extend(["--report-html", "scans/from_tui.html"])
+            return args
+
+        def action_run(self) -> None:
+            argv = self._build_argv()
+            self.dismiss(argv)
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+        def on_button_pressed(self, event) -> None:
+            if event.button.id == "btn-run":
+                self.action_run()
+            elif event.button.id == "btn-cancel":
+                self.action_cancel()
+
+    # ── Modal: command palette (fuzzy list of all actions) ──────────────
+    class CommandPaletteModal(ModalScreen[Optional[str]]):
+        """Fuzzy-searchable list of every action. Press Enter to dispatch."""
+        CSS = """
+        CommandPaletteModal { align: center middle; }
+        #palette-box {
+            background: $surface; border: thick $accent;
+            padding: 1 2; min-width: 70; max-width: 90;
+            height: 28;
+        }
+        #palette-input { margin-bottom: 1; }
+        """
+        BINDINGS = [
+            Binding("escape", "dismiss(None)", "Cancel"),
+        ]
+
+        # Each entry: (action_key, label, description)
+        ALL_ACTIONS = [
+            ("setup", "🛰️  Open Scan Setup",
+              "Full UI to configure a new scan with all options"),
+            ("scan", "⚡ Quick scan (modal)",
+              "Type target + flags directly"),
+            ("load", "📂 Load scan from JSON file", ""),
+            ("save", "💾 Save current scan", ""),
+            ("verify", "✅ Verify probes",
+              "Heartbleed/MS17/Shellshock/BlueKeep/+17 more"),
+            ("ssh-creds", "🔑 SSH credentialed scan",
+              "Linux package inventory → NVD"),
+            ("winrm", "🪟 WinRM credentialed scan",
+              "Windows host inspection"),
+            ("ad", "🏢 AD enumeration",
+              "DC discovery + Kerberos user enum"),
+            ("asrep", "🔥 AS-REP roast",
+              "Extract hashcat-format hashes"),
+            ("fuzz", "💉 Web fuzz",
+              "Path traversal/CRLF/XSS/SSRF"),
+            ("defcreds", "🔓 Default credential check",
+              "FTP anon, admin/admin, Redis no-auth, etc."),
+            ("takeover", "🎯 Subdomain takeover", ""),
+            ("cloud", "☁️ Cloud asset discovery", ""),
+            ("smtp", "📧 SMTP audit (open relay)", ""),
+            ("priorities", "📊 Compute priorities",
+              "CVSS+EPSS+KEV smart scoring"),
+            ("compliance", "📋 Compliance evaluation",
+              "CIS / PCI / HIPAA"),
+            ("report", "📝 Save report (HTML/PDF/MD)", ""),
+            ("dashboard", "🌐 Launch web dashboard",
+              "Cytoscape network graph + REST API"),
+            ("listnet", "🗺️ List local subnets", ""),
+            ("spider", "🕸️ Network spider",
+              "Recursive subnet discovery via SNMP routes"),
+        ]
+
+        def compose(self) -> ComposeResult:
+            with Container(id="palette-box"):
+                yield Label("🎯 Command Palette  [dim](type to filter)[/dim]")
+                yield Input(placeholder="search…", id="palette-input")
+                self.palette_list = VerticalScroll(id="palette-list")
+                yield self.palette_list
+
+        def on_mount(self) -> None:
+            self._render("")
+            self.query_one("#palette-input", Input).focus()
+
+        def _render(self, query: str) -> None:
+            self.palette_list.remove_children()
+            q = query.lower()
+            for key, label, desc in self.ALL_ACTIONS:
+                if q and q not in label.lower() and q not in desc.lower() and q not in key:
+                    continue
+                line = f"  [bold accent]{key:<12}[/bold accent] {label}"
+                if desc:
+                    line += f"\n              [dim]{desc}[/dim]"
+                self.palette_list.mount(Static(line))
+
+        def on_input_changed(self, event) -> None:
+            self._render(event.value)
+
+        def on_input_submitted(self, event) -> None:
+            # Pick the first visible action
+            q = event.value.lower()
+            for key, label, desc in self.ALL_ACTIONS:
+                if not q or q in key or q in label.lower() or q in desc.lower():
+                    self.dismiss(key)
+                    return
+            self.dismiss(None)
+
     # ── Modal: help overlay ──────────────────────────────────────────────
     class HelpModal(ModalScreen):
         CSS = """
@@ -447,6 +821,9 @@ def run(scan_json_path: str) -> int:
             Binding("enter", "rescan_current", "Rescan this", show=False),
             # Scan setup actions
             Binding("s", "action_scan", "Scan"),
+            Binding("S", "open_setup", "Scan Setup", show=True),
+            Binding("ctrl+p", "open_palette", "Palette", show=True),
+            Binding("P", "open_palette", "Palette", show=False),
             Binding("l", "action_load", "Load"),
             Binding("S", "action_save", "Save", show=False),
             Binding("v", "action_verify", "Verify"),
@@ -1096,6 +1473,131 @@ def run(scan_json_path: str) -> int:
 
         def action_show_help(self) -> None:
             self.push_screen(HelpModal())
+
+        def action_open_setup(self) -> None:
+            """Open the full ScanSetupScreen, then run the built argv."""
+            current_target = self.scan_data.get("target", "192.168.1.0/24")
+            # Strip any "auto: " prefix added by multi-subnet aggregator
+            if current_target.startswith("auto:"):
+                current_target = "192.168.1.0/24"
+
+            def callback(argv: Optional[list[str]]) -> None:
+                if argv is None:
+                    return
+                if not argv:
+                    self.notify("No target — cancelled.", timeout=3)
+                    return
+                self.notify(f"Launching scan: {' '.join(argv[:8])}…",
+                              timeout=4)
+                cmd = [sys.executable, "-m", "explotica"] + argv
+                # If --json wasn't included, force scan_path so we can reload
+                if "--json" not in argv:
+                    cmd.extend(["--json", self.scan_path])
+                # Run in worker pool so the TUI stays interactive
+                self.pool.start(
+                    ip=argv[0] if argv else "?",
+                    action="setup-driven scan",
+                    cmd=cmd,
+                    json_out=self.scan_path,
+                )
+
+            self.push_screen(ScanSetupScreen(current_target), callback)
+
+        def action_open_palette(self) -> None:
+            """Open the command palette."""
+
+            def callback(action_key: Optional[str]) -> None:
+                if not action_key:
+                    return
+                # Dispatch to the matching action method
+                dispatch = {
+                    "setup": self.action_open_setup,
+                    "scan": self.action_scan,
+                    "load": self.action_load,
+                    "save": self.action_save,
+                    "verify": self.action_verify,
+                    "ssh-creds": self.action_sshcreds,
+                    "winrm": self.action_winrm,
+                    "ad": self.action_ad,
+                    "asrep": self.action_asrep,
+                    "fuzz": self.action_fuzz,
+                    "defcreds": self.action_defcreds,
+                    "takeover": self.action_takeover,
+                    "cloud": self.action_cloud,
+                    "priorities": self.action_priorities,
+                    "compliance": self.action_compliance,
+                    "report": self.action_report,
+                    "dashboard": self.action_dashboard,
+                }
+                fn = dispatch.get(action_key)
+                if fn:
+                    fn()
+                elif action_key == "listnet":
+                    self._show_listnet()
+                elif action_key == "spider":
+                    self._run_spider()
+                elif action_key == "smtp":
+                    self._prompt_smtp()
+                else:
+                    self.notify(f"Action not wired: {action_key}", timeout=3)
+
+            self.push_screen(CommandPaletteModal(), callback)
+
+        def _show_listnet(self) -> None:
+            try:
+                from .enumerate import list_subnets, format_summary
+                net = list_subnets()
+                summary = format_summary(net)
+                self.notify(summary[:200], timeout=8)
+            except Exception as e:
+                self.notify(f"listnet failed: {e}", timeout=4)
+
+        def _run_spider(self) -> None:
+            def callback(seed: Optional[str]) -> None:
+                if not seed:
+                    return
+                from .network_spider import spider
+                self.notify(f"Spidering from {seed}… see notifications",
+                              timeout=3)
+
+                def worker():
+                    try:
+                        result = spider(seed, max_depth=2)
+                        msg = (f"Spider done: {result['subnet_count']} subnet(s), "
+                                f"{result['router_count']} router(s)")
+                        self.call_from_thread(self.notify, msg, timeout=6)
+                    except Exception as e:
+                        self.call_from_thread(self.notify,
+                                                f"Spider failed: {e}", timeout=4)
+                threading.Thread(target=worker, daemon=True).start()
+            self.push_screen(CommandModal(
+                "🕸️ Network spider", "seed CIDR (e.g. 192.168.1.0/24)",
+                "192.168.1.0/24"
+            ), callback)
+
+        def _prompt_smtp(self) -> None:
+            def callback(host: Optional[str]) -> None:
+                if not host:
+                    return
+                from .smtp_test import audit_smtp
+                self.notify(f"SMTP audit: {host}…", timeout=3)
+
+                def worker():
+                    try:
+                        r = audit_smtp(host)
+                        rt = r.get("relay_test", {})
+                        if rt.get("finding") == "OPEN_RELAY":
+                            msg = f"💥 {host} is an OPEN RELAY"
+                        else:
+                            msg = f"{host} SMTP audit complete: {rt.get('finding')}"
+                        self.call_from_thread(self.notify, msg, timeout=6)
+                    except Exception as e:
+                        self.call_from_thread(self.notify,
+                                                f"SMTP audit failed: {e}", timeout=4)
+                threading.Thread(target=worker, daemon=True).start()
+            self.push_screen(CommandModal(
+                "📧 SMTP audit", "host:port", "mail.example.com"
+            ), callback)
 
         # ── Phase 49: selection + per-host rescan ────────────────────────
         def _current_row_ip(self) -> Optional[str]:
