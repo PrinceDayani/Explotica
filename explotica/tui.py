@@ -22,11 +22,111 @@ import json
 import logging
 import subprocess
 import sys
+import tempfile
 import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
+
+
+# ── Worker pool: tracks concurrent subprocess scans ──────────────────────
+@dataclass
+class ScanProcess:
+    """One running (or completed) per-host scan."""
+    id: str
+    ip: str
+    action: str           # human-readable action name
+    cmd: list[str]        # the subprocess argv
+    started_at: float
+    status: str = "running"     # running / done / failed / killed
+    ended_at: Optional[float] = None
+    error: Optional[str] = None
+    json_out: Optional[str] = None  # path to temp JSON
+
+    @property
+    def elapsed(self) -> float:
+        end = self.ended_at or time.time()
+        return end - self.started_at
+
+
+class WorkerPool:
+    """Manages concurrent per-host scan subprocesses + post-completion merge."""
+
+    def __init__(self, on_change: Callable, on_complete: Callable):
+        # on_change(): fires whenever the process list mutates (start, end,
+        # status). Used to refresh the tracker widget.
+        # on_complete(scan_process, new_scan_dict): fires when one process
+        # completes successfully — caller merges new data into the scan.
+        self.processes: list[ScanProcess] = []
+        self._lock = threading.Lock()
+        self.on_change = on_change
+        self.on_complete = on_complete
+
+    def start(self, ip: str, action: str, cmd: list[str],
+               json_out: Optional[str] = None) -> ScanProcess:
+        proc = ScanProcess(
+            id=uuid.uuid4().hex[:8], ip=ip, action=action,
+            cmd=cmd, started_at=time.time(), json_out=json_out,
+        )
+        with self._lock:
+            self.processes.append(proc)
+        self.on_change()
+        threading.Thread(target=self._worker, args=(proc,),
+                          daemon=True).start()
+        return proc
+
+    def _worker(self, proc: ScanProcess) -> None:
+        try:
+            result = subprocess.run(proc.cmd, capture_output=True,
+                                     timeout=900, check=False)
+            if result.returncode == 0 and proc.json_out and Path(proc.json_out).exists():
+                try:
+                    new_data = json.loads(
+                        Path(proc.json_out).read_text(encoding="utf-8")
+                    )
+                    proc.status = "done"
+                    proc.ended_at = time.time()
+                    self.on_change()
+                    self.on_complete(proc, new_data)
+                except (json.JSONDecodeError, OSError) as e:
+                    proc.status = "failed"
+                    proc.error = f"parse JSON: {e}"
+                    proc.ended_at = time.time()
+                    self.on_change()
+            else:
+                proc.status = "failed"
+                proc.error = (result.stderr[:200].decode("utf-8", "ignore")
+                                if result.stderr else
+                                f"exit code {result.returncode}")
+                proc.ended_at = time.time()
+                self.on_change()
+        except subprocess.TimeoutExpired:
+            proc.status = "failed"
+            proc.error = "timeout (15min)"
+            proc.ended_at = time.time()
+            self.on_change()
+        except Exception as e:
+            proc.status = "failed"
+            proc.error = str(e)
+            proc.ended_at = time.time()
+            self.on_change()
+
+    def active_count(self) -> int:
+        with self._lock:
+            return sum(1 for p in self.processes if p.status == "running")
+
+    def all_processes(self) -> list[ScanProcess]:
+        with self._lock:
+            return list(self.processes)
+
+    def clear_completed(self) -> None:
+        with self._lock:
+            self.processes = [p for p in self.processes if p.status == "running"]
+        self.on_change()
 
 
 def textual_available() -> bool:
@@ -121,6 +221,102 @@ def run(scan_json_path: str) -> int:
         def on_input_submitted(self, event) -> None:
             self.dismiss(event.value)
 
+    # ── Modal: host action checklist ─────────────────────────────────────
+    # Available actions a user can trigger against a single host. Each is a
+    # tuple of (action_key, label, default_flags_for_explotica_cli).
+    HOST_ACTIONS = [
+        ("a", "🔥 Full re-scan (all the things)",
+         ["--ports", "top1000", "--all-the-things", "--turbo"]),
+        ("v", "✅ Verify probes (Heartbleed/MS17/Shellshock/+19)",
+         ["--ports", "top1000", "--verify-cves", "--verify-cves-v2",
+          "--no-arp"]),
+        ("d", "🔎 Deep scan (vuln + nmap + searchsploit)",
+         ["--ports", "top1000", "--vuln-scan", "--deep", "--use-nmap",
+          "--use-searchsploit", "--epss-kev", "--no-arp"]),
+        ("r", "🏷️ Rich intel only (TLS/HTTP/SMB)",
+         ["--ports", "top1000", "--rich-intel", "--deep", "--no-arp"]),
+        ("c", "🔓 Default credential check",
+         ["--ports", "top1000", "--check-default-creds", "--no-arp"]),
+        ("f", "💉 Web fuzz (path traversal/XSS/CRLF/SSRF)",
+         ["--ports", "top100", "--web-fuzz", "--no-arp"]),
+        ("p", "📊 Compute priorities (CVSS+EPSS+KEV)",
+         ["--from-json-merge", "--prioritize"]),
+        ("o", "🎯 OS fingerprint (deep)",
+         ["--ports", "top1000", "--os-fp-db", "--rich-intel", "--no-arp"]),
+        ("s", "🔍 Quick scan (top 100 ports only)",
+         ["--ports", "top100", "--vuln-scan", "--no-arp"]),
+        ("F", "🌐 Full-coverage everything",
+         ["--ports", "top1000", "--full-coverage", "--ultra", "--no-arp"]),
+        ("x", "⚙️ Custom flags…", None),  # special — prompts for flag string
+    ]
+
+    class HostActionModal(ModalScreen[tuple[str, list[str]]]):
+        """Pops up when user activates a host. Lets them pick which scan
+        action to run. Returns (action_label, cmd_flags) or None on cancel."""
+        CSS = """
+        HostActionModal { align: center middle; }
+        #action-box {
+            background: $surface; border: thick $accent;
+            padding: 1 2; min-width: 70; max-width: 95;
+            max-height: 30;
+        }
+        #action-title { color: $text; margin-bottom: 1; }
+        #action-list { height: 22; overflow-y: auto; }
+        .action-row {
+            padding: 0 1;
+        }
+        .action-key {
+            color: $accent; text-style: bold;
+            width: 4;
+        }
+        """
+        BINDINGS = [
+            Binding("escape", "dismiss(None)", "Cancel"),
+        ]
+
+        def __init__(self, host_ip: str, host_hostname: str = ""):
+            super().__init__()
+            self.host_ip = host_ip
+            self.host_hostname = host_hostname
+
+        def compose(self) -> ComposeResult:
+            with Container(id="action-box"):
+                title = f"🎯 Scan actions for [cyan]{self.host_ip}[/cyan]"
+                if self.host_hostname:
+                    title += f"  ({self.host_hostname})"
+                yield Label(title, id="action-title")
+                yield Label(
+                    "[dim]Pick an action (single letter):[/dim]",
+                    id="action-subtitle",
+                )
+                with VerticalScroll(id="action-list"):
+                    for key, label, _flags in HOST_ACTIONS:
+                        yield Static(
+                            f"  [bold accent]{key}[/bold accent]  {label}",
+                            classes="action-row",
+                        )
+                yield Label("[dim]Esc to cancel[/dim]", id="action-footer")
+
+        def on_key(self, event) -> None:
+            ch = event.key
+            for k, label, flags in HOST_ACTIONS:
+                if ch == k:
+                    if flags is None:
+                        # Custom — push another modal asking for flags
+                        def cb(custom: Optional[str]) -> None:
+                            if custom is None:
+                                self.dismiss(None)
+                                return
+                            self.dismiss((label, custom.split()))
+                        self.app.push_screen(CommandModal(
+                            f"Custom flags for {self.host_ip}",
+                            "scan flags (e.g. --ports all --use-nmap)",
+                            "--ports top1000 --vuln-scan --deep --no-arp",
+                        ), cb)
+                        return
+                    self.dismiss((label, list(flags)))
+                    return
+
     # ── Modal: help overlay ──────────────────────────────────────────────
     class HelpModal(ModalScreen):
         CSS = """
@@ -147,14 +343,28 @@ def run(scan_json_path: str) -> int:
   1 Hosts            2 CVEs            3 Ports
   4 Exploits         5 Compliance      6 Extra
 
-[b]Selection & per-host actions (Hosts tab)[/b]
+[b]Per-host action menu (Hosts tab)[/b]
+  [b]Enter[/b]              open scan-action menu for host under cursor
+                     (or for ALL selected hosts — runs in parallel)
+  Then pick a letter:
+      [accent]a[/accent]  Full re-scan        [accent]v[/accent]  Verify probes (Heartbleed/MS17/+19)
+      [accent]d[/accent]  Deep scan           [accent]r[/accent]  Rich intel (TLS/HTTP/SMB)
+      [accent]c[/accent]  Default creds       [accent]f[/accent]  Web fuzz
+      [accent]p[/accent]  Priorities          [accent]o[/accent]  OS fingerprint
+      [accent]s[/accent]  Quick scan (top100) [accent]F[/accent]  Full-coverage everything
+      [accent]x[/accent]  Custom flags
+
+[b]Selection (Hosts tab)[/b]
   [b]space[/b]              toggle select on host under cursor
   [b]*[/b] (Shift-8)        select all visible hosts
   [b]n[/b]                  clear selection
-  [b]g[/b]                  configure custom scan flags for host under cursor
-  [b]R[/b]                  re-scan selected hosts (or host under cursor)
-                     — uses per-host config if set, else default flags
+  [b]g[/b]                  configure DEFAULT scan flags for host under cursor
+  [b]R[/b]                  re-scan selected hosts (or host under cursor) — direct
   [b]B[/b]                  bulk action (alias for R)
+
+[b]Live process tracker (bottom-right)[/b]
+  Shows every running/recent scan — IP, action, elapsed time, status.
+  Multiple scans run concurrently in their own subprocesses.
 
 [b]Global actions[/b]
   s    [b]s[/b]can — new full scan
@@ -191,10 +401,24 @@ def run(scan_json_path: str) -> int:
         DataTable { background: #161b22; }
         DataTable > .datatable--header { background: #0d1117; color: #58a6ff; }
         DataTable > .datatable--cursor { background: #1f6feb; color: white; }
-        #detail-pane {
-            background: #161b22; border-left: solid #30363d;
-            padding: 1 2; width: 50%;
+        #right-column {
+            width: 50%;
+            border-left: solid #30363d;
         }
+        #detail-pane {
+            background: #161b22;
+            padding: 1 2;
+            height: 70%;
+        }
+        #process-pane {
+            background: #0d1117;
+            border-top: solid #30363d;
+            padding: 1 2;
+            height: 30%;
+        }
+        .proc-running { color: #ffcc00; }
+        .proc-done { color: #34c759; }
+        .proc-failed { color: #ff3b30; }
         #status-bar {
             background: #161b22; color: #8b949e;
             padding: 0 2; height: 1;
@@ -259,6 +483,11 @@ def run(scan_json_path: str) -> int:
             # Per-host selection + custom-flag state
             self.selected_hosts: set[str] = set()
             self.per_host_config: dict[str, list[str]] = {}
+            # Worker pool — concurrent per-host subprocess scans
+            self.pool = WorkerPool(
+                on_change=self._on_pool_change,
+                on_complete=self._on_scan_complete,
+            )
 
         def compose(self) -> ComposeResult:
             yield Header(name=f"🛰️  Explotica  •  {self.scan_data.get('target', '?')}")
@@ -272,8 +501,11 @@ def run(scan_json_path: str) -> int:
                                                           cursor_type="row",
                                                           zebra_stripes=True)
                             yield self.host_table
-                        self.detail_pane = VerticalScroll(id="detail-pane")
-                        yield self.detail_pane
+                        with Vertical(id="right-column"):
+                            self.detail_pane = VerticalScroll(id="detail-pane")
+                            yield self.detail_pane
+                            self.process_pane = VerticalScroll(id="process-pane")
+                            yield self.process_pane
                 with TabPane("CVEs", id="cves"):
                     self.cve_table = DataTable(id="cve-table",
                                                  cursor_type="row",
@@ -297,6 +529,68 @@ def run(scan_json_path: str) -> int:
                     yield self.extra_view
             yield Static("", id="status-bar")
             yield Footer()
+
+        # ── Worker pool callbacks ────────────────────────────────────────
+        def _on_pool_change(self) -> None:
+            """WorkerPool fires this on any process state change (cross-thread)."""
+            self.call_from_thread(self._render_process_pane)
+
+        def _on_scan_complete(self, proc: ScanProcess,
+                                new_data: dict) -> None:
+            """A scan finished — merge its results into our in-memory scan."""
+            self.call_from_thread(self._merge_rescan_result, new_data)
+            self.call_from_thread(self._save_scan)
+            self.call_from_thread(self._populate_hosts)
+            self.call_from_thread(self._populate_cves)
+            self.call_from_thread(self._populate_ports)
+            self.call_from_thread(self._populate_exploits)
+            self.call_from_thread(self._populate_extra)
+            self.call_from_thread(
+                self.notify,
+                f"✓ {proc.action} on {proc.ip} complete ({proc.elapsed:.1f}s)",
+                timeout=4,
+            )
+
+        def _render_process_pane(self) -> None:
+            """Refresh the bottom-right process-tracker panel."""
+            try:
+                pane = self.process_pane
+            except Exception:
+                return
+            pane.remove_children()
+            procs = self.pool.all_processes()
+            active = sum(1 for p in procs if p.status == "running")
+            done = sum(1 for p in procs if p.status == "done")
+            failed = sum(1 for p in procs if p.status == "failed")
+            pane.mount(Static(
+                f"[bold]⚡ Process Tracker[/bold]   "
+                f"[yellow]{active} running[/yellow] · "
+                f"[green]{done} done[/green] · "
+                f"[red]{failed} failed[/red]"
+            ))
+            if not procs:
+                pane.mount(Static("[dim]No scans running. "
+                                    "Enter on a host to start one.[/dim]"))
+                return
+            # Most recent first, cap at 12
+            for p in reversed(procs[-12:]):
+                if p.status == "running":
+                    cls = "proc-running"
+                    icon = "⏳"
+                    tail = f"({p.elapsed:.1f}s)"
+                elif p.status == "done":
+                    cls = "proc-done"
+                    icon = "✓"
+                    tail = f"({p.elapsed:.1f}s)"
+                else:
+                    cls = "proc-failed"
+                    icon = "✗"
+                    tail = f"({p.error or 'failed'})"
+                pane.mount(Static(
+                    f"  {icon} [{cls}]{p.ip:<16}[/{cls}] "
+                    f"{p.action[:40]:<40} {tail}",
+                    classes=cls,
+                ))
 
         def on_mount(self) -> None:
             # Title (live stats)
@@ -323,6 +617,9 @@ def run(scan_json_path: str) -> int:
             self._populate_compliance()
             self._populate_extra()
             self._update_status()
+            self._render_process_pane()
+            # Tick every 1s to update elapsed times in process tracker
+            self.set_interval(1.0, self._render_process_pane)
 
         # ── Tab population ───────────────────────────────────────────────
         def _populate_hosts(self) -> None:
@@ -873,18 +1170,64 @@ def run(scan_json_path: str) -> int:
             ), callback)
 
         def action_rescan_current(self) -> None:
-            """Enter key — rescan host under cursor (or open detail if none selected)."""
+            """Enter key — opens the action menu for the host under cursor.
+
+            If multiple hosts are selected, opens the action menu and applies
+            the chosen action to ALL selected (each spawns its own subprocess
+            in parallel).
+            """
             ip = self._current_row_ip()
             if not ip:
                 return
-            # If multi-selection active, R behavior; otherwise just show detail
+            # Determine target list — selection if any, else just this row
             if self.selected_hosts:
-                self.action_rescan()
+                targets = sorted(self.selected_hosts,
+                                  key=lambda x: tuple(int(o) for o in x.split(".")))
             else:
-                # Show host detail (already happens on row click)
-                host = next((h for h in self.hosts if h["ip"] == ip), None)
-                if host:
-                    self._show_host_detail(host)
+                targets = [ip]
+
+            host = next((h for h in self.hosts if h["ip"] == ip), None)
+            hostname = host.get("hostname", "") if host else ""
+
+            def callback(chosen: Optional[tuple[str, list[str]]]) -> None:
+                if not chosen:
+                    return
+                action_label, flags = chosen
+                for target in targets:
+                    self._launch_host_scan(target, action_label, flags)
+
+            # Title shows count if multi-target
+            display_ip = (f"{targets[0]} (+ {len(targets) - 1} more)"
+                          if len(targets) > 1 else targets[0])
+            self.push_screen(HostActionModal(display_ip, hostname), callback)
+
+        def _launch_host_scan(self, ip: str, action_label: str,
+                                flags: list[str]) -> None:
+            """Start a per-host subprocess scan via the worker pool.
+
+            Each invocation gets its OWN temp JSON output, so concurrent
+            scans don't trample each other. Results get merged when each
+            completes.
+            """
+            # Allocate temp JSON for this subprocess
+            tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+            tmp.close()
+            tmp_path = tmp.name
+            # Special-case "from-json-merge" pseudo-flag for re-enrich actions
+            # like priorities that need the existing scan as input.
+            if "--from-json-merge" in flags:
+                flags = [f for f in flags if f != "--from-json-merge"]
+                cmd = ([sys.executable, "-m", "explotica",
+                          "--from-json", self.scan_path]
+                        + flags
+                        + ["--json", tmp_path])
+            else:
+                cmd = ([sys.executable, "-m", "explotica", ip]
+                        + flags
+                        + ["--json", tmp_path])
+            self.pool.start(ip=ip, action=action_label, cmd=cmd,
+                              json_out=tmp_path)
+            self.notify(f"Launched: {action_label} on {ip}", timeout=3)
 
         def action_rescan(self) -> None:
             """Re-scan selected hosts (or host under cursor if no selection)."""
