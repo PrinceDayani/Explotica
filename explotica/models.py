@@ -1,0 +1,65 @@
+"""Data models — the contract every layer (scanner, CLI, web, TUI) agrees on."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Optional
+
+
+@dataclass
+class Port:
+    number: int
+    protocol: str = "tcp"
+    state: str = "open"
+    service: Optional[str] = None
+    banner: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Host:
+    ip: str
+    mac: Optional[str] = None
+    vendor: Optional[str] = None
+    hostname: Optional[str] = None
+    is_up: bool = True
+    response_ms: Optional[float] = None
+    ports: list[Port] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "ip": self.ip,
+            "mac": self.mac,
+            "vendor": self.vendor,
+            "hostname": self.hostname,
+            "is_up": self.is_up,
+            "response_ms": self.response_ms,
+            "ports": [p.to_dict() for p in self.ports],
+        }
+
+
+@dataclass
+class ScanResult:
+    target: str
+    started_at: str
+    finished_at: str
+    duration_s: float
+    hosts: list[Host] = field(default_factory=list)
+    scanner_version: str = "0.1.0"
+
+    @staticmethod
+    def now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def to_dict(self) -> dict:
+        return {
+            "target": self.target,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_s": self.duration_s,
+            "scanner_version": self.scanner_version,
+            "hosts": [h.to_dict() for h in self.hosts],
+        }
