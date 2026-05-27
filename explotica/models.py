@@ -63,6 +63,9 @@ class Port:
     # Phase 12: extra intelligence on a port
     ssh_info: Optional[dict] = None         # KEXINIT algorithms, weak-alg flags
     crawl_info: Optional[dict] = None       # web crawler findings on this HTTP port
+    # Phase 13: high-impact service probes + HTTP audits
+    service_intel: Optional[dict] = None    # RDP NTLM / LDAP / Docker / k8s / ES / Mongo
+    http_audit_info: Optional[dict] = None  # methods, CORS, GraphQL, WP user enum
 
     def to_dict(self) -> dict:
         return {
@@ -82,6 +85,8 @@ class Port:
             "tech_stack": self.tech_stack,
             "ssh_info": self.ssh_info,
             "crawl_info": self.crawl_info,
+            "service_intel": self.service_intel,
+            "http_audit_info": self.http_audit_info,
         }
 
 
@@ -123,6 +128,8 @@ class ScanResult:
     hosts: list[Host] = field(default_factory=list)
     scanner_version: str = "0.1.0"
     dns_info: Optional[dict] = None  # populated when target is a domain
+    osint_info: Optional[dict] = None  # crt.sh + ASN + RDAP WHOIS
+    netfabric_info: Optional[dict] = None  # DHCP discover + traceroute hops
 
     @staticmethod
     def now_iso() -> str:
@@ -137,6 +144,8 @@ class ScanResult:
             "scanner_version": self.scanner_version,
             "hosts": [h.to_dict() for h in self.hosts],
             "dns_info": self.dns_info,
+            "osint_info": self.osint_info,
+            "netfabric_info": self.netfabric_info,
         }
 
     @classmethod
@@ -182,6 +191,8 @@ class ScanResult:
                         tech_stack=p.get("tech_stack", []),
                         ssh_info=p.get("ssh_info"),
                         crawl_info=p.get("crawl_info"),
+                        service_intel=p.get("service_intel"),
+                        http_audit_info=p.get("http_audit_info"),
                         exploits=[
                             Exploit(
                                 title=e["title"],
@@ -210,4 +221,6 @@ class ScanResult:
             hosts=hosts,
             scanner_version=data.get("scanner_version", "unknown"),
             dns_info=data.get("dns_info"),
+            osint_info=data.get("osint_info"),
+            netfabric_info=data.get("netfabric_info"),
         )

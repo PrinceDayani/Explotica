@@ -18,12 +18,17 @@ from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
 from .models import Host, Port, ScanResult
 from .dns_enum import enum_dns
 from .epss_kev import enrich_hosts_with_epss_kev
+from .http_audit import audit_http
 from .http_scan import scan_http
+from .netfabric import dhcp_discover, traceroute_many
 from .nmap_wrap import (enrich_host_with_nmap, enrich_hosts_with_nmap,
                          nmap_available)
+from .osint import run_osint
 from .protocol_probes import unmask_port, unmask_ports
 from .searchsploit_wrap import (enrich_host_with_exploits,
                                 searchsploit_available)
+from .service_probes_v2 import (probe_service, probe_udp_ntp,
+                                 SERVICE_PROBES)
 from .shodan_lite import enrich_hosts_with_shodan
 from .smb_scan import scan_smb
 from .ssh_enum import enum_ssh
@@ -85,6 +90,59 @@ _HTTP_PORTS = frozenset({80, 81, 88, 591, 800, 1080, 3000, 4000, 4080, 5000,
                           5050, 7001, 8000, 8008, 8080, 8081, 8088, 8888,
                           9000, 9090})
 _HTTPS_PORTS = frozenset({443, 4443, 8443, 9443})
+
+
+def _service_intel_host(host: Host) -> None:
+    """Run service_probes_v2 probes for ports we know how to deep-probe."""
+    if not host.ports:
+        return
+    for p in host.ports:
+        if p.number not in SERVICE_PROBES:
+            continue
+        try:
+            info = probe_service(host.ip, p.number)
+            if info:
+                p.service_intel = info
+        except Exception as e:
+            log.debug("service_intel %s:%d failed: %s", host.ip, p.number, e)
+
+
+_HTTP_AUDIT_PORTS = frozenset({80, 81, 88, 800, 3000, 5000, 7001, 8000,
+                                8008, 8080, 8081, 8888, 9000, 9090,
+                                443, 4443, 8443, 9443})
+
+
+def _http_audit_host(host: Host) -> None:
+    """Run http_audit (methods/CORS/GraphQL/WP) for each HTTP-ish port."""
+    if not host.ports:
+        return
+    for p in host.ports:
+        if p.number not in _HTTP_AUDIT_PORTS:
+            continue
+        tls = p.number in (443, 4443, 8443, 9443)
+        # Pull crawled paths if web crawler ran
+        crawled = []
+        if p.crawl_info and p.crawl_info.get("pages_crawled"):
+            crawled = [
+                urllib_split_path(pg["url"])
+                for pg in p.crawl_info["pages_crawled"]
+            ]
+        try:
+            audit = audit_http(host.ip, p.number, tls=tls,
+                                crawled_paths=crawled or None)
+            if audit:
+                p.http_audit_info = audit
+        except Exception as e:
+            log.debug("http_audit %s:%d failed: %s", host.ip, p.number, e)
+
+
+def urllib_split_path(url: str) -> str:
+    """Extract just the path component from a URL."""
+    from urllib.parse import urlparse
+    try:
+        return urlparse(url).path or "/"
+    except Exception:
+        return "/"
 
 
 def _ssh_enum_host(host: Host) -> None:
@@ -294,6 +352,10 @@ def run_scan(
     shodan_enabled: bool = False,
     ssh_enum_enabled: bool = False,
     dns_enum_enabled: bool = False,
+    service_intel_enabled: bool = False,
+    http_audit_enabled: bool = False,
+    osint_enabled: bool = False,
+    netfabric_enabled: bool = False,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -353,6 +415,10 @@ def run_scan(
                 _ssh_enum_host(h)
             if web_crawl_enabled and h.ports:
                 _web_crawl_host(h)
+            if service_intel_enabled and h.ports:
+                _service_intel_host(h)
+            if http_audit_enabled and h.ports:
+                _http_audit_host(h)
             if vuln_scan and h.ports:
                 vuln_enrich_host(h)
         except Exception as e:  # one bad host shouldn't kill the scan
@@ -453,6 +519,40 @@ def run_scan(
             except Exception as e:
                 log.warning("DNS enum failed: %s", e)
 
+    # ── Phase 8: OSINT layer (target-level) ──────────────────────────────
+    osint_info = None
+    if osint_enabled:
+        if progress:
+            progress("OSINT lookup (crt.sh + ASN + RDAP)…")
+        try:
+            osint_info = run_osint(target, hosts)
+        except Exception as e:
+            log.warning("OSINT failed: %s", e)
+
+    # ── Phase 9: Network fabric (DHCP + traceroute) ─────────────────────
+    netfabric_info = None
+    if netfabric_enabled:
+        netfabric_info = {}
+        if progress:
+            progress("DHCP discover…")
+        try:
+            dhcp = dhcp_discover()
+            if dhcp:
+                netfabric_info["dhcp"] = dhcp
+        except Exception as e:
+            log.warning("DHCP discover failed: %s", e)
+        # Traceroute to first few hosts (cap to keep scan time bounded)
+        trace_targets = [h.ip for h in hosts if h.ports][:5]
+        if trace_targets:
+            if progress:
+                progress(f"traceroute to {len(trace_targets)} host(s)…")
+            try:
+                netfabric_info["traceroute"] = traceroute_many(trace_targets)
+            except Exception as e:
+                log.warning("traceroute failed: %s", e)
+        if not netfabric_info:
+            netfabric_info = None
+
     return ScanResult(
         target=target,
         started_at=started_iso,
@@ -461,4 +561,6 @@ def run_scan(
         hosts=hosts,
         scanner_version=__version__,
         dns_info=dns_info,
+        osint_info=osint_info,
+        netfabric_info=netfabric_info,
     )

@@ -118,6 +118,71 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
                 if p.ssh_info.get("issues"):
                     for iss in p.ssh_info["issues"][:2]:
                         ports_cell.append(f"  ⚠ SSH: {iss}\n", style="bold yellow")
+            # Service intel — RDP NTLM, Docker, k8s, ES, Mongo etc.
+            if p.service_intel:
+                si = p.service_intel
+                if si.get("ntlm_av_pairs"):
+                    av = si["ntlm_av_pairs"]
+                    dom = av.get("dns_domain_name") or av.get("netbios_domain_name")
+                    cn = av.get("dns_computer_name") or av.get("netbios_computer_name")
+                    osv = si.get("os_version", "")
+                    ports_cell.append(
+                        f"  RDP NTLM: {cn or '?'}@{dom or '?'} {osv}\n",
+                        style="bold magenta"
+                    )
+                if si.get("repositories"):
+                    ports_cell.append(
+                        f"  Docker repos: {', '.join(si['repositories'][:5])}\n",
+                        style="bold red"
+                    )
+                if si.get("indices"):
+                    ports_cell.append(
+                        f"  ES indices: {len(si['indices'])} ({', '.join(si['indices'][:3])})\n",
+                        style="bold red"
+                    )
+                if si.get("databases"):
+                    ports_cell.append(
+                        f"  Mongo DBs: {', '.join(si['databases'][:5])}\n",
+                        style="bold red"
+                    )
+                if si.get("gitVersion"):
+                    ports_cell.append(
+                        f"  k8s {si['gitVersion']}\n", style="cyan"
+                    )
+                if si.get("anonymous_bind") == "allowed":
+                    ports_cell.append(
+                        "  LDAP: anonymous bind ALLOWED\n", style="bold red"
+                    )
+                if si.get("monlist_responded"):
+                    ports_cell.append(
+                        f"  NTP monlist: amp ratio {si.get('amp_ratio', '?')}x\n",
+                        style="bold yellow"
+                    )
+            # HTTP audit findings
+            if p.http_audit_info:
+                ai = p.http_audit_info
+                if ai.get("cors", {}).get("severity"):
+                    ports_cell.append(
+                        f"  ⚠ CORS {ai['cors']['severity']}: {ai['cors'].get('note', '')[:80]}\n",
+                        style="bold red"
+                    )
+                if ai.get("graphql"):
+                    ports_cell.append(
+                        f"  ⚠ GraphQL introspection enabled: "
+                        f"{ai['graphql'].get('type_count', 0)} types\n",
+                        style="bold red"
+                    )
+                if ai.get("wordpress"):
+                    ports_cell.append(
+                        f"  ⚠ WP users exposed: {ai['wordpress'].get('count', 0)}\n",
+                        style="bold red"
+                    )
+                methods = ai.get("methods", {}).get("risky_methods_summary", [])
+                if methods:
+                    ports_cell.append(
+                        f"  Risky HTTP methods: {', '.join(methods)}\n",
+                        style="yellow"
+                    )
             # Web crawl summary
             if p.crawl_info:
                 ci = p.crawl_info
@@ -277,6 +342,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dns-enum", action="store_true",
                    help="Pull DNS records (A/AAAA/MX/NS/TXT/SOA), brute "
                         "common subdomains, try AXFR, analyze SPF/DMARC.")
+    p.add_argument("--service-intel", action="store_true",
+                   help="Service-specific deep probes: RDP NTLM disclosure, "
+                        "LDAP RootDSE, Docker registry catalog, k8s /version, "
+                        "Elasticsearch indices, MongoDB DB listing.")
+    p.add_argument("--http-audit", action="store_true",
+                   help="HTTP application audit: OPTIONS methods, CORS "
+                        "misconfig, GraphQL introspection, WP user enum.")
+    p.add_argument("--osint", action="store_true",
+                   help="OSINT layer: crt.sh Cert Transparency subdomain "
+                        "enum, team-cymru ASN lookup, RDAP WHOIS.")
+    p.add_argument("--netfabric", action="store_true",
+                   help="Network-fabric intel: DHCP DISCOVER broadcast + "
+                        "traceroute hop discovery to live hosts.")
     p.add_argument("--full-coverage", action="store_true",
                    help="MAXIMUM COVERAGE preset. Turns on: --vuln-scan, --deep, "
                         "--use-nmap, --use-searchsploit, --aggressive. "
@@ -326,6 +404,10 @@ def main(argv: list[str] | None = None) -> int:
         args.shodan = True
         args.ssh_enum = True
         args.dns_enum = True
+        args.service_intel = True
+        args.http_audit = True
+        args.osint = True
+        args.netfabric = True
         args.aggressive = True
         if args.ports == "top100":  # only override the default
             args.ports = "top1000"
@@ -333,7 +415,8 @@ def main(argv: list[str] | None = None) -> int:
             "[bold magenta]--full-coverage:[/bold magenta] enabling "
             "--vuln-scan --deep --use-nmap --use-searchsploit --rich-intel "
             "--epss-kev --unmask --udp-probe --web-crawl --shodan "
-            "--ssh-enum --dns-enum --aggressive, "
+            "--ssh-enum --dns-enum --service-intel --http-audit --osint "
+            "--netfabric --aggressive, "
             f"--ports={args.ports}"
         )
 
@@ -446,6 +529,10 @@ def main(argv: list[str] | None = None) -> int:
                     shodan_enabled=args.shodan,
                     ssh_enum_enabled=args.ssh_enum,
                     dns_enum_enabled=args.dns_enum,
+                    service_intel_enabled=args.service_intel,
+                    http_audit_enabled=args.http_audit,
+                    osint_enabled=args.osint,
+                    netfabric_enabled=args.netfabric,
                     nmap_timeout=args.nmap_timeout,
                     progress=progress,
                 )
@@ -549,6 +636,10 @@ def main(argv: list[str] | None = None) -> int:
                 shodan_enabled=args.shodan,
                 ssh_enum_enabled=args.ssh_enum,
                 dns_enum_enabled=args.dns_enum,
+                service_intel_enabled=args.service_intel,
+                http_audit_enabled=args.http_audit,
+                osint_enabled=args.osint,
+                netfabric_enabled=args.netfabric,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )
@@ -575,7 +666,8 @@ def main(argv: list[str] | None = None) -> int:
                   or args.rich_intel or args.epss_kev
                   or args.unmask or args.udp_probe
                   or args.web_crawl or args.shodan or args.ssh_enum
-                  or args.dns_enum)
+                  or args.dns_enum or args.service_intel
+                  or args.http_audit or args.osint or args.netfabric)
     console.print(render_result(result, show_vulns=show_vulns))
 
     if show_vulns:
@@ -647,6 +739,33 @@ def main(argv: list[str] | None = None) -> int:
         if di.get("axfr_attempts"):
             console.print("[bold red]⚠ AXFR succeeded on:[/bold red] "
                           + ", ".join(a["ns"] for a in di["axfr_attempts"]))
+
+    # OSINT summary
+    if result.osint_info:
+        oi = result.osint_info
+        if oi.get("crtsh"):
+            ct = oi["crtsh"]
+            console.print(
+                f"[bold]crt.sh:[/bold] {ct.get('subdomain_count', 0)} subdomain(s) "
+                f"from {ct.get('cert_rows', 0)} cert row(s)"
+            )
+        asn_hosts = oi.get("asn_per_host", {})
+        if asn_hosts:
+            console.print(f"[bold]ASN data:[/bold] {len(asn_hosts)} host(s) "
+                          "with public-IP attribution")
+
+    # Netfabric summary
+    if result.netfabric_info:
+        nf = result.netfabric_info
+        if nf.get("dhcp"):
+            dh = nf["dhcp"]
+            console.print(
+                f"[bold]DHCP server:[/bold] {dh.get('server_ip', '?')}, "
+                f"offered={dh.get('offered_ip', '?')}"
+            )
+        if nf.get("traceroute"):
+            console.print(f"[bold]Traceroute:[/bold] {len(nf['traceroute'])} "
+                          "host(s) hop-traced")
         else:
             console.print(
                 "[dim]No CVEs matched. Try [bold]--deep[/bold] for active "
