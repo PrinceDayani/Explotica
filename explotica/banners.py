@@ -65,6 +65,13 @@ def _generic_probe(host: str, port: int, timeout: float) -> str | None:
 def _clean(data: bytes) -> str | None:
     if not data:
         return None
+    # If the payload is mostly non-printable (binary protocol), don't try to
+    # decode — show a short hex preview instead. NetBIOS, RDP, SMB, and other
+    # binary protocols hit this branch.
+    printable = sum(1 for b in data if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
+    if printable / max(len(data), 1) < 0.7:
+        preview = data[:16].hex(" ")
+        return f"<binary {len(data)}B: {preview}…>"
     text = data.decode("utf-8", errors="replace").strip()
     # collapse to first non-empty line, cap length
     first = next((line for line in text.splitlines() if line.strip()), text)

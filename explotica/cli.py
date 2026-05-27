@@ -145,9 +145,10 @@ def main(argv: list[str] | None = None) -> int:
     console.print(render_result(result))
 
     if args.json:
-        Path(args.json).write_text(json.dumps(result.to_dict(), indent=2),
-                                   encoding="utf-8")
-        console.print(f"[green]✓[/green] JSON written to [cyan]{args.json}[/cyan]")
+        out = Path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"[green]✓[/green] JSON written to [cyan]{out}[/cyan]")
 
     return 0
 
