@@ -22,6 +22,20 @@ from .scanner import run_scan
 
 log = logging.getLogger(__name__)
 
+
+def _parse_ssh_creds(creds_str: str, key_filename: str = None) -> dict:
+    """Parse `user:password` (or just `user` with key) for credentialed scan."""
+    if ":" in creds_str:
+        user, password = creds_str.split(":", 1)
+    else:
+        user = creds_str
+        password = None
+    return {
+        "username": user,
+        "password": password,
+        "key_filename": key_filename,
+    }
+
 console = Console()
 
 
@@ -390,6 +404,16 @@ def main(argv: list[str] | None = None) -> int:
                         "preauth. Requires --ad-enum DOMAIN.")
     p.add_argument("--smtp-audit", action="store_true",
                    help="SMTP open-relay test + VRFY/EXPN user enum on port 25/587")
+    p.add_argument("--os-fp-db", action="store_true",
+                   help="Multi-signal OS fingerprinting (TTL + ports + banners + MAC vendor)")
+    p.add_argument("--verify-cves", action="store_true",
+                   help="Run hand-written verification probes for top CVEs "
+                        "(Heartbleed/MS17-010/Shellshock/BlueKeep/Log4Shell/ProxyShell/Apache)")
+    p.add_argument("--ssh-creds", metavar="USER:PASSWORD",
+                   help="Run credentialed SSH scan: inventory installed pkgs + "
+                        "match against NVD. Format: user:pass (or user with --ssh-key)")
+    p.add_argument("--ssh-key", metavar="KEYFILE",
+                   help="SSH private key for credentialed scan (use with --ssh-creds USER)")
     p.add_argument("--all-the-things", action="store_true",
                    help="EVERYTHING — full-coverage + ALL active opt-in checks. "
                         "Requires authorized engagement (account lockout / login attempts).")
@@ -459,6 +483,9 @@ def main(argv: list[str] | None = None) -> int:
         args.web_security = True
         args.ics = True
         args.prioritize = True
+        # Phase 36-38: deep scanning side
+        args.os_fp_db = True
+        args.verify_cves = True
         # NOTE: --syn-scan deliberately NOT included in --full-coverage.
         # Per-packet L3 routing in scapy makes it slower than async TCP on
         # most LANs. Opt in explicitly via --syn-scan when you want it.
@@ -489,6 +516,8 @@ def main(argv: list[str] | None = None) -> int:
         args.web_security = True
         args.ics = True
         args.prioritize = True
+        args.os_fp_db = True
+        args.verify_cves = True
         args.aggressive = True
         # PLUS active opt-in modules:
         args.check_default_creds = True
@@ -760,6 +789,11 @@ def main(argv: list[str] | None = None) -> int:
                 ad_enum_domain=args.ad_enum,
                 asrep_roast=args.asrep_roast,
                 smtp_audit=args.smtp_audit,
+                os_fp_db=args.os_fp_db,
+                verify_cve_probes=args.verify_cves,
+                credentialed_scan_enabled=bool(args.ssh_creds),
+                ssh_credentials=_parse_ssh_creds(args.ssh_creds, args.ssh_key)
+                                  if args.ssh_creds else None,
                 nmap_timeout=args.nmap_timeout,
                 progress=progress,
             )

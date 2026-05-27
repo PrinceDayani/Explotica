@@ -378,6 +378,11 @@ def run_scan(
     ad_enum_domain: Optional[str] = None,
     asrep_roast: bool = False,
     smtp_audit: bool = False,
+    # Phase 36-38
+    os_fp_db: bool = False,
+    verify_cve_probes: bool = False,
+    credentialed_scan_enabled: bool = False,
+    ssh_credentials: Optional[dict] = None,
     nmap_timeout: int = 180,
     progress: ProgressCb = None,
 ) -> ScanResult:
@@ -831,6 +836,39 @@ def run_scan(
                 extra_findings["honeypot_indicators"] = hp
         except Exception as e:
             log.warning("honeypot detection failed: %s", e)
+
+    if os_fp_db and hosts:
+        if progress:
+            progress("Multi-signal OS fingerprinting…")
+        try:
+            from .os_fp_db import fingerprint_scan
+            scan_dict = {"hosts": [h.to_dict() for h in hosts]}
+            extra_findings["os_fingerprints"] = fingerprint_scan(scan_dict)
+        except Exception as e:
+            log.warning("OS fingerprint failed: %s", e)
+
+    if verify_cve_probes and hosts:
+        if progress:
+            progress("Verification probes (Heartbleed/MS17-010/Shellshock/BlueKeep/Log4Shell…)")
+        try:
+            from .verify_probes import verify_scan
+            scan_dict = {"hosts": [h.to_dict() for h in hosts]}
+            verify_results = verify_scan(scan_dict)
+            if verify_results:
+                extra_findings["verified_cves"] = verify_results
+        except Exception as e:
+            log.warning("verify probes failed: %s", e)
+
+    if credentialed_scan_enabled and ssh_credentials and hosts:
+        if progress:
+            progress(f"Credentialed SSH scan ({ssh_credentials.get('username','root')}@…)")
+        try:
+            from .creds_scan import credentialed_scan_hosts
+            creds_results = credentialed_scan_hosts(hosts, ssh_credentials)
+            if creds_results:
+                extra_findings["credentialed"] = creds_results
+        except Exception as e:
+            log.warning("credentialed scan failed: %s", e)
 
     if prioritize_scores and hosts:
         if progress:

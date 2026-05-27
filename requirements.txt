@@ -13,3 +13,5 @@ textual>=0.50.0
 playwright>=1.40.0
 # Optional — required for PDF report (--report-pdf).
 weasyprint>=60.0
+# Optional — required for --ssh-creds credentialed scanning.
+paramiko>=3.0.0
