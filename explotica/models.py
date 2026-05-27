@@ -92,3 +92,49 @@ class ScanResult:
             "scanner_version": self.scanner_version,
             "hosts": [h.to_dict() for h in self.hosts],
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ScanResult":
+        hosts = [
+            Host(
+                ip=h["ip"],
+                mac=h.get("mac"),
+                vendor=h.get("vendor"),
+                hostname=h.get("hostname"),
+                is_up=h.get("is_up", True),
+                response_ms=h.get("response_ms"),
+                ports=[
+                    Port(
+                        number=p["number"],
+                        protocol=p.get("protocol", "tcp"),
+                        state=p.get("state", "open"),
+                        service=p.get("service"),
+                        banner=p.get("banner"),
+                        product_vendor=p.get("product_vendor"),
+                        product_name=p.get("product_name"),
+                        product_version=p.get("product_version"),
+                        cves=[
+                            CVE(
+                                id=c["id"],
+                                severity=c.get("severity", "UNKNOWN"),
+                                cvss=c.get("cvss"),
+                                summary=c.get("summary"),
+                                published=c.get("published"),
+                                source=c.get("source", "NVD"),
+                            )
+                            for c in p.get("cves", [])
+                        ],
+                    )
+                    for p in h.get("ports", [])
+                ],
+            )
+            for h in data.get("hosts", [])
+        ]
+        return cls(
+            target=data["target"],
+            started_at=data["started_at"],
+            finished_at=data["finished_at"],
+            duration_s=data.get("duration_s", 0.0),
+            hosts=hosts,
+            scanner_version=data.get("scanner_version", "unknown"),
+        )

@@ -18,22 +18,28 @@ log = logging.getLogger(__name__)
 # Order matters: more specific patterns should come first.
 _BANNER_PATTERNS: list[tuple[re.Pattern, str, str]] = [
     # ── SSH ───────────────────────────────────────────────────────────
-    (re.compile(r"SSH-\d+\.\d+-OpenSSH[_-](?P<v>[\d.p]+)", re.I),
+    # OpenSSH version can be like 7.4, 7.4p1, 8.2p1 — strip the p-suffix
+    # because NVD CPEs use plain X.Y for the major version.
+    (re.compile(r"SSH-\d+\.\d+-OpenSSH[_-](?P<v>\d+\.\d+(?:p\d+)?)", re.I),
      "openbsd", "openssh"),
-    (re.compile(r"SSH-\d+\.\d+-Dropbear[_ ](?P<v>[\d.]+)", re.I),
-     "matt_johnston", "dropbear_ssh"),
+    (re.compile(r"SSH-\d+\.\d+-dropbear[_ ]?(?P<v>\d+\.\d+(?:\.\d+)?)", re.I),
+     "dropbear_ssh_project", "dropbear_ssh"),
+    (re.compile(r"SSH-\d+\.\d+-libssh[_ -]?(?P<v>\d+\.\d+(?:\.\d+)?)", re.I),
+     "libssh", "libssh"),
 
     # ── FTP ───────────────────────────────────────────────────────────
-    (re.compile(r"\(ProFTPD\s+(?P<v>[\d.]+)", re.I),
+    # Synology's "NASFTPD Turbo Station X.Y.Z Server (ProFTPD)" — the X.Y.Z
+    # is the ProFTPD version. Map directly to proftpd:proftpd CPE.
+    (re.compile(r"NASFTPD\s+Turbo\s+Station\s+(?P<v>\d+\.\d+\.\d+)", re.I),
      "proftpd", "proftpd"),
-    (re.compile(r"vsFTPd\s+(?P<v>[\d.]+)", re.I),
+    (re.compile(r"ProFTPD\s+(?P<v>\d+\.\d+\.\d+)", re.I),
+     "proftpd", "proftpd"),
+    (re.compile(r"vsFTPd\s+(?P<v>\d+\.\d+(?:\.\d+)?)", re.I),
      "vsftpd_project", "vsftpd"),
-    (re.compile(r"Pure-FTPd\s+\[?(?P<v>[\d.]+)", re.I),
+    (re.compile(r"Pure-FTPd\s+\[?(?P<v>\d+\.\d+(?:\.\d+)?)", re.I),
      "pureftpd", "pure-ftpd"),
-    (re.compile(r"FileZilla Server\s+(?P<v>[\d.]+)", re.I),
+    (re.compile(r"FileZilla Server\s+(?P<v>\d+\.\d+(?:\.\d+)?)", re.I),
      "filezilla-project", "filezilla_server"),
-    (re.compile(r"NASFTPD\s+Turbo\s+Station\s+(?P<v>[\d.]+)", re.I),
-     "synology", "diskstation_manager"),  # Synology NAS marker
 
     # ── HTTP — Server header (needs --deep to capture reliably) ───────
     (re.compile(r"Server:\s*nginx/(?P<v>[\d.]+)", re.I),
@@ -66,8 +72,13 @@ _BANNER_PATTERNS: list[tuple[re.Pattern, str, str]] = [
      "postgresql", "postgresql"),
 
     # ── Rsync ─────────────────────────────────────────────────────────
-    (re.compile(r"@RSYNCD:\s*(?P<v>[\d.]+)", re.I),
-     "samba", "rsync"),
+    # NOTE: @RSYNCD: 31.0 reports the rsync PROTOCOL version (e.g. 31),
+    # not the software version. NVD doesn't index by protocol number, so
+    # we DON'T pattern-match this — it would just produce 0 hits and
+    # mislead the user. To get rsync software version, --use-nmap or
+    # check the banner directly. The mapping below would be:
+    #   protocol 31 → rsync 3.1.x or 3.2.x (ambiguous)
+    #   protocol 30 → rsync 3.0.x
 
     # ── Telnet ────────────────────────────────────────────────────────
     # (Telnet banners vary wildly; usually just OS strings)
@@ -98,16 +109,23 @@ def enrich_port(ip: str, port: Port) -> Port:
     """Fill in product/version/cves on a Port if banner can be parsed."""
     match = parse_banner(port.banner)
     if not match:
+        log.debug("vulnscan %s:%d — no banner pattern matched (%s)",
+                  ip, port.number, (port.banner or "")[:80])
         return port
     vendor, product, version = match
     port.product_vendor = vendor
     port.product_name = product
     port.product_version = version
+    log.info("vulnscan %s:%d — parsed %s:%s:%s, querying NVD…",
+             ip, port.number, vendor, product, version)
     try:
         port.cves = lookup_cves(vendor, product, version)
     except Exception as e:
         log.warning("CVE lookup failed for %s:%d (%s %s): %s",
                     ip, port.number, product, version, e)
+        return port
+    log.info("vulnscan %s:%d — %d CVE(s) for %s:%s:%s",
+             ip, port.number, len(port.cves), vendor, product, version)
     return port
 
 

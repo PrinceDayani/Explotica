@@ -115,8 +115,17 @@ def main(argv: list[str] | None = None) -> int:
         prog="explotica",
         description="Network discovery & reconnaissance — for authorized use only.",
     )
-    p.add_argument("target",
-                   help="CIDR ('192.168.1.0/24'), single IP, or hostname")
+    p.add_argument("target", nargs="?",
+                   help="CIDR ('192.168.1.0/24'), single IP, or hostname. "
+                        "Optional when using --from-json or --auto.")
+    p.add_argument("--auto", action="store_true",
+                   help="Auto-discover all directly-connected subnets and scan "
+                        "each. Don't combine with a positional target.")
+    p.add_argument("--max-hosts-per-subnet", type=int, default=4096,
+                   help="Refuse to auto-scan subnets larger than this many "
+                        "addresses (default: 4096 = /20).")
+    p.add_argument("--list-network", action="store_true",
+                   help="Just print the discovered subnets and exit — no scanning.")
     p.add_argument("-p", "--ports", default="top100",
                    help="Ports: 'top100', 'top1000', 'all', or '22,80,443' or '1-1024'")
     p.add_argument("--no-arp", action="store_true",
@@ -141,6 +150,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--banner-timeout", type=float, default=1.5)
     p.add_argument("--json", metavar="PATH",
                    help="Also write results as JSON to PATH")
+    p.add_argument("--from-json", metavar="PATH",
+                   help="Skip the scan; load a previous scan from JSON and "
+                        "(optionally) re-run --vuln-scan / --use-nmap on it.")
+    p.add_argument("--report-html", metavar="PATH",
+                   help="Write a self-contained HTML report to PATH.")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--version", action="version", version=f"explotica {__version__}")
     args = p.parse_args(argv)
@@ -150,16 +164,18 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
-    try:
-        ports = parse_ports(args.ports)
-    except ValueError as e:
-        console.print(f"[red]Invalid --ports value:[/red] {e}")
-        return 2
+    # ── --list-network: read-only enumeration, no scanning ───────────
+    if args.list_network:
+        from .enumerate import list_subnets, format_summary
+        net = list_subnets(max_hosts_per_subnet=args.max_hosts_per_subnet)
+        console.print(format_summary(net))
+        return 0
 
-    console.print(
-        f"[bold]Explotica[/bold] scanning [cyan]{args.target}[/cyan] "
-        f"({len(ports)} port(s), workers={args.workers})"
-    )
+    # Validate input mode
+    if not args.target and not args.from_json and not args.auto:
+        console.print("[red]Need one of: positional `target`, `--from-json PATH`, "
+                      "or `--auto`.[/red]")
+        return 2
 
     status_line = ""
 
@@ -168,31 +184,134 @@ def main(argv: list[str] | None = None) -> int:
         status_line = msg
         console.print(f"  [dim]·[/dim] {msg}")
 
-    try:
-        result = run_scan(
-            args.target,
-            use_arp=not args.no_arp,
-            ports=ports,
-            port_timeout=args.port_timeout,
-            banner_timeout=args.banner_timeout,
-            host_workers=args.workers,
-            skip_banners=args.no_banners,
-            vuln_scan=args.vuln_scan,
-            deep=args.deep,
-            use_nmap=args.use_nmap,
-            nmap_timeout=args.nmap_timeout,
-            progress=progress,
+    # ── Branch 0: --auto — enumerate then scan each subnet ────────────
+    if args.auto and not args.from_json:
+        from .enumerate import list_subnets, format_summary
+        from .models import ScanResult
+        net = list_subnets(max_hosts_per_subnet=args.max_hosts_per_subnet)
+        console.print("[bold]Auto-discovered network position:[/bold]")
+        console.print(format_summary(net))
+        if not net.subnets:
+            console.print("[red]No reachable subnets found to scan.[/red]")
+            return 2
+
+        try:
+            port_list = parse_ports(args.ports)
+        except ValueError as e:
+            console.print(f"[red]Invalid --ports value:[/red] {e}")
+            return 2
+
+        agg_started = ScanResult.now_iso()
+        import time as _time
+        t0 = _time.perf_counter()
+        all_hosts = []
+        targets_scanned = []
+        for sn in net.subnets:
+            console.print(
+                f"\n[bold cyan]▶ Scanning {sn.cidr}[/bold cyan] "
+                f"(iface={sn.interface}, gw={sn.gateway or '-'})"
+            )
+            try:
+                sub_result = run_scan(
+                    sn.cidr,
+                    use_arp=not args.no_arp,
+                    ports=port_list,
+                    port_timeout=args.port_timeout,
+                    banner_timeout=args.banner_timeout,
+                    host_workers=args.workers,
+                    skip_banners=args.no_banners,
+                    vuln_scan=args.vuln_scan,
+                    deep=args.deep,
+                    use_nmap=args.use_nmap,
+                    nmap_timeout=args.nmap_timeout,
+                    progress=progress,
+                )
+            except KeyboardInterrupt:
+                console.print("[red]Aborted by user.[/red]")
+                return 130
+            except Exception as e:
+                console.print(f"[yellow]  scan of {sn.cidr} failed: {e}[/yellow]")
+                continue
+            all_hosts.extend(sub_result.hosts)
+            targets_scanned.append(sn.cidr)
+            # Mark which subnet each host belongs to using hostname if empty
+            # (small affordance — not perfect but helps cross-subnet reports)
+
+        result = ScanResult(
+            target="auto: " + ", ".join(targets_scanned),
+            started_at=agg_started,
+            finished_at=ScanResult.now_iso(),
+            duration_s=round(_time.perf_counter() - t0, 2),
+            hosts=all_hosts,
+            scanner_version=__version__,
         )
-    except NotImplementedError as e:
-        console.print(f"[yellow]Orchestrator not implemented yet:[/yellow] {e}")
-        return 3
-    except KeyboardInterrupt:
-        console.print("[red]Aborted by user.[/red]")
-        return 130
-    except PermissionError as e:
-        console.print(f"[red]Permission denied:[/red] {e}\n"
-                      "On Windows, ARP needs Administrator + Npcap installed.")
-        return 1
+
+    # ── Branch A: load from existing JSON, optionally re-enrich ──────
+    elif args.from_json:
+        from .models import ScanResult
+        try:
+            data = json.loads(Path(args.from_json).read_text(encoding="utf-8"))
+            result = ScanResult.from_dict(data)
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            console.print(f"[red]Could not load {args.from_json}:[/red] {e}")
+            return 2
+        console.print(
+            f"[bold]Loaded[/bold] {len(result.hosts)} host(s) from "
+            f"[cyan]{args.from_json}[/cyan] (target was [cyan]{result.target}[/cyan])"
+        )
+        # Re-enrich if requested
+        if args.vuln_scan or args.deep or args.use_nmap:
+            from .nmap_wrap import enrich_host_with_nmap, nmap_available
+            from .service_fp import deepen_host
+            from .vulnscan import enrich_host as vuln_enrich_host
+            for h in result.hosts:
+                if args.deep and h.ports:
+                    progress(f"deep probe {h.ip}…")
+                    deepen_host(h.ip, h.ports)
+                if args.vuln_scan and h.ports:
+                    progress(f"NVD lookup {h.ip}…")
+                    vuln_enrich_host(h)
+                if args.use_nmap and h.ports and nmap_available():
+                    progress(f"nmap NSE {h.ip}…")
+                    enrich_host_with_nmap(h.ip, h.ports, timeout=args.nmap_timeout)
+    # ── Branch B: live scan ───────────────────────────────────────────
+    else:
+        try:
+            ports = parse_ports(args.ports)
+        except ValueError as e:
+            console.print(f"[red]Invalid --ports value:[/red] {e}")
+            return 2
+
+        console.print(
+            f"[bold]Explotica[/bold] scanning [cyan]{args.target}[/cyan] "
+            f"({len(ports)} port(s), workers={args.workers})"
+        )
+
+        try:
+            result = run_scan(
+                args.target,
+                use_arp=not args.no_arp,
+                ports=ports,
+                port_timeout=args.port_timeout,
+                banner_timeout=args.banner_timeout,
+                host_workers=args.workers,
+                skip_banners=args.no_banners,
+                vuln_scan=args.vuln_scan,
+                deep=args.deep,
+                use_nmap=args.use_nmap,
+                nmap_timeout=args.nmap_timeout,
+                progress=progress,
+            )
+        except NotImplementedError as e:
+            console.print(f"[yellow]Orchestrator not implemented yet:[/yellow] {e}")
+            return 3
+        except KeyboardInterrupt:
+            console.print("[red]Aborted by user.[/red]")
+            return 130
+        except PermissionError as e:
+            console.print(f"[red]Permission denied:[/red] {e}\n"
+                          "On Windows, ARP needs Administrator + Npcap installed.")
+            return 1
 
     show_vulns = args.vuln_scan or args.use_nmap or args.deep
     console.print(render_result(result, show_vulns=show_vulns))
@@ -220,6 +339,11 @@ def main(argv: list[str] | None = None) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
         console.print(f"[green]✓[/green] JSON written to [cyan]{out}[/cyan]")
+
+    if args.report_html:
+        from .report import write_report
+        out = write_report(result, args.report_html)
+        console.print(f"[green]✓[/green] HTML report at [cyan]{out}[/cyan]")
 
     return 0
 

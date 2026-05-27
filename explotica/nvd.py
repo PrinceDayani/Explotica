@@ -103,9 +103,13 @@ def _fetch(cpe: str, timeout: float = 8.0) -> Optional[dict]:
     })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            data = json.loads(resp.read().decode("utf-8"))
+            total = data.get("totalResults", 0)
+            log.info("NVD: %s → %d CVE(s)%s", cpe, total,
+                     "" if NVD_API_KEY else "  [no api key — rate limited]")
+            return data
     except Exception as e:
-        log.debug("NVD fetch failed for %s: %s", cpe, e)
+        log.warning("NVD fetch FAILED for %s: %s", cpe, e)
         return None
 
 
