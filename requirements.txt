@@ -11,3 +11,5 @@ textual>=0.50.0
 # Optional — required only for --browser-crawl (Playwright).
 # After install run: playwright install chromium
 playwright>=1.40.0
+# Optional — required for PDF report (--report-pdf).
+weasyprint>=60.0
