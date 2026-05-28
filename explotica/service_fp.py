@@ -212,7 +212,10 @@ def deepen_host(host_ip: str, ports: list[Port],
     and merge its output into port.banner if we learned something new."""
     from concurrent.futures import ThreadPoolExecutor
 
-    targets = [p for p in ports if p.number in DEEP_PROBE_PORTS]
+    # Phase 56: deep active probes only on OPEN ports — sending a TLS
+    # ClientHello to a filtered port just wastes 2.5s per attempt.
+    targets = [p for p in ports
+                if p.number in DEEP_PROBE_PORTS and p.state == "open"]
     if not targets:
         return
 

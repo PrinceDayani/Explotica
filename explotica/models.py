@@ -46,9 +46,15 @@ class Exploit:
 class Port:
     number: int
     protocol: str = "tcp"
-    state: str = "open"
+    state: str = "open"                # open / closed / filtered / unknown
+    state_reason: Optional[str] = None  # "syn-ack" / "RST" / "timeout" / "ICMP host-unreachable" / etc.
     service: Optional[str] = None
+    # Phase 56: did the service name come from evidence (banner/fingerprint)
+    # or from a hardcoded IANA port→name lookup? Critical for honest output.
+    iana_guess: bool = False           # True when service is just a port-number guess
     banner: Optional[str] = None
+    # Phase 56: which banner probes were attempted (debug + audit)
+    probes_attempted: list[str] = field(default_factory=list)
     # Version + vuln data (populated by --vuln-scan / --deep / --use-nmap)
     product_vendor: Optional[str] = None   # e.g. "proftpd"
     product_name: Optional[str] = None     # e.g. "proftpd"
@@ -72,8 +78,11 @@ class Port:
             "number": self.number,
             "protocol": self.protocol,
             "state": self.state,
+            "state_reason": self.state_reason,
             "service": self.service,
+            "iana_guess": self.iana_guess,
             "banner": self.banner,
+            "probes_attempted": self.probes_attempted,
             "product_vendor": self.product_vendor,
             "product_name": self.product_name,
             "product_version": self.product_version,
@@ -103,6 +112,12 @@ class Host:
     os_hint: Optional[dict] = None         # {os_family, hops_estimate, initial_ttl, observed_ttl}
     ttl: Optional[int] = None              # raw observed TTL
     udp_services: Optional[dict] = None    # {snmp, mdns, ssdp, netbios} → result dicts
+
+    def open_ports(self) -> list[Port]:
+        """Subset of self.ports where state == 'open'. Phase 56: enrichment
+        functions should use this instead of iterating self.ports directly,
+        since closed/filtered ports are now included in self.ports."""
+        return [p for p in self.ports if p.state == "open"]
 
     def to_dict(self) -> dict:
         return {
@@ -171,7 +186,10 @@ class ScanResult:
                         number=p["number"],
                         protocol=p.get("protocol", "tcp"),
                         state=p.get("state", "open"),
+                        state_reason=p.get("state_reason"),
                         service=p.get("service"),
+                        iana_guess=p.get("iana_guess", False),
+                        probes_attempted=p.get("probes_attempted", []),
                         banner=p.get("banner"),
                         product_vendor=p.get("product_vendor"),
                         product_name=p.get("product_name"),

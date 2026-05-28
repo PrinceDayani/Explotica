@@ -154,8 +154,14 @@ def enrich_host(host: Host, workers: int = 4) -> Host:
     """
     if not host.ports:
         return host
+    # Phase 56: enrich only OPEN ports — closed/filtered have no service
+    # banner to parse against NVD, and active version probes would just
+    # waste the deep-probe timeout budget.
+    targets = [p for p in host.ports if p.state == "open"]
+    if not targets:
+        return host
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(enrich_port, host.ip, p) for p in host.ports]
+        futs = [pool.submit(enrich_port, host.ip, p) for p in targets]
         for _ in as_completed(futs):
             pass
     return host

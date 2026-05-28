@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from . import __version__
-from .banners import grab_banner
+from .banners import grab_banner, grab_banner_full
 from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
 from .models import Host, Port, ScanResult
 from .aio import run_async_scan
@@ -100,10 +100,11 @@ _HTTPS_PORTS = frozenset({443, 4443, 8443, 9443})
 
 
 def _service_intel_host(host: Host) -> None:
-    """Run service_probes_v2 probes for ports we know how to deep-probe."""
+    """Run service_probes_v2 probes for ports we know how to deep-probe.
+    Phase 56: only open ports — closed/filtered would just timeout."""
     if not host.ports:
         return
-    for p in host.ports:
+    for p in host.open_ports():
         if p.number not in SERVICE_PROBES:
             continue
         try:
@@ -120,10 +121,11 @@ _HTTP_AUDIT_PORTS = frozenset({80, 81, 88, 800, 3000, 5000, 7001, 8000,
 
 
 def _http_audit_host(host: Host) -> None:
-    """Run http_audit (methods/CORS/GraphQL/WP) for each HTTP-ish port."""
+    """Run http_audit (methods/CORS/GraphQL/WP) for each HTTP-ish port.
+    Phase 56: only open ports."""
     if not host.ports:
         return
-    for p in host.ports:
+    for p in host.open_ports():
         if p.number not in _HTTP_AUDIT_PORTS:
             continue
         tls = p.number in (443, 4443, 8443, 9443)
@@ -153,10 +155,13 @@ def urllib_split_path(url: str) -> str:
 
 
 def _ssh_enum_host(host: Host) -> None:
-    """Enumerate SSH algorithms on any port serving SSH."""
-    for p in host.ports:
-        # SSH usually runs on 22 but can be anywhere; detect from banner
-        if p.number == 22 or (p.banner and p.banner.startswith(("SSH-", "deep: SSH-"))):
+    """Enumerate SSH algorithms on any port serving SSH.
+    Phase 56: only open ports. SSH-detection-by-content (works for non-22)."""
+    for p in host.open_ports():
+        # SSH usually runs on 22 but can be anywhere; detect from banner or
+        # from the content-based service identifier set by banners.py.
+        if (p.number == 22 or p.service == "ssh"
+                or (p.banner and p.banner.startswith(("SSH-", "deep: SSH-")))):
             try:
                 info = enum_ssh(host.ip, p.number)
                 if info:
@@ -172,9 +177,13 @@ _HTTPS_PORTS_CRAWL = frozenset({443, 4443, 8443, 9443})
 
 
 def _web_crawl_host(host: Host) -> None:
-    """Crawl every HTTP/HTTPS port on this host."""
-    for p in host.ports:
-        if p.number not in _HTTP_LIKE_PORTS:
+    """Crawl every HTTP/HTTPS port on this host. Phase 56: open ports only,
+    AND honors content-based 'http' service detection so non-standard ports
+    get crawled if banner-grab identified them as HTTP."""
+    for p in host.open_ports():
+        is_http_port = p.number in _HTTP_LIKE_PORTS
+        is_http_content = p.service in ("http", "https", "tls")
+        if not (is_http_port or is_http_content):
             continue
         try:
             info = web_crawl(host.ip, p.number,
@@ -195,7 +204,8 @@ def _unmask_host(host: Host) -> None:
     if not host.ports:
         return
     probe_ports = unmask_ports()
-    candidates = [p for p in host.ports
+    # Phase 56: only unmask OPEN ports (probing closed/filtered is wasted RTT)
+    candidates = [p for p in host.open_ports()
                   if p.number in probe_ports and not p.product_name]
     if not candidates:
         return
@@ -238,6 +248,9 @@ def _rich_intel_host(host: Host) -> None:
     """
     if not host.ports:
         return
+    open_ps = host.open_ports()
+    if not open_ps:
+        return
 
     def enrich_port(p: Port) -> None:
         try:
@@ -263,13 +276,21 @@ def _rich_intel_host(host: Host) -> None:
         except Exception as e:
             log.debug("rich-intel %s:%d failed: %s", host.ip, p.number, e)
 
-    with ThreadPoolExecutor(max_workers=min(8, len(host.ports))) as pool:
-        list(pool.map(enrich_port, host.ports))
+    with ThreadPoolExecutor(max_workers=min(8, len(open_ps))) as pool:
+        list(pool.map(enrich_port, open_ps))
 
 
-def _scan_host_ports(host: Host, ports: list[int], port_timeout: float) -> Host:
-    """Open-port scan for one host. Mutates host in place."""
-    host.ports = scan_ports(host.ip, ports=ports, timeout=port_timeout)
+def _scan_host_ports(host: Host, ports: list[int], port_timeout: float,
+                      *, include_closed: bool = True,
+                      include_filtered: bool = True) -> Host:
+    """State-aware port scan for one host. Mutates host in place.
+
+    Phase 56: emits open + closed + filtered by default. Caller controls
+    state filtering via include_* kwargs.
+    """
+    host.ports = scan_ports(host.ip, ports=ports, timeout=port_timeout,
+                             include_closed=include_closed,
+                             include_filtered=include_filtered)
     return host
 
 
@@ -300,18 +321,49 @@ def _grab_host_banners(host: Host, banner_timeout: float,
     if not host.ports:
         return host
 
-    targets = [p for p in host.ports if p.number not in _BANNER_SKIP]
+    # Phase 56: only grab banners on OPEN ports — closed/filtered ports have
+    # nothing to say. The state-aware scanner now emits all 3 states; we filter
+    # here so we don't waste banner_timeout seconds per closed port.
+    targets = [p for p in host.ports
+               if p.state == "open" and p.number not in _BANNER_SKIP]
     if not targets:
+        # Still apply IANA hints on open ports with no banner attempt
+        from .ports import apply_iana_guess
+        for p in host.ports:
+            if p.state == "open":
+                apply_iana_guess(p)
         return host
 
     def grab(p: Port) -> None:
         try:
-            p.banner = grab_banner(host.ip, p.number, timeout=banner_timeout)
+            banner, service, product, version, probes = grab_banner_full(
+                host.ip, p.number, timeout=banner_timeout
+            )
+            p.banner = banner
+            # Phase 56: content-based service identification — overrides any
+            # earlier port-number guess. Set ONLY when we have evidence.
+            if service:
+                p.service = service
+                p.iana_guess = False
+            if product and not p.product_name:
+                p.product_name = product
+            if version and not p.product_version:
+                p.product_version = version
+            if probes:
+                p.probes_attempted = probes
         except Exception as e:
             log.debug("banner %s:%d failed: %s", host.ip, p.number, e)
 
     with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as pool:
         list(pool.map(grab, targets))
+
+    # Phase 56: after banner+fingerprint, tag any open ports that STILL have
+    # no service as IANA guesses. This way the JSON is never empty, but the
+    # iana_guess flag makes clear that it's just a polite hint.
+    from .ports import apply_iana_guess
+    for p in host.ports:
+        if p.state == "open":
+            apply_iana_guess(p)
     return host
 
 
@@ -391,6 +443,9 @@ def run_scan(
     web_fuzz_enabled: bool = False,
     sqli_time_based: bool = False,
     nmap_timeout: int = 180,
+    # Phase 56: state filtering — defaults emit all 3 states
+    include_closed: bool = True,
+    include_filtered: bool = True,
     progress: ProgressCb = None,
 ) -> ScanResult:
     """Run a full scan and return a ScanResult.
@@ -534,7 +589,9 @@ def run_scan(
             # ── Sequential prelude (each step depends on the previous) ──
             _enrich(h)
             if not async_populated:
-                _scan_host_ports(h, ports or [], port_timeout)
+                _scan_host_ports(h, ports or [], port_timeout,
+                                 include_closed=include_closed,
+                                 include_filtered=include_filtered)
                 if not skip_banners and h.ports:
                     _grab_host_banners(h, banner_timeout, workers=16)
             if deep and h.ports:
@@ -614,7 +671,8 @@ def run_scan(
         # Build per-host port list of just the unfingerprinted ports
         per_host: dict[str, list[int]] = {}
         for h in hosts:
-            ufp = [p.number for p in h.ports if not p.product_name]
+            # Phase 56: only nmap-probe OPEN ports (closed/filtered would waste time)
+            ufp = [p.number for p in h.open_ports() if not p.product_name]
             if ufp:
                 per_host[h.ip] = ufp
         if per_host:
@@ -723,9 +781,10 @@ def run_scan(
             from .ics import probe_ics_host
             ics_results = {}
             for h in hosts:
-                if not h.ports:
+                open_ps = h.open_ports()
+                if not open_ps:
                     continue
-                r = probe_ics_host(h.ip, [p.number for p in h.ports])
+                r = probe_ics_host(h.ip, [p.number for p in open_ps])
                 if r:
                     ics_results[h.ip] = r
             if ics_results:
@@ -763,7 +822,8 @@ def run_scan(
             from .default_creds import check_host_defaults
             dc_results: dict = {}
             for h in hosts:
-                ports = [p.number for p in h.ports]
+                # Phase 56: default-cred check should only target OPEN ports
+                ports = [p.number for p in h.open_ports()]
                 if ports:
                     found = check_host_defaults(h.ip, ports)
                     if found:

@@ -95,10 +95,20 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
     for host in sorted(result.hosts, key=lambda h: tuple(int(o) for o in h.ip.split("."))):
         ports_cell = Text()
         vulns_cell = Text()
-        for p in host.ports:
+        # Phase 56: rendered table shows only open ports by default to avoid
+        # 65k-row tables. Closed/filtered counts shown as summary. Full data
+        # is still in JSON output.
+        open_ports = [p for p in host.ports if p.state == "open"]
+        closed_count = sum(1 for p in host.ports if p.state == "closed")
+        filtered_count = sum(1 for p in host.ports if p.state == "filtered")
+        for p in open_ports:
             label = f"{p.number}"
             if p.service:
-                label += f"/{p.service}"
+                # iana_guess=True means "we're labeling it but it's just a hint"
+                if p.iana_guess:
+                    label += f"/{p.service}?"
+                else:
+                    label += f"/{p.service}"
             ports_cell.append(label + " ", style="bold green")
             if p.product_name and p.product_version:
                 ports_cell.append(
@@ -286,6 +296,19 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
             if udp_summary:
                 host_display += f"\n[dim cyan]UDP: {', '.join(udp_summary)}[/dim cyan]"
 
+        # Phase 56: closed + filtered summary in dim italics so the user can
+        # see them without flooding the table
+        if closed_count or filtered_count:
+            tail = []
+            if closed_count:
+                tail.append(f"{closed_count} closed")
+            if filtered_count:
+                tail.append(f"{filtered_count} filtered")
+            ports_cell.append(
+                f"[dim italic]({', '.join(tail)})[/dim italic]\n",
+                style="dim",
+            )
+
         row = [
             host.ip,
             host_display,
@@ -315,8 +338,17 @@ def main(argv: list[str] | None = None) -> int:
                         "addresses (default: 4096 = /20).")
     p.add_argument("--list-network", action="store_true",
                    help="Just print the discovered subnets and exit — no scanning.")
-    p.add_argument("-p", "--ports", default="top100",
-                   help="Ports: 'top100', 'top1000', 'all', or '22,80,443' or '1-1024'")
+    p.add_argument("-p", "--ports", default="all",
+                   help="Ports: 'all' (default — 1-65535), 'top1000', "
+                        "'top100', or '22,80,443' or '1-1024'. "
+                        "Phase 56: default is now full 65k range; use top1000 "
+                        "or top100 explicitly for fast triage.")
+    p.add_argument("--open-only", action="store_true",
+                   help="Emit only open ports in output (legacy behavior). "
+                        "Default is to emit open + closed + filtered.")
+    p.add_argument("--exclude-filtered", action="store_true",
+                   help="Skip filtered ports in output. Useful on hosts behind "
+                        "default-deny firewalls where filtered count = 65,500.")
     p.add_argument("--no-arp", action="store_true",
                    help="Skip ARP (use ICMP sweep). Use for non-LAN targets.")
     p.add_argument("--no-banners", action="store_true",
@@ -876,6 +908,9 @@ def main(argv: list[str] | None = None) -> int:
                 web_fuzz_enabled=args.web_fuzz,
                 sqli_time_based=args.sqli_time,
                 nmap_timeout=args.nmap_timeout,
+                # Phase 56 state filtering
+                include_closed=not args.open_only,
+                include_filtered=not args.open_only and not args.exclude_filtered,
                 progress=progress,
             )
         except NotImplementedError as e:
