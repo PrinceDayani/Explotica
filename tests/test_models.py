@@ -2,7 +2,7 @@
 
 import json
 
-from explotica.models import CVE, Exploit, Host, Port, ScanResult
+from explotica.core.models import CVE, Exploit, Host, Port, ScanResult
 
 
 class TestPort:
@@ -57,7 +57,7 @@ class TestHost:
 
 class TestScanResult:
     def test_scanner_version_from_constants(self):
-        from explotica.constants import SCANNER_VERSION
+        from explotica.core.constants import SCANNER_VERSION
         r = ScanResult(target="x", started_at="t", finished_at="t",
                        duration_s=0.0)
         assert r.scanner_version == SCANNER_VERSION

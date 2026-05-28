@@ -3,7 +3,7 @@
 import pytest
 import time
 
-from explotica.safety import (
+from explotica.safety_kit.safety import (
     Scope, ScopeViolation, SafeMode, RateLimiter,
     set_active_scope, get_active_scope, in_scope, require_in_scope,
     set_safe_mode, get_safe_mode, safe_to_run,

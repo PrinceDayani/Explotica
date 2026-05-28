@@ -13,35 +13,35 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from . import __version__
-from .banners import grab_banner, grab_banner_full
-from .discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
-from .models import Host, Port, ScanResult
-from .aio import run_async_scan
-from .dns_enum import enum_dns
-from .epss_kev import enrich_hosts_with_epss_kev
-from .http_audit import audit_http
-from .http_scan import scan_http
-from .netfabric import dhcp_discover, traceroute_many
-from .nmap_wrap import (enrich_host_with_nmap, enrich_hosts_with_nmap,
+from .fingerprint.banners import grab_banner, grab_banner_full
+from .discovery.discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
+from .core.models import Host, Port, ScanResult
+from .discovery.aio import run_async_scan
+from .enrich.dns_enum import enum_dns
+from .vulns.epss_kev import enrich_hosts_with_epss_kev
+from .enrich.http_audit import audit_http
+from .enrich.http_scan import scan_http
+from .discovery.netfabric import dhcp_discover, traceroute_many
+from .vulns.nmap_wrap import (enrich_host_with_nmap, enrich_hosts_with_nmap,
                          nmap_available)
-from .osint import run_osint
-from .protocol_probes import unmask_port, unmask_ports
-from .searchsploit_wrap import (enrich_host_with_exploits,
+from .enrich.osint import run_osint
+from .fingerprint.protocol_probes import unmask_port, unmask_ports
+from .vulns.searchsploit_wrap import (enrich_host_with_exploits,
                                 searchsploit_available)
-from .service_probes_v2 import (probe_service, probe_udp_ntp,
+from .fingerprint.service_probes_v2 import (probe_service, probe_udp_ntp,
                                  SERVICE_PROBES)
-from .shodan_lite import enrich_hosts_with_shodan
-from .service_fp_db import match_response as fpdb_match
-from .smb_scan import scan_smb
-from .ssh_enum import enum_ssh
-from .syn_scan import syn_scan, syn_scan_available
-from .tls_scan import scan_tls
-from .udp_probes import probe_all_udp
-from .web_crawler import crawl as web_crawl
-from .oui import lookup as oui_lookup
-from .ports import TOP_100_PORTS, scan_ports
-from .service_fp import deepen_host
-from .vulnscan import enrich_host as vuln_enrich_host
+from .enrich.shodan_lite import enrich_hosts_with_shodan
+from .fingerprint.service_fp_db import match_response as fpdb_match
+from .enrich.smb_scan import scan_smb
+from .enrich.ssh_enum import enum_ssh
+from .discovery.syn_scan import syn_scan, syn_scan_available
+from .enrich.tls_scan import scan_tls
+from .discovery.udp_probes import probe_all_udp
+from .enrich.web_crawler import crawl as web_crawl
+from .fingerprint.oui import lookup as oui_lookup
+from .discovery.ports import TOP_100_PORTS, scan_ports
+from .fingerprint.service_fp import deepen_host
+from .vulns.vulnscan import enrich_host as vuln_enrich_host
 
 log = logging.getLogger(__name__)
 
@@ -83,12 +83,12 @@ def _enrich(host: Host) -> Host:
     # this host is local. (TTL would just confirm "Linux/Windows" which we
     # often get from OUI vendor + open-port fingerprints anyway.)
     if host.ttl is None and not host.mac:
-        from .discovery import quick_ttl
+        from .discovery.discovery import quick_ttl
         ttl = quick_ttl(host.ip, timeout=0.5)
         if ttl is not None:
             host.ttl = ttl
     if host.ttl is not None and host.os_hint is None:
-        from .os_fingerprint import guess_os_from_ttl
+        from .fingerprint.os_fingerprint import guess_os_from_ttl
         host.os_hint = guess_os_from_ttl(host.ttl)
     return host
 
@@ -118,7 +118,7 @@ def _http_audit_host(host: Host) -> None:
     Phase 57: dispatch via port_classifier (content + port hints unified)."""
     if not host.ports:
         return
-    from .port_classifier import is_http_like, is_https
+    from .core.port_classifier import is_http_like, is_https
     for p in host.open_ports():
         if not is_http_like(p):
             continue
@@ -168,7 +168,7 @@ def _web_crawl_host(host: Host) -> None:
     """Crawl every HTTP/HTTPS port on this host. Phase 57: dispatch via the
     unified port_classifier — handles content-based 'http' service identification
     so non-standard ports also get crawled."""
-    from .port_classifier import is_http_like, is_https
+    from .core.port_classifier import is_http_like, is_https
     for p in host.open_ports():
         if not is_http_like(p):
             continue
@@ -241,7 +241,7 @@ def _rich_intel_host(host: Host) -> None:
 
     # Phase 57: dispatch via unified port_classifier — handles content-based
     # identification, so HTTPS on port 31337 still gets the right enrichment.
-    from .port_classifier import is_https, is_http, is_smb
+    from .core.port_classifier import is_https, is_http, is_smb
 
     def enrich_port(p: Port) -> None:
         try:
@@ -319,7 +319,7 @@ def _grab_host_banners(host: Host, banner_timeout: float,
                if p.state == "open" and p.number not in _BANNER_SKIP]
     if not targets:
         # Still apply IANA hints on open ports with no banner attempt
-        from .ports import apply_iana_guess
+        from .discovery.ports import apply_iana_guess
         for p in host.ports:
             if p.state == "open":
                 apply_iana_guess(p)
@@ -351,7 +351,7 @@ def _grab_host_banners(host: Host, banner_timeout: float,
     # Phase 56: after banner+fingerprint, tag any open ports that STILL have
     # no service as IANA guesses. This way the JSON is never empty, but the
     # iana_guess flag makes clear that it's just a polite hint.
-    from .ports import apply_iana_guess
+    from .discovery.ports import apply_iana_guess
     for p in host.ports:
         if p.state == "open":
             apply_iana_guess(p)
@@ -484,7 +484,7 @@ def run_scan(
     syn_results: dict[str, list[int]] = {}
     if syn_scan_enabled and hosts and ports:
         # Phase 63: safe-mode gates SYN scan (raw sockets are IDS-visible)
-        from .safety import safe_to_run as _gate
+        from .safety_kit.safety import safe_to_run as _gate
         if not _gate("syn_scan"):
             log.info("syn_scan skipped (safe-mode)")
             syn_scan_enabled = False
@@ -505,7 +505,7 @@ def run_scan(
                     # banner-grab pass later. We do NOT stamp an IANA-guess
                     # service at scan time; that would defeat Phase 56's
                     # iana_guess honesty contract.
-                    from .models import Port
+                    from .core.models import Port
                     for h in hosts:
                         open_ports = syn_results.get(h.ip, [])
                         h.ports = [
@@ -552,7 +552,7 @@ def run_scan(
             # Phase 57: merge async-discovered ports with SYN results. The
             # async scan now returns full Port objects with state, banner,
             # state_reason — no need to re-stamp port→service guesses here.
-            from .banners import _identify_protocol
+            from .fingerprint.banners import _identify_protocol
             for h in hosts:
                 probed_ports, banner_map = async_results.get(h.ip, ([], {}))
                 by_num: dict[int, Port] = {p.number: p for p in probed_ports}
@@ -677,8 +677,8 @@ def run_scan(
         use_searchsploit = False
 
     # Phase 63: checkpoint + shutdown integration
-    from .checkpoint import Checkpoint
-    from .shutdown import get_token as _get_shutdown
+    from .safety_kit.checkpoint import Checkpoint
+    from .safety_kit.shutdown import get_token as _get_shutdown
     _shutdown = _get_shutdown()
     _checkpoint = Checkpoint(checkpoint_path,
                                every_n_hosts=checkpoint_every_n)
@@ -834,7 +834,7 @@ def run_scan(
         if progress:
             progress("ICS protocol probes (Modbus/BACnet/DNP3/S7/EthIP)…")
         try:
-            from .ics import probe_ics_host
+            from .specialized.ics import probe_ics_host
             ics_results = {}
             for h in hosts:
                 open_ps = h.open_ports()
@@ -852,11 +852,11 @@ def run_scan(
         if progress:
             progress("Web security analysis (JWT/CSP/cookies)…")
         try:
-            from .web_security import analyze_response
+            from .active.web_security import analyze_response
             ws_results: dict = {}
             for h in hosts:
                 host_ws: list = []
-                from .port_classifier import is_https
+                from .core.port_classifier import is_https
                 for p in h.open_ports():
                     if not p.http_info:
                         continue
@@ -874,14 +874,14 @@ def run_scan(
 
     if check_default_creds and hosts:
         # Phase 63: respect safe-mode (this is a LOCKOUT-RISK check)
-        from .safety import safe_to_run as _gate
+        from .safety_kit.safety import safe_to_run as _gate
         if not _gate("default_creds"):
             log.info("default_creds skipped (safe-mode)")
         else:
             if progress:
                 progress("Default credential checks…")
             try:
-                from .default_creds import check_host_defaults
+                from .active.default_creds import check_host_defaults
                 dc_results: dict = {}
                 for h in hosts:
                     # Phase 56: default-cred check should only target OPEN ports
@@ -899,7 +899,7 @@ def run_scan(
         if progress:
             progress("SMTP audits (open relay + VRFY/EXPN)…")
         try:
-            from .smtp_test import audit_smtp
+            from .active.smtp_test import audit_smtp
             smtp_results: dict = {}
             for h in hosts:
                 for p in h.ports:
@@ -916,7 +916,7 @@ def run_scan(
         if progress:
             progress("Subdomain takeover detection…")
         try:
-            from .takeover import check_subdomains
+            from .active.takeover import check_subdomains
             subdomains = [s["name"] for s in dns_info.get("subdomains_found", [])]
             if subdomains:
                 takeovers = check_subdomains(subdomains)
@@ -929,7 +929,7 @@ def run_scan(
         if progress:
             progress(f"Cloud asset discovery for '{cloud_keyword}'…")
         try:
-            from .cloud_assets import discover_cloud_assets
+            from .specialized.cloud_assets import discover_cloud_assets
             cloud = discover_cloud_assets(cloud_keyword)
             if cloud:
                 extra_findings["cloud_assets"] = cloud
@@ -940,7 +940,7 @@ def run_scan(
         if progress:
             progress(f"AD enumeration for {ad_enum_domain}…")
         try:
-            from .ad_enum import run_ad_enum
+            from .ad.ad_enum import run_ad_enum
             extra_findings["ad_enum"] = run_ad_enum(ad_enum_domain)
         except Exception as e:
             log.warning("AD enum failed: %s", e)
@@ -948,14 +948,14 @@ def run_scan(
     if asrep_roast and ad_enum_domain:
         # Phase 63: safe-mode gates Kerberos roasting (generates failed
         # authentication logs in AD)
-        from .safety import safe_to_run as _gate
+        from .safety_kit.safety import safe_to_run as _gate
         if not _gate("asrep_roast"):
             log.info("asrep_roast skipped (safe-mode)")
         else:
             if progress:
                 progress(f"AS-REP roasting for {ad_enum_domain}…")
             try:
-                from .kerberoast import run_roast
+                from .ad.kerberoast import run_roast
                 extra_findings["asrep_roast"] = run_roast(ad_enum_domain)
             except Exception as e:
                 log.warning("AS-REP roast failed: %s", e)
@@ -964,7 +964,7 @@ def run_scan(
         if progress:
             progress("Honeypot detection (Cowrie/Kippo/Dionaea/Conpot)…")
         try:
-            from .honeypot import detect_honeypot_in_scan
+            from .specialized.honeypot import detect_honeypot_in_scan
             scan_dict = {"hosts": [h.to_dict() for h in hosts]}
             hp = detect_honeypot_in_scan(scan_dict)
             if hp:
@@ -976,7 +976,7 @@ def run_scan(
         if progress:
             progress("Multi-signal OS fingerprinting…")
         try:
-            from .os_fp_db import fingerprint_scan
+            from .fingerprint.os_fp_db import fingerprint_scan
             scan_dict = {"hosts": [h.to_dict() for h in hosts]}
             extra_findings["os_fingerprints"] = fingerprint_scan(scan_dict)
         except Exception as e:
@@ -986,7 +986,7 @@ def run_scan(
         if progress:
             progress("Verification probes (Heartbleed/MS17-010/Shellshock/BlueKeep/Log4Shell…)")
         try:
-            from .verify_probes import verify_scan
+            from .vulns.verify_probes import verify_scan
             scan_dict = {"hosts": [h.to_dict() for h in hosts]}
             verify_results = verify_scan(scan_dict)
             if verify_results:
@@ -998,7 +998,7 @@ def run_scan(
         if progress:
             progress(f"Credentialed SSH scan ({ssh_credentials.get('username','root')}@…)")
         try:
-            from .creds_scan import credentialed_scan_hosts
+            from .credentialed.creds_scan import credentialed_scan_hosts
             creds_results = credentialed_scan_hosts(hosts, ssh_credentials)
             if creds_results:
                 extra_findings["credentialed"] = creds_results
@@ -1009,7 +1009,7 @@ def run_scan(
         if progress:
             progress("Credentialed WinRM scan (Windows hosts)…")
         try:
-            from .winrm_scan import winrm_scan_hosts
+            from .credentialed.winrm_scan import winrm_scan_hosts
             winrm_results = winrm_scan_hosts(hosts, winrm_credentials)
             if winrm_results:
                 extra_findings["winrm_credentialed"] = winrm_results
@@ -1020,7 +1020,7 @@ def run_scan(
         if progress:
             progress("Extended verification probes (Citrix/Confluence/Spring4Shell/MOVEit/F5/…)")
         try:
-            from .verify_probes_v2 import verify_scan_v2
+            from .vulns.verify_probes_v2 import verify_scan_v2
             scan_dict = {"hosts": [h.to_dict() for h in hosts]}
             v2_results = verify_scan_v2(scan_dict)
             if v2_results:
@@ -1034,7 +1034,7 @@ def run_scan(
         if progress:
             progress("Deep database fingerprinting (MySQL/PG/MSSQL/Mongo/Redis/ES/...)")
         try:
-            from .db_fingerprint import (fingerprint_host_databases,
+            from .credentialed.db_fingerprint import (fingerprint_host_databases,
                                             cve_lookup_for_databases)
             db_results: dict[str, dict] = {}
             for h in hosts:
@@ -1054,7 +1054,7 @@ def run_scan(
         if progress:
             progress("SNMP credentialed inventory (hrSWInstalled walk)…")
         try:
-            from .snmp_inventory import snmp_inventory_hosts
+            from .credentialed.snmp_inventory import snmp_inventory_hosts
             creds = snmp_creds or {"version": "2c", "community": "public"}
             snmp_results = snmp_inventory_hosts(hosts, creds)
             if snmp_results:
@@ -1064,14 +1064,14 @@ def run_scan(
 
     if web_appscan_enabled and hosts:
         # Phase 63: web app fuzzing can trip WAFs / fill logs / lock accounts
-        from .safety import safe_to_run as _gate
+        from .safety_kit.safety import safe_to_run as _gate
         if not _gate("web_appscan"):
             log.info("web_appscan skipped (safe-mode)")
         else:
             if progress:
                 progress("OWASP-class web app scanner (form fuzz + API discovery)…")
             try:
-                from .web_appscan import scan_hosts_webapps
+                from .active.web_appscan import scan_hosts_webapps
                 wa_results = scan_hosts_webapps(
                     hosts, include_time_based=sqli_time_based
                 )
@@ -1084,7 +1084,7 @@ def run_scan(
         if progress:
             progress("Container + K8s scanning (Docker daemon, CIS audit, Trivy)…")
         try:
-            from .container_scan import scan_hosts_containers
+            from .active.container_scan import scan_hosts_containers
             cont_results = scan_hosts_containers(
                 hosts, kube_token=kube_token, run_trivy=True
             )
@@ -1098,7 +1098,7 @@ def run_scan(
         if "." in target and "/" not in target and progress:
             progress("Subdomain enumeration + takeover scan…")
         try:
-            from .subdomain_extended import enumerate_subdomains
+            from .active.subdomain_extended import enumerate_subdomains
             if "." in target and "/" not in target:
                 sub_results = enumerate_subdomains(
                     target, wordlist=subdomain_wordlist,
@@ -1112,14 +1112,14 @@ def run_scan(
     # Phase 61: combined-risk scoring once EPSS/KEV are populated
     if epss_kev and hosts:
         try:
-            from .epss_kev import summarize_epss_kev_for_hosts
+            from .vulns.epss_kev import summarize_epss_kev_for_hosts
             extra_findings["risk_summary"] = summarize_epss_kev_for_hosts(hosts)
         except Exception as e:
             log.debug("risk summary failed: %s", e)
 
     if web_fuzz_enabled and hosts:
         # Phase 63: web fuzz sends injection payloads that may trip WAFs
-        from .safety import safe_to_run as _gate
+        from .safety_kit.safety import safe_to_run as _gate
         if not _gate("web_fuzz"):
             log.info("web_fuzz skipped (safe-mode)")
             web_fuzz_enabled = False
@@ -1127,7 +1127,7 @@ def run_scan(
         if progress:
             progress("Active web fuzzing (SQLi/XSS/path-traversal/SSRF/CRLF)…")
         try:
-            from .web_fuzz import fuzz_scan
+            from .active.web_fuzz import fuzz_scan
             scan_dict = {"hosts": [h.to_dict() for h in hosts]}
             fuzz_results = fuzz_scan(scan_dict, include_sqli_time=sqli_time_based)
             if fuzz_results:
@@ -1139,7 +1139,7 @@ def run_scan(
         if progress:
             progress("Computing prioritization scores…")
         try:
-            from .prioritize import score_scan_result
+            from .vulns.prioritize import score_scan_result
             scan_dict = {"hosts": [h.to_dict() for h in hosts]}
             extra_findings["prioritization"] = score_scan_result(scan_dict)
         except Exception as e:
@@ -1149,7 +1149,7 @@ def run_scan(
         if progress:
             progress(f"Compliance check: {', '.join(compliance_frameworks)}…")
         try:
-            from .compliance import evaluate, ALL_FRAMEWORKS
+            from .specialized.compliance import evaluate, ALL_FRAMEWORKS
             scan_dict = {
                 "hosts": [h.to_dict() for h in hosts],
                 "extra_findings": extra_findings,

@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from explotica.retry import (
+from explotica.safety_kit.retry import (
     BreakerOpen, CircuitBreaker, exponential_backoff, get_breaker,
     retry, retry_call,
 )

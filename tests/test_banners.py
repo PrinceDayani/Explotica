@@ -1,6 +1,6 @@
 """Banner-grab content classification — Phase 56 cascade."""
 
-from explotica.banners import _identify_protocol
+from explotica.fingerprint.banners import _identify_protocol
 
 
 class TestProtocolIdentification:

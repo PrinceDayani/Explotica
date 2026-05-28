@@ -1,7 +1,7 @@
 """Port classifier — content wins over port-number hints (Phase 57)."""
 
-from explotica.models import Port
-from explotica.port_classifier import (
+from explotica.core.models import Port
+from explotica.core.port_classifier import (
     is_http, is_https, is_http_like, is_tls, is_smb,
     is_dns, is_database, is_remote_admin, is_email,
 )

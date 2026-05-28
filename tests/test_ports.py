@@ -4,8 +4,8 @@ import errno
 
 import pytest
 
-from explotica.models import Port
-from explotica.ports import (
+from explotica.core.models import Port
+from explotica.discovery.ports import (
     ALL_TCP_PORTS, IANA_SERVICE_HINTS, TOP_100_PORTS,
     _errno_to_state, apply_iana_guess, probe_tcp, scan_ports,
 )

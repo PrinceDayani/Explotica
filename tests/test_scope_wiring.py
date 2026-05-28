@@ -9,7 +9,7 @@ import inspect
 
 import pytest
 
-from explotica.safety import Scope, set_active_scope
+from explotica.safety_kit.safety import Scope, set_active_scope
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +28,7 @@ class TestOSINTScopeEnforcement:
 
     def test_crtsh_blocks_out_of_scope(self):
         """When scope is set to example.com, crt.sh of evil.com must skip."""
-        from explotica.osint import crtsh_subdomains
+        from explotica.enrich.osint import crtsh_subdomains
         set_active_scope(Scope.from_target("example.com"))
         result = crtsh_subdomains("evil.com")
         assert result is None
@@ -41,7 +41,7 @@ class TestTakeoverScopeEnforcement:
         assert "get_active_scope" in src
 
     def test_takeover_skips_out_of_scope(self):
-        from explotica.takeover import check_subdomain
+        from explotica.active.takeover import check_subdomain
         set_active_scope(Scope.from_target("example.com"))
         result = check_subdomain("evil.com")
         assert result is None
@@ -54,7 +54,7 @@ class TestSubdomainEnumScopeEnforcement:
         assert "get_active_scope" in src
 
     def test_enum_returns_skipped_for_out_of_scope(self):
-        from explotica.subdomain_extended import enumerate_subdomains
+        from explotica.active.subdomain_extended import enumerate_subdomains
         set_active_scope(Scope.from_target("example.com"))
         result = enumerate_subdomains("evil.com")
         assert result.get("skipped_reason") == "outside-scope"
@@ -67,7 +67,7 @@ class TestADEnumScopeEnforcement:
         assert "get_active_scope" in src
 
     def test_ad_enum_skips_out_of_scope(self):
-        from explotica.ad_enum import run_ad_enum
+        from explotica.ad.ad_enum import run_ad_enum
         set_active_scope(Scope.from_target("corp.local"))
         result = run_ad_enum("evil.local")
         assert result.get("skipped_reason") == "outside-scope"
@@ -75,7 +75,7 @@ class TestADEnumScopeEnforcement:
 
 class TestScopeWithMultipleDomains:
     def test_subdomain_of_in_scope_domain_allowed(self):
-        from explotica.subdomain_extended import enumerate_subdomains
+        from explotica.active.subdomain_extended import enumerate_subdomains
         set_active_scope(Scope.from_target("example.com"))
         # api.example.com is a subdomain — must be allowed
         # We can't run the full enum without network, so just verify the

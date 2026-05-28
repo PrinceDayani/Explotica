@@ -17,8 +17,8 @@ from rich.table import Table
 from rich.text import Text
 
 from . import __version__
-from .models import ScanResult
-from .ports import TOP_100_PORTS
+from .core.models import ScanResult
+from .discovery.ports import TOP_100_PORTS
 from .scanner import run_scan
 
 log = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ def _resolve_db_credentials(args):
     """
     if getattr(args, "use_cred_vault", False):
         try:
-            from .credential_vault import get_profile
+            from .credentialed.credential_vault import get_profile
             return get_profile()
         except Exception:
             pass
@@ -623,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # --shell launches the REPL
     if args.shell:
-        from .shell import launch_shell
+        from .ui.shell import launch_shell
         return launch_shell()
 
     # If --interactive (or no target given), run the wizard then re-enter
@@ -631,7 +631,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.interactive or (not args.target and not args.from_json
                               and not args.auto and not args.list_network
                               and argv is None):
-        from .interactive import run_wizard
+        from .ui.interactive import run_wizard
         wiz_args = run_wizard()
         if wiz_args is None:
             return 0
@@ -639,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
         return main(wiz_args)
 
     # ── Phase 62: structured logging + safety + shutdown ────────────────
-    from .logging_config import configure as configure_logging
+    from .safety_kit.logging_config import configure as configure_logging
     log_level = (args.log_level
                  or ("DEBUG" if args.verbose else None)
                  or None)
@@ -649,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Install scope enforcement based on --target
     if args.target:
-        from .safety import Scope, set_active_scope
+        from .safety_kit.safety import Scope, set_active_scope
         try:
             scope = Scope.from_target(args.target, strict=args.strict_scope)
             set_active_scope(scope)
@@ -658,12 +658,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # Install safe-mode if requested
     if args.safe_mode:
-        from .safety import SafeMode, set_safe_mode
+        from .safety_kit.safety import SafeMode, set_safe_mode
         set_safe_mode(SafeMode.safe_all())
         log.warning("safe-mode enabled: active checks disabled")
 
     # Install signal handlers for graceful Ctrl+C
-    from .shutdown import install_signal_handlers
+    from .safety_kit.shutdown import install_signal_handlers
     install_signal_handlers(
         emergency_dump_path=args.json if hasattr(args, "json") else None,
     )
@@ -794,7 +794,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── --list-network: read-only enumeration, no scanning ───────────
     if args.list_network:
-        from .enumerate import list_subnets, format_summary
+        from .discovery.enumerate import list_subnets, format_summary
         net = list_subnets(max_hosts_per_subnet=args.max_hosts_per_subnet)
         console.print(format_summary(net))
         return 0
@@ -838,8 +838,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Branch 0: --auto — enumerate then scan each subnet ────────────
     if args.auto and not args.from_json:
-        from .enumerate import list_subnets, format_summary
-        from .models import ScanResult
+        from .discovery.enumerate import list_subnets, format_summary
+        from .core.models import ScanResult
         try:
             net = list_subnets(max_hosts_per_subnet=args.max_hosts_per_subnet)
         except Exception as e:
@@ -926,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Branch A: load from existing JSON, optionally re-enrich ──────
     elif args.from_json:
-        from .models import ScanResult
+        from .core.models import ScanResult
         try:
             data = json.loads(Path(args.from_json).read_text(encoding="utf-8"))
             result = ScanResult.from_dict(data)
@@ -940,13 +940,13 @@ def main(argv: list[str] | None = None) -> int:
         # Re-enrich if requested
         if (args.vuln_scan or args.deep or args.use_nmap or args.use_searchsploit
                 or args.rich_intel or args.epss_kev):
-            from .epss_kev import enrich_hosts_with_epss_kev
-            from .nmap_wrap import enrich_host_with_nmap, nmap_available
+            from .vulns.epss_kev import enrich_hosts_with_epss_kev
+            from .vulns.nmap_wrap import enrich_host_with_nmap, nmap_available
             from .scanner import _rich_intel_host
-            from .searchsploit_wrap import (enrich_host_with_exploits,
+            from .vulns.searchsploit_wrap import (enrich_host_with_exploits,
                                             searchsploit_available)
-            from .service_fp import deepen_host
-            from .vulnscan import enrich_host as vuln_enrich_host
+            from .fingerprint.service_fp import deepen_host
+            from .vulns.vulnscan import enrich_host as vuln_enrich_host
             for h in result.hosts:
                 if args.deep and h.ports:
                     progress(f"deep probe {h.ip}…")
@@ -978,7 +978,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         # ── Phase 62: authorization gate for active checks ───────────
-        from .safety import classify_args_risk, show_authorization_banner
+        from .safety_kit.safety import classify_args_risk, show_authorization_banner
         _low, active_checks = classify_args_risk(args)
         if active_checks:
             try:
@@ -1282,13 +1282,13 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[green]✓[/green] JSON written to [cyan]{out}[/cyan]")
 
     if args.report_html:
-        from .report import write_report
+        from .output.report import write_report
         out = write_report(result, args.report_html)
         console.print(f"[green]✓[/green] HTML report at [cyan]{out}[/cyan]")
 
     # ── Optional dashboard launch ───────────────────────────────────────
     if args.dashboard is not None:
-        from .dashboard import serve, fastapi_available
+        from .output.dashboard import serve, fastapi_available
         if not fastapi_available():
             console.print(
                 "[yellow]--dashboard requested but fastapi/uvicorn not "

@@ -5,7 +5,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from explotica.checkpoint import Checkpoint
+from explotica.safety_kit.checkpoint import Checkpoint
 from explotica import shutdown
 
 
