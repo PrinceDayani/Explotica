@@ -43,7 +43,7 @@ def _http_get(host: str, port: int, path: str, *,
             sock = ctx.wrap_socket(sock, server_hostname=host)
         hlines = [f"GET {path} HTTP/1.0",
                   f"Host: {host}",
-                  "User-Agent: explotica/0.1",
+                  "User-Agent: explotica/0.7.0",
                   "Connection: close"]
         for k, v in (headers or {}).items():
             hlines.append(f"{k}: {v}")

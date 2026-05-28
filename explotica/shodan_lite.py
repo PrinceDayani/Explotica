@@ -84,7 +84,7 @@ def lookup_ip(ip: str, timeout: float = 6.0) -> Optional[dict]:
 
     url = f"{INTERNETDB_URL}/{ip}"
     req = urllib.request.Request(url, headers={
-        "User-Agent": "explotica/0.1 (network-recon-toolkit)",
+        "User-Agent": "explotica/0.7.0 (network-recon-toolkit)",
         "Accept": "application/json",
     })
     try:

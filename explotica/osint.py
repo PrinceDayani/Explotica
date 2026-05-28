@@ -60,7 +60,7 @@ def crtsh_subdomains(domain: str, timeout: float = 15.0) -> Optional[dict]:
 
     url = f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json"
     req = urllib.request.Request(url, headers={
-        "User-Agent": "explotica/0.1",
+        "User-Agent": "explotica/0.7.0",
         "Accept": "application/json",
     })
     try:
@@ -162,7 +162,7 @@ def rdap_lookup(domain_or_ip: str, timeout: float = 10.0) -> Optional[dict]:
     obj_type = "ip" if is_ip else "domain"
     url = f"https://rdap.org/{obj_type}/{urllib.parse.quote(domain_or_ip)}"
     req = urllib.request.Request(url, headers={
-        "User-Agent": "explotica/0.1",
+        "User-Agent": "explotica/0.7.0",
         "Accept": "application/rdap+json",
     })
     try:

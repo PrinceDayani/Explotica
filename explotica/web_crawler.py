@@ -66,10 +66,11 @@ def _fetch(url: str, timeout: float = 4.0,
             sock = ctx.wrap_socket(raw, server_hostname=host)
         else:
             sock = raw
+        from .constants import USER_AGENT
         req = (
             f"GET {path} HTTP/1.0\r\n"
             f"Host: {host}\r\n"
-            f"User-Agent: explotica/0.1\r\n"
+            f"User-Agent: {USER_AGENT}\r\n"
             f"Accept: */*\r\n"
             f"Connection: close\r\n\r\n"
         ).encode()

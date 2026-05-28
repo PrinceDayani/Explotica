@@ -49,7 +49,7 @@ _kev_set: Optional[set[str]] = None
 
 def _fetch_url(url: str, timeout: float = 30.0) -> Optional[bytes]:
     req = urllib.request.Request(
-        url, headers={"User-Agent": "explotica/0.1"}
+        url, headers={"User-Agent": "explotica/0.7.0"}
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
