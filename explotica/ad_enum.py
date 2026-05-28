@@ -289,13 +289,29 @@ def run_ad_enum(domain: str, *,
                 kerberos_enum: bool = True,
                 usernames: Optional[list[str]] = None,
                 timeout: float = 3.0) -> dict:
-    """Full AD enum for a domain. Returns dict with DCs + found users."""
+    """Full AD enum for a domain.
+
+    Phase 64: scope-enforced — refuses to enumerate a domain that's
+    outside the active scope. Prevents Kerberos+LDAP traffic to
+    unauthorized DCs.
+    """
     result: dict = {
         "domain": domain,
         "dcs": [],
         "users_found": [],
         "asreproastable": [],
     }
+
+    # Phase 64: scope enforcement
+    try:
+        from .safety import get_active_scope
+        scope = get_active_scope()
+        if scope is not None and not scope.permits(domain):
+            log.warning("AD enum skipped: %s outside scope", domain)
+            result["skipped_reason"] = "outside-scope"
+            return result
+    except ImportError:
+        pass
 
     log.info("AD enum: discovering DCs for %s", domain)
     dcs = discover_dcs(domain, timeout=timeout)

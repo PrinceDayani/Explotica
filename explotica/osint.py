@@ -52,7 +52,20 @@ def crtsh_subdomains(domain: str, timeout: float = 15.0) -> Optional[dict]:
     """Query crt.sh for all SANs of certs issued to *.domain.
 
     Returns dict with sorted list of unique subdomains found.
+
+    Phase 64: scope-enforced — refuses to enumerate a domain that's
+    outside the active scope. Prevents OSINT leakage when scope is set.
     """
+    # Phase 64: scope enforcement
+    try:
+        from .safety import get_active_scope
+        scope = get_active_scope()
+        if scope is not None and not scope.permits(domain):
+            log.warning("crt.sh skipped: %s outside scope", domain)
+            return None
+    except ImportError:
+        pass
+
     key = f"crtsh_{domain.replace('.', '_')}"
     cached = _cache_read(key)
     if cached is not None:

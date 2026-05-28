@@ -264,8 +264,10 @@ def enum_dns(domain: str, *, brute_subdomains: bool = True,
                     r = f.result()
                     if r:
                         found.append(r)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Phase 64: log at debug instead of silent pass so
+                    # rare failures (DNS timeout, scope violation) surface
+                    log.debug("subdomain check error: %s", e)
         result["subdomains_found"] = sorted(found, key=lambda x: x["name"])
 
     return result

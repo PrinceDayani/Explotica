@@ -218,8 +218,19 @@ def check_subdomain(subdomain: str, *, dns_server: str = "8.8.8.8",
                     timeout: float = 5.0) -> Optional[dict]:
     """Check one subdomain for takeover-ability.
 
-    Returns dict on positive match or None.
+    Phase 64: scope-enforced — refuses to check a subdomain that's
+    outside the active scope (prevents OSINT/takeover leakage).
     """
+    # Phase 64: scope enforcement
+    try:
+        from .safety import get_active_scope
+        scope = get_active_scope()
+        if scope is not None and not scope.permits(subdomain):
+            log.debug("takeover check skipped: %s outside scope", subdomain)
+            return None
+    except ImportError:
+        pass
+
     cname = _resolve_cname(subdomain, dns_server, timeout)
     if not cname:
         return None

@@ -487,14 +487,20 @@ def enumerate_subdomains(domain: str, *,
                           max_candidates: int = 5000) -> dict:
     """Brute-force subdomain enumeration with permutations.
 
-    Returns:
-      {
-        'discovered': [{'subdomain': ..., 'ip': ...}, ...],
-        'total_tested': int,
-        'wildcard_detected': bool,
-        'candidates_generated': int,
-      }
+    Phase 64: scope-enforced — refuses to enumerate a domain outside
+    the active scope.
     """
+    # Phase 64: scope enforcement
+    try:
+        from .safety import get_active_scope
+        scope = get_active_scope()
+        if scope is not None and not scope.permits(domain):
+            log.warning("subdomain enum skipped: %s outside scope", domain)
+            return {"discovered": [], "total_tested": 0,
+                    "skipped_reason": "outside-scope"}
+    except ImportError:
+        pass
+
     wildcard = detect_wildcard_dns(domain, timeout=timeout)
     if wildcard:
         return {
