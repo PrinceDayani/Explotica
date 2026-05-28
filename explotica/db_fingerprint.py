@@ -560,26 +560,83 @@ def fingerprint_influxdb(host: str, port: int = 8086,
     }
 
 
-# ── Dispatcher ───────────────────────────────────────────────────────────
-# Maps port number → (fingerprint_fn, supports_auth, default_args)
-_PORT_DISPATCH = {
-    3306: ("mysql", fingerprint_mysql, True),
-    3307: ("mysql", fingerprint_mysql, True),  # alt MySQL
-    5432: ("postgres", fingerprint_postgres, True),
-    1433: ("mssql", fingerprint_mssql, True),
-    1521: ("oracle", fingerprint_oracle, False),
-    1522: ("oracle", fingerprint_oracle, False),
-    27017: ("mongodb", fingerprint_mongodb, True),
-    27018: ("mongodb", fingerprint_mongodb, True),
-    27019: ("mongodb", fingerprint_mongodb, True),
-    6379: ("redis", fingerprint_redis, True),
-    11211: ("memcached", fingerprint_memcached, False),
-    9200: ("elasticsearch", fingerprint_elasticsearch, True),
-    9201: ("elasticsearch", fingerprint_elasticsearch, True),
-    5984: ("couchdb", fingerprint_couchdb, False),
-    6984: ("couchdb", fingerprint_couchdb, False),
-    8086: ("influxdb", fingerprint_influxdb, False),
+# ── Phase 58: data-driven dispatcher ─────────────────────────────────────
+# The hardcoded _PORT_DISPATCH dict was a maintenance burden. Now we load
+# from db_dispatch.json so users can add/remove entries without code changes.
+# The product names map to fingerprint functions via _PRODUCT_FUNCTIONS below.
+import os as _os
+from pathlib import Path as _Path
+
+
+def _load_port_dispatch() -> dict[int, tuple[str, bool, str]]:
+    """Load (port -> product / supports_auth / label) mapping from JSON.
+
+    Falls back to a minimal built-in dict if the JSON is missing or invalid
+    (so the module never breaks).
+    """
+    # Allow env-override; otherwise look in the package dir
+    json_path = _Path(_os.environ.get(
+        "EXPLOTICA_DB_DISPATCH",
+        str(_Path(__file__).parent / "db_dispatch.json")
+    ))
+    fallback = {
+        3306:  ("mysql", True, "MySQL"),
+        5432:  ("postgres", True, "PostgreSQL"),
+        1433:  ("mssql", True, "MSSQL"),
+        27017: ("mongodb", True, "MongoDB"),
+        6379:  ("redis", True, "Redis"),
+        11211: ("memcached", False, "Memcached"),
+        9200:  ("elasticsearch", True, "Elasticsearch"),
+    }
+    if not json_path.exists():
+        log.debug("db_dispatch.json not found at %s — using fallback", json_path)
+        return fallback
+    try:
+        import json as _json
+        data = _json.loads(json_path.read_text(encoding="utf-8"))
+        out: dict[int, tuple[str, bool, str]] = {}
+        for port_str, entry in (data.get("ports") or {}).items():
+            try:
+                pn = int(port_str)
+                out[pn] = (
+                    entry.get("product", "unknown"),
+                    bool(entry.get("supports_auth", False)),
+                    entry.get("label", entry.get("product", "")),
+                )
+            except (ValueError, TypeError):
+                continue
+        if not out:
+            return fallback
+        return out
+    except (OSError, ValueError) as e:
+        log.warning("db_dispatch.json invalid: %s — using fallback", e)
+        return fallback
+
+
+# Product name → fingerprint function. New protocols can be plugged in
+# here; the JSON dispatch only needs the product slug.
+_PRODUCT_FUNCTIONS: dict[str, callable] = {
+    "mysql":         fingerprint_mysql,
+    "postgres":      fingerprint_postgres,
+    "mssql":         fingerprint_mssql,
+    "oracle":        fingerprint_oracle,
+    "mongodb":       fingerprint_mongodb,
+    "redis":         fingerprint_redis,
+    "memcached":     fingerprint_memcached,
+    "elasticsearch": fingerprint_elasticsearch,
+    "couchdb":       fingerprint_couchdb,
+    "influxdb":      fingerprint_influxdb,
 }
+
+# Loaded once at module import — re-load via reload_dispatch() if user
+# edits the JSON file mid-session.
+_PORT_DISPATCH: dict[int, tuple[str, bool, str]] = _load_port_dispatch()
+
+
+def reload_dispatch() -> None:
+    """Re-read db_dispatch.json (e.g. after user edits it)."""
+    global _PORT_DISPATCH
+    _PORT_DISPATCH = _load_port_dispatch()
 
 
 def fingerprint_port(host: str, port: int, *,
@@ -588,27 +645,83 @@ def fingerprint_port(host: str, port: int, *,
                       ) -> Optional[dict]:
     """Auto-dispatch fingerprint for a known database port.
 
+    Phase 58: credentials can now be either:
+      - Legacy dict form: {"mysql": {"user": "...", "password": "..."}, ...}
+      - VaultProfile object (preferred — supports multi-cred try-in-order)
+
     Args:
-      db_credentials: {"mysql": {"user": "...", "password": "..."},
-                       "postgres": {...}, ...} — per-product credentials.
+      db_credentials: per-product credentials (legacy dict or VaultProfile)
     """
     if port not in _PORT_DISPATCH:
         return None
-    product, fn, supports_auth = _PORT_DISPATCH[port]
-    kwargs: dict = {"timeout": timeout}
-    if supports_auth and db_credentials:
-        creds = db_credentials.get(product, {})
-        if creds:
-            kwargs["username"] = creds.get("user") or creds.get("username")
-            kwargs["password"] = creds.get("password")
-            if "database" in creds:
-                kwargs["database"] = creds["database"]
-    try:
-        return fn(host, port=port, **kwargs)
-    except Exception as e:
-        log.debug("db_fingerprint %s:%d (%s) crashed: %s",
-                  host, port, product, e)
+    product, supports_auth, _label = _PORT_DISPATCH[port]
+    fn = _PRODUCT_FUNCTIONS.get(product)
+    if fn is None:
+        log.debug("db_fingerprint port %d: product %s has no impl yet",
+                  port, product)
         return None
+
+    # Resolve credentials per product (vault or legacy dict)
+    creds_to_try: list[dict] = []
+    if supports_auth and db_credentials is not None:
+        # VaultProfile path
+        if hasattr(db_credentials, "vault"):
+            for cs in db_credentials.vault(product):
+                creds_to_try.append({
+                    "username": cs.username,
+                    "password": cs.password,
+                    "database": cs.extra.get("database", ""),
+                    "_cred_set": cs,
+                })
+        elif isinstance(db_credentials, dict):
+            creds = db_credentials.get(product, {})
+            if creds:
+                creds_to_try.append({
+                    "username": creds.get("user") or creds.get("username"),
+                    "password": creds.get("password"),
+                    "database": creds.get("database", ""),
+                })
+
+    # If no creds OR fn doesn't need them, try once anon
+    if not creds_to_try:
+        try:
+            return fn(host, port=port, timeout=timeout)
+        except Exception as e:
+            log.debug("db_fingerprint %s:%d (%s) crashed: %s",
+                      host, port, product, e)
+            return None
+
+    # Multi-credential try-in-order
+    for c in creds_to_try:
+        kwargs: dict = {"timeout": timeout}
+        if c.get("username"):
+            kwargs["username"] = c["username"]
+        if c.get("password"):
+            kwargs["password"] = c["password"]
+        if c.get("database"):
+            kwargs["database"] = c["database"]
+        try:
+            result = fn(host, port=port, **kwargs)
+        except Exception as e:
+            log.debug("db_fingerprint %s:%d (%s) cred '%s' crashed: %s",
+                      host, port, product,
+                      (c.get("_cred_set") or {}).get("label", "?"), e)
+            cs = c.get("_cred_set")
+            if cs is not None:
+                cs.record_failure()
+            continue
+        if result and result.get("auth_used"):
+            cs = c.get("_cred_set")
+            if cs is not None:
+                cs.record_success()
+            return result
+        if result:
+            # Got data but auth not used — last-resort return; first usable
+            cs = c.get("_cred_set")
+            if cs is not None and not result.get("auth_error"):
+                cs.record_success()
+            return result
+    return None
 
 
 def fingerprint_host_databases(host: str, ports: list[Port],

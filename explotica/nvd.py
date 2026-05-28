@@ -29,7 +29,13 @@ from .models import CVE
 log = logging.getLogger(__name__)
 
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-CACHE_TTL_SECONDS = 7 * 24 * 3600   # 7 days
+# Phase 58: vuln DB cache max-age is 1 day per user requirement. The NVD
+# corpus updates daily; stale cache risks missing newly-published CVEs.
+# Override via $EXPLOTICA_NVD_TTL_SECONDS env var if you really need longer.
+CACHE_TTL_SECONDS = int(os.environ.get(
+    "EXPLOTICA_NVD_TTL_SECONDS",
+    str(24 * 3600),     # 1 day
+))
 
 # Default cache dir: ~/.cache/explotica/nvd  (or env override)
 CACHE_DIR = Path(
