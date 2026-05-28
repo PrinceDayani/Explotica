@@ -592,6 +592,26 @@ def main(argv: list[str] | None = None) -> int:
                    help="Launch the interactive REPL shell — stays alive, "
                         "scan/query/save commands at a prompt")
     p.add_argument("--version", action="version", version=f"explotica {__version__}")
+    # ── Phase 62: production safety flags ────────────────────────────────
+    p.add_argument("--strict-scope", dest="strict_scope", action="store_true",
+                   default=True,
+                   help="Refuse to probe IPs outside --target (default ON)")
+    p.add_argument("--no-strict-scope", dest="strict_scope",
+                   action="store_false",
+                   help="Allow probes outside --target (warnings only)")
+    p.add_argument("--safe-mode", action="store_true",
+                   help="Disable ALL active checks that could cause harm "
+                        "(default-creds, web-fuzz, syn-scan, AS-REP, etc.)")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="Skip the authorization confirmation prompt "
+                        "(equivalent to EXPLOTICA_I_AM_AUTHORIZED=1)")
+    p.add_argument("--log-level", default=None,
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                   help="Override log level (env: EXPLOTICA_LOG_LEVEL)")
+    p.add_argument("--log-file", default=None,
+                   help="Also log to a file (env: EXPLOTICA_LOG_FILE)")
+    p.add_argument("--log-json", action="store_true",
+                   help="Use one-line JSON log format")
     args = p.parse_args(argv)
 
     # --shell launches the REPL
@@ -611,9 +631,34 @@ def main(argv: list[str] | None = None) -> int:
         # Re-enter main() with the wizard's argv
         return main(wiz_args)
 
-    logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
-        format="%(levelname)s %(name)s: %(message)s",
+    # ── Phase 62: structured logging + safety + shutdown ────────────────
+    from .logging_config import configure as configure_logging
+    log_level = (args.log_level
+                 or ("DEBUG" if args.verbose else None)
+                 or None)
+    configure_logging(level=log_level, logfile=args.log_file,
+                       format_kind="json" if args.log_json else "plain",
+                       force=True)
+
+    # Install scope enforcement based on --target
+    if args.target:
+        from .safety import Scope, set_active_scope
+        try:
+            scope = Scope.from_target(args.target, strict=args.strict_scope)
+            set_active_scope(scope)
+        except Exception as e:
+            log.warning("could not establish scope from target: %s", e)
+
+    # Install safe-mode if requested
+    if args.safe_mode:
+        from .safety import SafeMode, set_safe_mode
+        set_safe_mode(SafeMode.safe_all())
+        log.warning("safe-mode enabled: active checks disabled")
+
+    # Install signal handlers for graceful Ctrl+C
+    from .shutdown import install_signal_handlers
+    install_signal_handlers(
+        emergency_dump_path=args.json if hasattr(args, "json") else None,
     )
 
     # --full-coverage preset: maximum vuln discovery
@@ -924,6 +969,23 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             console.print(f"[red]Invalid --ports value:[/red] {e}")
             return 2
+
+        # ── Phase 62: authorization gate for active checks ───────────
+        from .safety import classify_args_risk, show_authorization_banner
+        _low, active_checks = classify_args_risk(args)
+        if active_checks:
+            try:
+                ok = show_authorization_banner(
+                    target=args.target,
+                    active_checks=active_checks,
+                    force_yes=args.yes,
+                )
+            except Exception as e:
+                log.error("authorization gate failed: %s", e)
+                ok = False
+            if not ok:
+                console.print("[red]Authorization not confirmed — aborting.[/red]")
+                return 1
 
         console.print(
             f"[bold]Explotica[/bold] scanning [cyan]{args.target}[/cyan] "

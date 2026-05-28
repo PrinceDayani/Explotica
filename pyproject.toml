@@ -1,0 +1,194 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "explotica"
+dynamic = ["version"]
+description = "Comprehensive network vulnerability scanner — discovery, port scanning, CVE matching, web app fuzzing, container/K8s scanning, AD enum, ICS, OWASP, and more"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Personal-use"}
+authors = [
+    {name = "Prince Dayani", email = "prince@kaizenithtechnologies.com"},
+]
+keywords = [
+    "security", "vulnerability-scanner", "network-scanner", "pentest",
+    "cve", "nvd", "kerberoast", "asrep-roast", "owasp", "ics", "kubernetes",
+    "subdomain-takeover", "snmp", "kerberos",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: System :: Networking :: Monitoring",
+]
+
+# Core required dependencies — installed by default
+dependencies = [
+    "scapy>=2.5.0",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+# Async I/O acceleration (Linux/macOS only)
+async = [
+    "uvloop>=0.19.0; sys_platform != 'win32'",
+]
+
+# Web dashboard
+dashboard = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+]
+
+# Textual TUI
+tui = [
+    "textual>=0.50.0",
+]
+
+# Browser-based crawling
+browser = [
+    "playwright>=1.40.0",
+]
+
+# PDF reports
+pdf = [
+    "weasyprint>=60.0",
+]
+
+# Credentialed scanning
+credentialed = [
+    "paramiko>=3.0.0",       # SSH
+    "pywinrm>=0.4.3",        # WinRM
+]
+
+# Database fingerprinting (full auth paths)
+databases = [
+    "pymysql>=1.1.0",        # MySQL/MariaDB
+    "psycopg2-binary>=2.9",  # PostgreSQL
+    "pymssql>=2.2.10",       # MSSQL
+    "pymongo>=4.5.0",        # MongoDB
+    "redis>=5.0.0",          # Redis
+]
+
+# Development / testing
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.23.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+
+# Everything — convenience for "give me the works"
+all = [
+    "uvloop>=0.19.0; sys_platform != 'win32'",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "textual>=0.50.0",
+    "playwright>=1.40.0",
+    "weasyprint>=60.0",
+    "paramiko>=3.0.0",
+    "pywinrm>=0.4.3",
+    "pymysql>=1.1.0",
+    "psycopg2-binary>=2.9",
+    "pymssql>=2.2.10",
+    "pymongo>=4.5.0",
+    "redis>=5.0.0",
+]
+
+[project.scripts]
+explotica = "explotica.cli:main"
+explotica-tui = "explotica.tui:main"
+explotica-dashboard = "explotica.dashboard:main"
+explotica-shell = "explotica.shell:main"
+
+[project.urls]
+"Homepage" = "https://github.com/PrinceDayani/Explotica"
+"Bug Tracker" = "https://github.com/PrinceDayani/Explotica/issues"
+"Source Code" = "https://github.com/PrinceDayani/Explotica"
+"Architecture" = "https://github.com/PrinceDayani/Explotica/blob/main/ARCHITECTURE.md"
+
+[tool.setuptools]
+packages = ["explotica"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+explotica = [
+    "*.json",  # db_dispatch.json + similar data files
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "explotica.constants.SCANNER_VERSION"}
+
+# ── Tooling configuration ───────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "network: tests that require live network access",
+    "slow: tests that take >5s",
+    "integration: end-to-end integration tests",
+]
+
+[tool.coverage.run]
+source = ["explotica"]
+omit = [
+    "*/tests/*",
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "B",   # flake8-bugbear
+    "I",   # isort
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (use black)
+    "B008",  # function calls in defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["E501", "B011"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

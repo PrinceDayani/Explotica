@@ -17,7 +17,7 @@ from __future__ import annotations
 #   - ScanResult.scanner_version field
 #   - report headers (HTML/PDF/MD)
 #   - JSON output meta
-SCANNER_VERSION = "0.7.0"  # Phase 57
+SCANNER_VERSION = "0.8.0"  # Phase 62 — production readiness
 
 # ── HTTP identity ───────────────────────────────────────────────────────
 USER_AGENT = f"explotica/{SCANNER_VERSION}"
