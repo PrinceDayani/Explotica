@@ -34,9 +34,11 @@ def _send_http(host: str, port: int, *, tls: bool, method: str,
             sock = ctx.wrap_socket(raw, server_hostname=host)
         else:
             sock = raw
+        # Phase 57: User-Agent from central constants
+        from .constants import USER_AGENT
         hlines = [f"{method} {path} HTTP/1.0",
                   f"Host: {host}",
-                  "User-Agent: explotica/0.1",
+                  f"User-Agent: {USER_AGENT}",
                   "Connection: close"]
         if headers:
             for k, v in headers.items():

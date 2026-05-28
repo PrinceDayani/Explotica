@@ -181,8 +181,10 @@ def _http_probe(host: str, port: int, *, tls: bool,
             sock = ctx.wrap_socket(raw, server_hostname=host)
         else:
             sock = raw
+        # Phase 57: User-Agent from central constants module
+        from .constants import USER_AGENT
         req = (f"GET / HTTP/1.0\r\nHost: {host}\r\n"
-               f"User-Agent: explotica/0.1\r\n"
+               f"User-Agent: {USER_AGENT}\r\n"
                f"Accept: */*\r\nConnection: close\r\n\r\n").encode()
         sock.sendall(req)
         chunks: list[bytes] = []

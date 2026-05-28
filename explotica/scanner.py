@@ -93,10 +93,8 @@ def _enrich(host: Host) -> Host:
     return host
 
 
-_HTTP_PORTS = frozenset({80, 81, 88, 591, 800, 1080, 3000, 4000, 4080, 5000,
-                          5050, 7001, 8000, 8008, 8080, 8081, 8088, 8888,
-                          9000, 9090})
-_HTTPS_PORTS = frozenset({443, 4443, 8443, 9443})
+# Phase 57: removed local _HTTP_PORTS / _HTTPS_PORTS hardcoded sets.
+# Use port_classifier.is_http/is_https from the unified module instead.
 
 
 def _service_intel_host(host: Host) -> None:
@@ -115,20 +113,16 @@ def _service_intel_host(host: Host) -> None:
             log.debug("service_intel %s:%d failed: %s", host.ip, p.number, e)
 
 
-_HTTP_AUDIT_PORTS = frozenset({80, 81, 88, 800, 3000, 5000, 7001, 8000,
-                                8008, 8080, 8081, 8888, 9000, 9090,
-                                443, 4443, 8443, 9443})
-
-
 def _http_audit_host(host: Host) -> None:
     """Run http_audit (methods/CORS/GraphQL/WP) for each HTTP-ish port.
-    Phase 56: only open ports."""
+    Phase 57: dispatch via port_classifier (content + port hints unified)."""
     if not host.ports:
         return
+    from .port_classifier import is_http_like, is_https
     for p in host.open_ports():
-        if p.number not in _HTTP_AUDIT_PORTS:
+        if not is_http_like(p):
             continue
-        tls = p.number in (443, 4443, 8443, 9443)
+        tls = is_https(p)
         # Pull crawled paths if web crawler ran
         crawled = []
         if p.crawl_info and p.crawl_info.get("pages_crawled"):
@@ -170,24 +164,17 @@ def _ssh_enum_host(host: Host) -> None:
                 log.debug("ssh_enum %s:%d failed: %s", host.ip, p.number, e)
 
 
-_HTTP_LIKE_PORTS = frozenset({80, 81, 88, 591, 800, 1080, 3000, 4000, 4080,
-                               5000, 5050, 7001, 8000, 8008, 8080, 8081,
-                               8088, 8888, 9000, 9090, 443, 4443, 8443, 9443})
-_HTTPS_PORTS_CRAWL = frozenset({443, 4443, 8443, 9443})
-
-
 def _web_crawl_host(host: Host) -> None:
-    """Crawl every HTTP/HTTPS port on this host. Phase 56: open ports only,
-    AND honors content-based 'http' service detection so non-standard ports
-    get crawled if banner-grab identified them as HTTP."""
+    """Crawl every HTTP/HTTPS port on this host. Phase 57: dispatch via the
+    unified port_classifier — handles content-based 'http' service identification
+    so non-standard ports also get crawled."""
+    from .port_classifier import is_http_like, is_https
     for p in host.open_ports():
-        is_http_port = p.number in _HTTP_LIKE_PORTS
-        is_http_content = p.service in ("http", "https", "tls")
-        if not (is_http_port or is_http_content):
+        if not is_http_like(p):
             continue
         try:
             info = web_crawl(host.ip, p.number,
-                              tls=(p.number in _HTTPS_PORTS_CRAWL),
+                              tls=is_https(p),
                               max_pages=15, depth=1, timeout=4.0)
             if info and info.get("total_pages"):
                 p.crawl_info = info
@@ -252,9 +239,13 @@ def _rich_intel_host(host: Host) -> None:
     if not open_ps:
         return
 
+    # Phase 57: dispatch via unified port_classifier — handles content-based
+    # identification, so HTTPS on port 31337 still gets the right enrichment.
+    from .port_classifier import is_https, is_http, is_smb
+
     def enrich_port(p: Port) -> None:
         try:
-            if p.number in _HTTPS_PORTS:
+            if is_https(p):
                 tls = scan_tls(host.ip, p.number, timeout=3.0)
                 if tls:
                     p.tls_info = tls
@@ -263,13 +254,13 @@ def _rich_intel_host(host: Host) -> None:
                     p.http_info = http
                     if http.get("tech_stack"):
                         p.tech_stack = http["tech_stack"]
-            elif p.number in _HTTP_PORTS:
+            elif is_http(p):
                 http = scan_http(host.ip, p.number, tls=False, timeout=3.0)
                 if http:
                     p.http_info = http
                     if http.get("tech_stack"):
                         p.tech_stack = http["tech_stack"]
-            elif p.number == 445:
+            elif is_smb(p):
                 smb = scan_smb(host.ip, p.number, timeout=3.0)
                 if smb:
                     p.smb_info = smb
@@ -486,8 +477,12 @@ def run_scan(
                     retries=1,
                 )
                 if syn_results:
+                    # Phase 57: SYN scan only tells us "open or not".
+                    # No service identification here — that comes from the
+                    # banner-grab pass later. We do NOT stamp an IANA-guess
+                    # service at scan time; that would defeat Phase 56's
+                    # iana_guess honesty contract.
                     from .models import Port
-                    from .ports import COMMON_SERVICE_NAMES
                     for h in hosts:
                         open_ports = syn_results.get(h.ip, [])
                         h.ports = [
@@ -495,7 +490,7 @@ def run_scan(
                                 number=p,
                                 protocol="tcp",
                                 state="open",
-                                service=COMMON_SERVICE_NAMES.get(p),
+                                state_reason="SYN-ACK received",
                             )
                             for p in open_ports
                         ]
@@ -513,19 +508,15 @@ def run_scan(
     # Single event loop scans ALL hosts × ALL ports + banners in one go.
     # The thread-based per-host pipeline below then skips port_scan +
     # banner_grab when this populated the data.
-    async_results: dict[str, tuple[list[int], dict[int, str]]] = {}
+    # Phase 57: aio.run_async_scan now returns list[Port] (state-aware),
+    # not list[int]. The result tuple is (probed_ports, banners_by_number).
+    async_results: dict[str, tuple[list[Port], dict[int, str]]] = {}
     if async_io and hosts and ports:
         if progress:
             progress(f"async I/O: {len(hosts)} hosts × {len(ports)} ports in "
                      "one event loop…")
         try:
-            from .models import Port
-            # If SYN already found open ports, scan only those (faster banner phase)
-            if syn_results:
-                # Build per-host port list = SYN's findings (skip closed)
-                ports_to_use = ports  # async scan will validate
-            else:
-                ports_to_use = ports
+            ports_to_use = ports
             async_results = run_async_scan(
                 [h.ip for h in hosts], ports_to_use,
                 use_uvloop=True,
@@ -535,26 +526,40 @@ def run_scan(
                 host_concurrency=min(host_workers * 2, 64),
                 port_concurrency=2000 if host_workers >= 128 else 1000,
             )
-            # Populate Host.ports from the async results — merge with SYN if present
-            from .ports import COMMON_SERVICE_NAMES
+            # Phase 57: merge async-discovered ports with SYN results. The
+            # async scan now returns full Port objects with state, banner,
+            # state_reason — no need to re-stamp port→service guesses here.
+            from .banners import _identify_protocol
             for h in hosts:
-                open_ports, banners = async_results.get(h.ip, ([], {}))
-                # Union with SYN-found ports (in case async missed some)
+                probed_ports, banner_map = async_results.get(h.ip, ([], {}))
+                by_num: dict[int, Port] = {p.number: p for p in probed_ports}
+                # Union with SYN-found open ports (in case async missed some)
                 if syn_results:
-                    syn_ports = set(syn_results.get(h.ip, []))
-                    all_open = sorted(set(open_ports) | syn_ports)
-                else:
-                    all_open = open_ports
-                h.ports = [
-                    Port(
-                        number=p,
-                        protocol="tcp",
-                        state="open",
-                        service=COMMON_SERVICE_NAMES.get(p),
-                        banner=banners.get(p),
-                    )
-                    for p in all_open
-                ]
+                    for sp in syn_results.get(h.ip, []):
+                        if sp not in by_num:
+                            by_num[sp] = Port(
+                                number=sp, protocol="tcp", state="open",
+                                state_reason="SYN-ACK (no TCP-connect confirm)",
+                            )
+                # Apply banner content classification where available
+                for num, port in by_num.items():
+                    b = banner_map.get(num)
+                    if b:
+                        port.banner = b
+                        # Best-effort content-based service identification
+                        try:
+                            svc, prod, ver = _identify_protocol(b.encode("utf-8",
+                                                                          "ignore"))
+                            if svc:
+                                port.service = svc
+                                port.iana_guess = False
+                            if prod and not port.product_name:
+                                port.product_name = prod
+                            if ver and not port.product_version:
+                                port.product_version = ver
+                        except Exception:
+                            pass
+                h.ports = sorted(by_num.values(), key=lambda p: p.number)
             if progress:
                 total_open = sum(len(h.ports) for h in hosts)
                 progress(f"async I/O complete: {total_open} open port(s) across "
@@ -800,12 +805,13 @@ def run_scan(
             ws_results: dict = {}
             for h in hosts:
                 host_ws: list = []
-                for p in h.ports:
+                from .port_classifier import is_https
+                for p in h.open_ports():
                     if not p.http_info:
                         continue
                     headers = p.http_info.get("headers", {})
                     ws_result = analyze_response(headers, b"",
-                                                  url_was_https=(p.number in (443, 8443)))
+                                                  url_was_https=is_https(p))
                     if ws_result.get("issue_count"):
                         host_ws.append({"port": p.number, **ws_result})
                 if host_ws:

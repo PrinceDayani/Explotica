@@ -291,10 +291,12 @@ def winrm_scan_hosts(hosts: list, creds: dict,
     out: dict[str, dict] = {}
 
     def scan(h):
+        # Phase 57: check state==open, not just "port number is present in list"
+        # (which would include closed/filtered ports now that Phase 56 emits all)
         port = None
-        if any(p.number == 5985 for p in h.ports):
+        if any(p.number == 5985 and p.state == "open" for p in h.ports):
             port = 5985
-        elif any(p.number == 5986 for p in h.ports):
+        elif any(p.number == 5986 and p.state == "open" for p in h.ports):
             port = 5986
         if not port:
             return (h.ip, None)

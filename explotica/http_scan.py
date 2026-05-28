@@ -129,10 +129,12 @@ def _send_request(host: str, port: int, path: str, *, tls: bool,
             sock = ctx.wrap_socket(raw, server_hostname=host)
         else:
             sock = raw
+        # Phase 57: User-Agent from central constants
+        from .constants import USER_AGENT
         req = (
             f"{method} {path} HTTP/1.0\r\n"
             f"Host: {host}\r\n"
-            f"User-Agent: explotica/0.1\r\n"
+            f"User-Agent: {USER_AGENT}\r\n"
             f"Accept: */*\r\n"
             f"Connection: close\r\n"
             f"\r\n"

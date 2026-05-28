@@ -144,8 +144,9 @@ def _fetch(cpe: str, timeout: float = 10.0) -> Optional[dict]:
     try:
         params = urllib.parse.urlencode({"cpeName": cpe})
         path = f"{_NVD_PATH_BASE}?{params}"
+        from .constants import USER_AGENT
         headers = {
-            "User-Agent": "explotica/0.1 (network-recon-toolkit)",
+            "User-Agent": f"{USER_AGENT} (network-recon-toolkit)",
             "Accept": "application/json",
             "Connection": "keep-alive",
         }

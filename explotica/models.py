@@ -141,7 +141,14 @@ class ScanResult:
     finished_at: str
     duration_s: float
     hosts: list[Host] = field(default_factory=list)
-    scanner_version: str = "0.1.0"
+    # Phase 57: version sourced from central constants module instead of
+    # hardcoded literal that drifted from other locations
+    scanner_version: str = ""  # set in __post_init__ if empty
+
+    def __post_init__(self):
+        if not self.scanner_version:
+            from .constants import SCANNER_VERSION
+            self.scanner_version = SCANNER_VERSION
     dns_info: Optional[dict] = None  # populated when target is a domain
     osint_info: Optional[dict] = None  # crt.sh + ASN + RDAP WHOIS
     netfabric_info: Optional[dict] = None  # DHCP discover + traceroute hops

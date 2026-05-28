@@ -318,15 +318,28 @@ def fuzz_scan(scan_dict: dict, *, include_sqli_time: bool = False
     """Run web fuzzing on every HTTP/HTTPS port in a scan."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     out: dict[str, list[dict]] = {}
-    HTTP_PORTS = {80, 81, 8000, 8008, 8080, 8081, 3000, 5000, 8888}
-    HTTPS_PORTS = {443, 4443, 8443}
+    # Phase 57: use the unified port classifier instead of local hardcoded
+    # HTTP/HTTPS sets. This also accepts content-based service identification
+    # (so HTTP on port 31337 will be fuzzed).
+    from .port_classifier import (HTTP_HINT_PORTS, HTTPS_HINT_PORTS,
+                                    HTTP_SERVICE_NAMES)
 
     def work(h):
         ip = h["ip"]
         ports_to_fuzz = []
         for p in h.get("ports", []):
-            if p["number"] in HTTP_PORTS or p["number"] in HTTPS_PORTS:
-                ports_to_fuzz.append((p["number"], p["number"] in HTTPS_PORTS))
+            # Phase 57: skip non-open ports (closed/filtered have nothing to fuzz)
+            if p.get("state", "open") != "open":
+                continue
+            num = p["number"]
+            # Content-based first; fall back to port-number hints
+            svc = p.get("service", "")
+            iana_guess = p.get("iana_guess", False)
+            is_evidenced_http = (svc in HTTP_SERVICE_NAMES and not iana_guess)
+            is_https = (num in HTTPS_HINT_PORTS or svc == "https")
+            is_http = (num in HTTP_HINT_PORTS or is_evidenced_http)
+            if is_http or is_https:
+                ports_to_fuzz.append((num, is_https))
         all_findings: list[dict] = []
         for port, tls in ports_to_fuzz:
             fs = fuzz_endpoint(ip, port, tls=tls,

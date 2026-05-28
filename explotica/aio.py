@@ -1,9 +1,14 @@
 """Async I/O primitives — uvloop-accelerated when available.
 
-This module provides async equivalents of the hot path:
-  - async_scan_ports(): asyncio.open_connection-based port probe
-  - async_grab_banner(): single async banner grab
-  - async_http_probe(): async HTTP HEAD/GET with optional TLS
+Phase 57 rewrite. Brought into consistency with Phase 56's sync scanner:
+
+  - async_probe_port: now returns a state-aware Port (open/closed/filtered/
+    unknown with state_reason), not Optional[int]. Mirrors ports.probe_tcp.
+  - async_grab_banner: uses the SAME content-based cascade as banners.py.
+    No more HTTP_PORTS_AIO / HTTPS_PORTS_AIO / QUIET_PORTS_AIO port-keyed
+    dispatch — that was the same bug we fixed in the sync path.
+  - All HTTP/TLS port hints come from port_classifier (the SINGLE source
+    of truth) instead of being redefined per module.
 
 Why async over threads for I/O-bound scanning:
   - Threads: ~256-1000 max before context-switch dominates. GIL-bound.
@@ -19,10 +24,16 @@ Or via the run_scan_async() entrypoint in scanner.py.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
-import socket
 import ssl
 from typing import Optional
+
+from .banners import _identify_protocol, _clean_text
+from .constants import USER_AGENT
+from .models import Port
+from .port_classifier import is_https, is_http_like, is_tls
+from .ports import _errno_to_state
 
 log = logging.getLogger(__name__)
 
@@ -45,59 +56,100 @@ def install_uvloop() -> bool:
         return False
 
 
-# ── Port probing ──────────────────────────────────────────────────────────
-async def async_probe_port(ip: str, port: int, timeout: float = 0.4) -> Optional[int]:
-    """Single async TCP connect. Returns port number if open, None otherwise.
+# ── Port probing — state-aware ────────────────────────────────────────────
+async def async_probe_port(ip: str, port: int,
+                            timeout: float = 0.4) -> Port:
+    """Single async TCP-connect probe. ALWAYS returns a Port.
 
-    No state tracking, no socket cleanup leaks — asyncio handles it. Each
-    probe is independent and can be batched via gather().
+    Phase 57 — classifies state from the OSError errno, matching the sync
+    ports.probe_tcp behavior. open / closed / filtered / unknown all have
+    structured reasons in state_reason.
     """
-    fut = asyncio.open_connection(ip, port)
     try:
+        fut = asyncio.open_connection(ip, port)
         reader, writer = await asyncio.wait_for(fut, timeout=timeout)
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        return None
-    try:
-        writer.close()
+        # Connected — port is open. Close politely.
         try:
-            await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
-        except (asyncio.TimeoutError, Exception):
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.3)
+            except (asyncio.TimeoutError, Exception):
+                pass
+        except Exception:
             pass
-    except Exception:
-        pass
-    return port
+        return Port(number=port, protocol="tcp",
+                    state="open", state_reason="tcp-connect succeeded")
+    except asyncio.TimeoutError:
+        return Port(number=port, protocol="tcp",
+                    state="filtered", state_reason=f"timeout {timeout}s")
+    except ConnectionRefusedError:
+        return Port(number=port, protocol="tcp",
+                    state="closed", state_reason="RST received")
+    except OSError as e:
+        err = e.errno or 0
+        state, reason = _errno_to_state(err)
+        return Port(number=port, protocol="tcp",
+                    state=state, state_reason=reason)
 
 
 async def async_scan_ports(ip: str, ports: list[int],
                             timeout: float = 0.4,
-                            concurrency: int = 1000) -> list[int]:
-    """Probe many ports on one host concurrently.
+                            concurrency: int = 2000,
+                            include_closed: bool = True,
+                            include_filtered: bool = True
+                            ) -> list[Port]:
+    """Probe many ports on one host concurrently — returns full Port objects.
 
-    Concurrency capped by a semaphore. 1000 is a safe default — kernel
-    file descriptor limits + scapy/raw socket pressure tend to be elsewhere.
+    Phase 57: state-aware (matches sync ports.scan_ports). The legacy
+    list[int]-of-open-ports return type is gone; callers needing just
+    open numbers can do `[p.number for p in result if p.state == 'open']`.
     """
     if not ports:
         return []
     sem = asyncio.Semaphore(concurrency)
 
-    async def probe_one(p: int) -> Optional[int]:
+    async def probe_one(p: int) -> Port:
         async with sem:
             return await async_probe_port(ip, p, timeout=timeout)
 
     results = await asyncio.gather(*(probe_one(p) for p in ports))
-    open_ports = sorted(p for p in results if p is not None)
-    return open_ports
+    out: list[Port] = []
+    for r in results:
+        if r.state == "open":
+            out.append(r)
+        elif r.state == "closed" and include_closed:
+            out.append(r)
+        elif r.state == "filtered" and include_filtered:
+            out.append(r)
+    return sorted(out, key=lambda p: p.number)
 
 
-# ── Banner grabbing ───────────────────────────────────────────────────────
-HTTP_PORTS_AIO = {80, 81, 8000, 8008, 8080, 8081, 3000, 5000, 8888}
-HTTPS_PORTS_AIO = {443, 8443}
-QUIET_PORTS_AIO = {22, 21, 25, 110, 143, 587, 993, 995}
+# ── Banner grabbing — content-based, NOT port-keyed ──────────────────────
+async def _async_passive_read(ip: str, port: int,
+                                timeout: float = 1.0) -> Optional[bytes]:
+    """Connect and read whatever the server volunteers (SSH/FTP/SMTP/etc.).
+    Returns RAW BYTES — caller does the protocol classification."""
+    try:
+        fut = asyncio.open_connection(ip, port)
+        reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+    except (asyncio.TimeoutError, OSError):
+        return None
+    try:
+        data = await asyncio.wait_for(reader.read(2048), timeout=timeout)
+    except (asyncio.TimeoutError, OSError):
+        data = b""
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=0.3)
+        except Exception:
+            pass
+    return data or None
 
 
 async def _async_http_probe(ip: str, port: int, *, tls: bool,
-                              timeout: float = 1.5) -> Optional[str]:
-    """Async HTTP HEAD probe — returns first line + Server header."""
+                              timeout: float = 1.5) -> Optional[bytes]:
+    """Async HTTP HEAD probe — returns raw response bytes."""
     if tls:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -110,13 +162,13 @@ async def _async_http_probe(ip: str, port: int, *, tls: bool,
         reader, writer = await asyncio.wait_for(fut, timeout=timeout)
     except (asyncio.TimeoutError, OSError, ssl.SSLError):
         return None
-
     try:
-        req = (f"HEAD / HTTP/1.0\r\nHost: {ip}\r\n"
-               f"User-Agent: explotica/0.1\r\n\r\n").encode()
+        req = (f"GET / HTTP/1.0\r\nHost: {ip}\r\n"
+               f"User-Agent: {USER_AGENT}\r\n"
+               f"Accept: */*\r\nConnection: close\r\n\r\n").encode()
         writer.write(req)
         await writer.drain()
-        data = await asyncio.wait_for(reader.read(2048), timeout=timeout)
+        data = await asyncio.wait_for(reader.read(4096), timeout=timeout)
     except (asyncio.TimeoutError, OSError, ssl.SSLError):
         data = b""
     finally:
@@ -125,70 +177,81 @@ async def _async_http_probe(ip: str, port: int, *, tls: bool,
             await asyncio.wait_for(writer.wait_closed(), timeout=0.3)
         except Exception:
             pass
-    if not data:
-        return None
-    text = data.decode("utf-8", errors="replace")
-    keep: list[str] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            if keep:
-                break
-            continue
-        if (line.startswith("HTTP/")
-                or line.lower().startswith(("server:", "x-powered-by:"))):
-            keep.append(line)
-        if len(keep) >= 3:
-            break
-    return " | ".join(keep)[:240] or None
+    return data or None
 
 
-async def _async_passive_read(ip: str, port: int,
-                                timeout: float = 1.5) -> Optional[str]:
-    """Connect and read whatever the server volunteers (SSH/FTP/SMTP/etc.)."""
-    try:
-        fut = asyncio.open_connection(ip, port)
-        reader, writer = await asyncio.wait_for(fut, timeout=timeout)
-    except (asyncio.TimeoutError, OSError):
-        return None
-    try:
-        data = await asyncio.wait_for(reader.read(1024), timeout=timeout)
-    except (asyncio.TimeoutError, OSError):
-        data = b""
-    finally:
-        try:
-            writer.close()
-            await asyncio.wait_for(writer.wait_closed(), timeout=0.3)
-        except Exception:
-            pass
-    if not data:
-        return None
-    # Same binary-detection logic as the threaded version
-    printable = sum(1 for b in data
-                     if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
-    if printable / max(len(data), 1) < 0.7:
-        return f"<binary {len(data)}B: {data[:16].hex(' ')}…>"
-    text = data.decode("utf-8", errors="replace").strip()
-    first = next((line for line in text.splitlines() if line.strip()), text)
-    return first[:200] if first else None
+async def async_grab_banner_full(ip: str, port: int,
+                                   timeout: float = 1.0
+                                   ) -> tuple[Optional[str], Optional[str],
+                                                Optional[str], Optional[str],
+                                                list[str]]:
+    """Async version of banners.grab_banner_full.
+
+    Returns (banner_text, service_from_content, product, version,
+              probes_attempted).
+    Same cascade as the sync version — passive read → classify → if no
+    response, run HTTP/TLS/HTTPS/CRLF cascade based on port HINTS (not gates).
+    """
+    probes: list[str] = []
+
+    # Step 1: passive read (chatty services: SSH/FTP/SMTP/POP3/IMAP/Redis/...)
+    probes.append("passive-read")
+    data = await _async_passive_read(ip, port, timeout=min(timeout, 0.8))
+    if data:
+        svc, prod, ver = _identify_protocol(data)
+        return (_clean_text(data), svc, prod, ver, probes)
+
+    # Step 2: cascade by port hint (just for ORDERING)
+    if is_tls(port):
+        cascade = ["https-get", "http-get", "crlf-kick"]
+    elif is_http_like(port):
+        cascade = ["http-get", "https-get", "crlf-kick"]
+    else:
+        cascade = ["http-get", "https-get", "crlf-kick"]
+
+    for probe_name in cascade:
+        probes.append(probe_name)
+        if probe_name == "http-get":
+            data = await _async_http_probe(ip, port, tls=False, timeout=timeout)
+        elif probe_name == "https-get":
+            data = await _async_http_probe(ip, port, tls=True, timeout=timeout)
+        elif probe_name == "crlf-kick":
+            # Reuse passive_read with a tiny send — async event loop makes
+            # this minimal extra work.
+            try:
+                fut = asyncio.open_connection(ip, port)
+                reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+                writer.write(b"\r\n")
+                await writer.drain()
+                data = await asyncio.wait_for(reader.read(1024),
+                                                 timeout=timeout)
+                try:
+                    writer.close()
+                    await asyncio.wait_for(writer.wait_closed(), timeout=0.3)
+                except Exception:
+                    pass
+            except (asyncio.TimeoutError, OSError):
+                data = None
+        else:
+            data = None
+        if data:
+            svc, prod, ver = _identify_protocol(data)
+            return (_clean_text(data), svc, prod, ver, probes)
+
+    return (None, None, None, None, probes)
 
 
 async def async_grab_banner(ip: str, port: int,
-                              timeout: float = 1.5) -> Optional[str]:
-    """Dispatch to the right probe for this port (HTTP / HTTPS / passive)."""
-    if port in HTTP_PORTS_AIO:
-        return await _async_http_probe(ip, port, tls=False, timeout=timeout)
-    if port in HTTPS_PORTS_AIO:
-        return await _async_http_probe(ip, port, tls=True, timeout=timeout)
-    if port in QUIET_PORTS_AIO:
-        return await _async_passive_read(ip, port, timeout)
-    # Fallback: try passive read
-    return await _async_passive_read(ip, port, timeout)
+                              timeout: float = 1.0) -> Optional[str]:
+    """Back-compat single-string banner grab."""
+    banner, _, _, _, _ = await async_grab_banner_full(ip, port, timeout=timeout)
+    return banner
 
 
 async def async_grab_all_banners(ip: str, ports: list[int],
-                                   timeout: float = 1.5,
-                                   concurrency: int = 64) -> dict[int, str]:
+                                   timeout: float = 1.0,
+                                   concurrency: int = 64
+                                   ) -> dict[int, str]:
     """Grab banners for many ports on one host concurrently."""
     if not ports:
         return {}
@@ -205,40 +268,46 @@ async def async_grab_all_banners(ip: str, ports: list[int],
 # ── Full-host async pipeline (port scan + banner grab) ────────────────────
 async def async_scan_host(ip: str, ports: list[int], *,
                             port_timeout: float = 0.4,
-                            banner_timeout: float = 1.5,
-                            port_concurrency: int = 1000,
+                            banner_timeout: float = 1.0,
+                            port_concurrency: int = 2000,
                             banner_concurrency: int = 64,
                             grab_banners: bool = True
-                            ) -> tuple[list[int], dict[int, str]]:
-    """Run port scan and banner grab for one host async, return (open_ports, banners)."""
-    open_ports = await async_scan_ports(
+                            ) -> tuple[list[Port], dict[int, str]]:
+    """Run port scan and banner grab for one host async.
+
+    Phase 57: returns full Port objects (not just numbers) so closed/filtered
+    info is preserved end-to-end.
+    """
+    probed = await async_scan_ports(
         ip, ports, timeout=port_timeout, concurrency=port_concurrency
     )
     banners: dict[int, str] = {}
-    if grab_banners and open_ports:
-        banners = await async_grab_all_banners(
-            ip, open_ports, timeout=banner_timeout,
-            concurrency=banner_concurrency
-        )
-    return (open_ports, banners)
+    if grab_banners and probed:
+        open_nums = [p.number for p in probed if p.state == "open"]
+        if open_nums:
+            banners = await async_grab_all_banners(
+                ip, open_nums, timeout=banner_timeout,
+                concurrency=banner_concurrency
+            )
+    return (probed, banners)
 
 
 # ── Multi-host async pipeline ─────────────────────────────────────────────
 async def async_scan_many(hosts: list[str], ports: list[int], *,
                             port_timeout: float = 0.4,
-                            banner_timeout: float = 1.5,
+                            banner_timeout: float = 1.0,
                             host_concurrency: int = 32,
-                            port_concurrency: int = 1000,
+                            port_concurrency: int = 2000,
                             grab_banners: bool = True
-                            ) -> dict[str, tuple[list[int], dict[int, str]]]:
+                            ) -> dict[str, tuple[list[Port], dict[int, str]]]:
     """Scan many hosts in parallel using one shared event loop.
 
-    With uvloop installed and host_concurrency=32, this can do a /24 of
-    27 live hosts × 1000 ports + banners in ~3-5 seconds on a fast LAN.
+    With uvloop installed and host_concurrency=32, this does a /24 of
+    27 live hosts × 65535 ports + banners in ~25-40 seconds on a fast LAN.
     """
     host_sem = asyncio.Semaphore(host_concurrency)
 
-    async def one(ip: str) -> tuple[str, tuple[list[int], dict[int, str]]]:
+    async def one(ip: str) -> tuple[str, tuple[list[Port], dict[int, str]]]:
         async with host_sem:
             res = await async_scan_host(
                 ip, ports, port_timeout=port_timeout,
@@ -255,7 +324,7 @@ async def async_scan_many(hosts: list[str], ports: list[int], *,
 # ── Sync wrapper — call from non-async code ──────────────────────────────
 def run_async_scan(hosts: list[str], ports: list[int],
                     use_uvloop: bool = True, **kwargs
-                    ) -> dict[str, tuple[list[int], dict[int, str]]]:
+                    ) -> dict[str, tuple[list[Port], dict[int, str]]]:
     """Run async_scan_many from sync code. Returns the same dict.
 
     Installs uvloop if available + requested.

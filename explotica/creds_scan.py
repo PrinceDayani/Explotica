@@ -895,11 +895,27 @@ def credentialed_scan_hosts(hosts: list, creds: dict,
     out: dict[str, dict] = {}
 
     def scan(h):
-        # Skip if SSH (22) isn't open on this host
-        if not any(p.number == 22 for p in h.ports):
+        # Phase 57: SSH must be OPEN, not just present in the port list
+        # (Phase 56 emits closed/filtered too). Also accept content-detected
+        # SSH on non-22 ports — closes the "SSH on 2222" coverage gap.
+        ssh_open = any(
+            p.state == "open" and (p.number == 22 or p.service == "ssh")
+            for p in h.ports
+        )
+        if not ssh_open:
             return (h.ip, None)
+        # Pick the SSH port — prefer 22, fall back to first open SSH-content port
+        ssh_port = next(
+            (p.number for p in h.ports
+             if p.state == "open" and p.number == 22),
+            None,
+        ) or next(
+            (p.number for p in h.ports
+             if p.state == "open" and p.service == "ssh"),
+            22,  # last-resort default
+        )
         return (h.ip, credentialed_scan(
-            h.ip, port=22,
+            h.ip, port=ssh_port,  # Phase 57: dynamic SSH port (not always 22)
             username=creds.get("username", "root"),
             password=creds.get("password"),
             key_filename=creds.get("key_filename"),

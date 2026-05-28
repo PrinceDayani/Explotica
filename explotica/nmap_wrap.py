@@ -239,14 +239,17 @@ def enrich_hosts_with_nmap(hosts: list[Host],
     """
     if not hosts:
         return
-    # Build the host list and the union of ports.
-    ips = [h.ip for h in hosts if h.ports]
+    # Phase 57: only nmap-scan hosts with OPEN ports — closed/filtered would
+    # just have nmap report 'tcp closed' for them, wasting probe budget.
+    ips = [h.ip for h in hosts if any(p.state == "open" for p in h.ports)]
     if not ips:
         return
     if ports_per_host:
         all_ports = sorted({p for plist in ports_per_host.values() for p in plist})
     else:
-        all_ports = sorted({p.number for h in hosts for p in h.ports})
+        # Phase 57: union of OPEN ports only
+        all_ports = sorted({p.number for h in hosts
+                             for p in h.ports if p.state == "open"})
 
     findings = run_nmap_multi(ips, all_ports, timeout=timeout)
     if not findings:
