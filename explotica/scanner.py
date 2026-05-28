@@ -448,6 +448,9 @@ def run_scan(
     kube_token: Optional[str] = None,
     subdomain_enum_enabled: bool = False,   # for domain targets
     subdomain_wordlist: Optional[list[str]] = None,
+    # Phase 63: production safety
+    checkpoint_path: Optional[str] = None,   # write partial JSON every N hosts
+    checkpoint_every_n: int = 10,
     progress: ProgressCb = None,
 ) -> ScanResult:
     """Run a full scan and return a ScanResult.
@@ -456,6 +459,9 @@ def run_scan(
     sequentially within one worker thread; multiple hosts run in parallel.
     Tunable via host_workers.
     """
+    # Phase 63: extra_findings declared up front so checkpoint mid-scan
+    # captures the same mutable reference that downstream code populates.
+    extra_findings: dict = {}
     started_iso = ScanResult.now_iso()
     t0 = time.perf_counter()
 
@@ -476,6 +482,12 @@ def run_scan(
 
     # ── Phase 2-pre: stateless SYN scan (when --syn-scan and we can) ────
     syn_results: dict[str, list[int]] = {}
+    if syn_scan_enabled and hosts and ports:
+        # Phase 63: safe-mode gates SYN scan (raw sockets are IDS-visible)
+        from .safety import safe_to_run as _gate
+        if not _gate("syn_scan"):
+            log.info("syn_scan skipped (safe-mode)")
+            syn_scan_enabled = False
     if syn_scan_enabled and hosts and ports:
         if syn_scan_available():
             if progress:
@@ -664,17 +676,44 @@ def run_scan(
                     "on PATH; skipping. (Install: apt install exploitdb)")
         use_searchsploit = False
 
+    # Phase 63: checkpoint + shutdown integration
+    from .checkpoint import Checkpoint
+    from .shutdown import get_token as _get_shutdown
+    _shutdown = _get_shutdown()
+    _checkpoint = Checkpoint(checkpoint_path,
+                               every_n_hosts=checkpoint_every_n)
+
     completed = 0
     with ThreadPoolExecutor(max_workers=host_workers) as pool:
         futures = {pool.submit(pipeline, h): h for h in hosts}
         for f in as_completed(futures):
             completed += 1
-            h = f.result()
+            try:
+                h = f.result()
+            except Exception as e:
+                # Phase 63: per-host failure shouldn't kill the whole scan
+                log.warning("pipeline error on host: %s", e)
+                continue
             if progress:
                 progress(
                     f"[{completed}/{len(hosts)}] {h.ip} "
                     f"— {len(h.ports)} open port(s)"
                 )
+            # Phase 63: checkpoint partial scan every N hosts
+            if _checkpoint.enabled:
+                _checkpoint.update({
+                    "target": target,
+                    "started_at": started_iso,
+                    "in_progress": True,
+                    "hosts_completed": completed,
+                    "hosts_total": len(hosts),
+                    "hosts": [h.to_dict() for h in hosts],
+                    "extra_findings": extra_findings,
+                })
+            # Phase 63: respect graceful shutdown — stop spawning new work
+            if _shutdown.is_set():
+                log.warning("shutdown requested mid-scan — finishing batch")
+                break
 
     # ── Phase 3: ONE-SHOT nmap (after all hosts done) ───────────────────
     # Either --use-nmap (run on ALL open ports) or --auto-fallback (run on
@@ -788,7 +827,8 @@ def run_scan(
             netfabric_info = None
 
     # ── Phase 10: Extra-finding modules (Phase 35) ──────────────────────
-    extra_findings: dict = {}
+    # Phase 63: extra_findings is declared up at the top of run_scan so the
+    # checkpoint inside the per-host loop captures the same dict reference.
 
     if ics_check and hosts:
         if progress:
@@ -833,22 +873,27 @@ def run_scan(
             log.warning("web security check failed: %s", e)
 
     if check_default_creds and hosts:
-        if progress:
-            progress("Default credential checks…")
-        try:
-            from .default_creds import check_host_defaults
-            dc_results: dict = {}
-            for h in hosts:
-                # Phase 56: default-cred check should only target OPEN ports
-                ports = [p.number for p in h.open_ports()]
-                if ports:
-                    found = check_host_defaults(h.ip, ports)
-                    if found:
-                        dc_results[h.ip] = found
-            if dc_results:
-                extra_findings["default_creds"] = dc_results
-        except Exception as e:
-            log.warning("default_creds failed: %s", e)
+        # Phase 63: respect safe-mode (this is a LOCKOUT-RISK check)
+        from .safety import safe_to_run as _gate
+        if not _gate("default_creds"):
+            log.info("default_creds skipped (safe-mode)")
+        else:
+            if progress:
+                progress("Default credential checks…")
+            try:
+                from .default_creds import check_host_defaults
+                dc_results: dict = {}
+                for h in hosts:
+                    # Phase 56: default-cred check should only target OPEN ports
+                    ports = [p.number for p in h.open_ports()]
+                    if ports:
+                        found = check_host_defaults(h.ip, ports)
+                        if found:
+                            dc_results[h.ip] = found
+                if dc_results:
+                    extra_findings["default_creds"] = dc_results
+            except Exception as e:
+                log.warning("default_creds failed: %s", e)
 
     if smtp_audit and hosts:
         if progress:
@@ -901,13 +946,19 @@ def run_scan(
             log.warning("AD enum failed: %s", e)
 
     if asrep_roast and ad_enum_domain:
-        if progress:
-            progress(f"AS-REP roasting for {ad_enum_domain}…")
-        try:
-            from .kerberoast import run_roast
-            extra_findings["asrep_roast"] = run_roast(ad_enum_domain)
-        except Exception as e:
-            log.warning("AS-REP roast failed: %s", e)
+        # Phase 63: safe-mode gates Kerberos roasting (generates failed
+        # authentication logs in AD)
+        from .safety import safe_to_run as _gate
+        if not _gate("asrep_roast"):
+            log.info("asrep_roast skipped (safe-mode)")
+        else:
+            if progress:
+                progress(f"AS-REP roasting for {ad_enum_domain}…")
+            try:
+                from .kerberoast import run_roast
+                extra_findings["asrep_roast"] = run_roast(ad_enum_domain)
+            except Exception as e:
+                log.warning("AS-REP roast failed: %s", e)
 
     if honeypot_check and hosts:
         if progress:
@@ -1012,17 +1063,22 @@ def run_scan(
             log.warning("snmp_inventory failed: %s", e)
 
     if web_appscan_enabled and hosts:
-        if progress:
-            progress("OWASP-class web app scanner (form fuzz + API discovery)…")
-        try:
-            from .web_appscan import scan_hosts_webapps
-            wa_results = scan_hosts_webapps(
-                hosts, include_time_based=sqli_time_based
-            )
-            if wa_results:
-                extra_findings["web_appscan"] = wa_results
-        except Exception as e:
-            log.warning("web_appscan failed: %s", e)
+        # Phase 63: web app fuzzing can trip WAFs / fill logs / lock accounts
+        from .safety import safe_to_run as _gate
+        if not _gate("web_appscan"):
+            log.info("web_appscan skipped (safe-mode)")
+        else:
+            if progress:
+                progress("OWASP-class web app scanner (form fuzz + API discovery)…")
+            try:
+                from .web_appscan import scan_hosts_webapps
+                wa_results = scan_hosts_webapps(
+                    hosts, include_time_based=sqli_time_based
+                )
+                if wa_results:
+                    extra_findings["web_appscan"] = wa_results
+            except Exception as e:
+                log.warning("web_appscan failed: %s", e)
 
     if container_scan_enabled and hosts:
         if progress:
@@ -1061,6 +1117,12 @@ def run_scan(
         except Exception as e:
             log.debug("risk summary failed: %s", e)
 
+    if web_fuzz_enabled and hosts:
+        # Phase 63: web fuzz sends injection payloads that may trip WAFs
+        from .safety import safe_to_run as _gate
+        if not _gate("web_fuzz"):
+            log.info("web_fuzz skipped (safe-mode)")
+            web_fuzz_enabled = False
     if web_fuzz_enabled and hosts:
         if progress:
             progress("Active web fuzzing (SQLi/XSS/path-traversal/SSRF/CRLF)…")

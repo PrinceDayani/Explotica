@@ -159,13 +159,24 @@ def _fetch(cpe: str, timeout: float = 10.0) -> Optional[dict]:
         if NVD_API_KEY:
             headers["apiKey"] = NVD_API_KEY
 
-        # Retry once on connection failure (keep-alive can race with server close)
-        for attempt in range(2):
+        # Phase 63: 3 attempts with exponential backoff + jitter (was 2 flat).
+        # NVD rate-limits anonymous clients to 5 req/30s — 502/429 are common.
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
             try:
                 conn = _get_conn()
                 conn.request("GET", path, headers=headers)
                 resp = conn.getresponse()
                 body = resp.read()
+                # Status-code-aware retry: 5xx + 429 are retryable
+                if resp.status in (429, 500, 502, 503, 504):
+                    log.debug("NVD %d transient for %s (attempt %d)",
+                              resp.status, cpe, attempt + 1)
+                    _reset_conn()
+                    if attempt < 2:
+                        from .retry import exponential_backoff
+                        time.sleep(exponential_backoff(attempt, base=1.0))
+                    continue
                 if resp.status != 200:
                     log.warning("NVD HTTP %d for %s", resp.status, cpe)
                     return None
@@ -175,12 +186,16 @@ def _fetch(cpe: str, timeout: float = 10.0) -> Optional[dict]:
                          "" if NVD_API_KEY else "  [anon rate-limited]")
                 return data
             except (http.client.HTTPException, OSError, socket.error) as e:
+                last_exc = e
                 log.debug("NVD attempt %d failed for %s: %s; resetting conn",
                           attempt + 1, cpe, e)
                 _reset_conn()
-                if attempt == 1:
-                    log.warning("NVD fetch FAILED for %s: %s", cpe, e)
-                    return None
+                if attempt < 2:
+                    from .retry import exponential_backoff
+                    time.sleep(exponential_backoff(attempt, base=0.5))
+        if last_exc:
+            log.warning("NVD fetch FAILED for %s after 3 attempts: %s",
+                        cpe, last_exc)
         return None
     finally:
         _release_quota_slot()

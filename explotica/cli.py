@@ -612,6 +612,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="Also log to a file (env: EXPLOTICA_LOG_FILE)")
     p.add_argument("--log-json", action="store_true",
                    help="Use one-line JSON log format")
+    # ── Phase 63: checkpoint flags ────────────────────────────────────────
+    p.add_argument("--checkpoint", default=None,
+                   help="Write partial scan to PATH every N hosts so crashes "
+                        "don't lose work. Auto-set to the --json path if "
+                        "--json is given.")
+    p.add_argument("--checkpoint-every", type=int, default=10,
+                   help="Checkpoint every N completed hosts (default: 10)")
     args = p.parse_args(argv)
 
     # --shell launches the REPL
@@ -1060,6 +1067,10 @@ def main(argv: list[str] | None = None) -> int:
                 kube_token=args.kube_token,
                 subdomain_enum_enabled=args.subdomain_enum,
                 subdomain_wordlist=_load_wordlist(args.subdomain_wordlist),
+                # Phase 63: checkpoint defaults to --json path
+                checkpoint_path=(args.checkpoint or
+                                   getattr(args, "json", None)),
+                checkpoint_every_n=args.checkpoint_every,
                 progress=progress,
             )
         except NotImplementedError as e:
