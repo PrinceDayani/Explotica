@@ -52,7 +52,35 @@ def _walk(host: str, oid: str, *,
            v3_level: str = "authPriv",     # noAuthNoPriv|authNoPriv|authPriv
            timeout: float = 4.0,
            retries: int = 1) -> list[str]:
-    """Walk an OID subtree. Returns list of "key = value" lines from snmpwalk."""
+    """Walk an OID subtree. Returns list of "OID = value" lines.
+
+    Phase 61: prefers native snmp_native.bulk_walk for v1/v2c (no
+    subprocess overhead, works without net-snmp installed). Falls back
+    to snmpwalk binary for v3 (USM auth not implemented natively yet).
+    """
+    # Native path for v1/v2c — much faster + no binary dependency
+    if version in ("1", "2c"):
+        try:
+            from .snmp_native import bulk_walk
+            lines: list[str] = []
+            for o, val in bulk_walk(host, oid, community=community,
+                                       timeout=timeout, max_oids=4096,
+                                       retries=retries):
+                # Emit in snmpwalk-style "OID = TYPE: value" format so
+                # downstream parsers keep working unchanged
+                if isinstance(val, str):
+                    lines.append("." + o + " = STRING: " + val)
+                elif isinstance(val, int):
+                    lines.append("." + o + " = INTEGER: " + str(val))
+                elif isinstance(val, bytes):
+                    lines.append("." + o + " = Hex-STRING: " + val.hex())
+                else:
+                    lines.append("." + o + " = " + str(val))
+            if lines:
+                return lines
+        except Exception as e:
+            log.debug("native SNMP walk failed: %s — trying binary", e)
+
     if not snmpwalk_available():
         log.debug("snmpwalk binary not available")
         return []

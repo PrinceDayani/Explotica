@@ -37,14 +37,30 @@ log = logging.getLogger(__name__)
 def fingerprint_mysql(host: str, port: int = 3306,
                        timeout: float = 4.0,
                        username: Optional[str] = None,
-                       password: Optional[str] = None) -> Optional[dict]:
-    """MySQL/MariaDB. The pre-auth handshake packet contains the server
-    version in plaintext — works without credentials.
+                       password: Optional[str] = None,
+                       database: str = "") -> Optional[dict]:
+    """MySQL/MariaDB fingerprinter.
 
-    Packet structure (MySQL Protocol::Handshake v10):
-      [3 bytes length][1 byte sequence][1 byte protocol_version=10]
-      [variable-length null-terminated version_string][...]
+    Phase 61: now prefers the full native protocol implementation from
+    mysql_protocol.deep_fingerprint (handshake + capability negotiation +
+    auth + COM_QUERY + SHOW GRANTS). Falls back to the minimal handshake
+    parser below ONLY if the deep path fails (e.g. import error).
     """
+    # Try the full protocol path first
+    try:
+        from .mysql_protocol import deep_fingerprint as _deep
+        result = _deep(host, port=port, timeout=timeout,
+                        username=username, password=password,
+                        database=database)
+        if result and result.get("server_version"):
+            return result
+    except ImportError:
+        log.debug("mysql_protocol unavailable; using minimal fallback")
+    except Exception as e:
+        log.debug("mysql_protocol.deep_fingerprint failed: %s; falling back",
+                  e)
+
+    # Fallback — minimal handshake parser (no auth, no query)
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
         sock.settimeout(timeout)
@@ -174,16 +190,30 @@ def fingerprint_postgres(host: str, port: int = 5432,
 def fingerprint_mssql(host: str, port: int = 1433,
                        timeout: float = 4.0,
                        username: Optional[str] = None,
-                       password: Optional[str] = None) -> Optional[dict]:
-    """MSSQL. Send a TDS pre-login packet — server replies with version bytes.
+                       password: Optional[str] = None,
+                       database: str = "master") -> Optional[dict]:
+    """MSSQL fingerprinter.
 
-    Pre-login packet structure (8 bytes per option entry):
-      0x12 (PRELOGIN)
-      0x01 (last packet flag)
-      [length]
-      [SPID][packet ID][window]
-      ... option fields ...
+    Phase 61: prefers full TDS 7.4 implementation from
+    mssql_protocol.deep_fingerprint (PRELOGIN + TLS upgrade + LOGIN7 +
+    token stream parsing). Falls back to the minimal pre-login byte scan
+    only on failure.
     """
+    # Full protocol path
+    try:
+        from .mssql_protocol import deep_fingerprint as _deep
+        result = _deep(host, port=port, timeout=timeout,
+                        username=username, password=password,
+                        database=database)
+        if result and result.get("version"):
+            return result
+    except ImportError:
+        log.debug("mssql_protocol unavailable; using minimal fallback")
+    except Exception as e:
+        log.debug("mssql_protocol.deep_fingerprint failed: %s; falling back",
+                  e)
+
+    # Fallback — minimal pre-login byte scan
     # Build minimal pre-login packet
     options = b"\x00\x00\x1a\x00\x06\xff"  # version option, length 6, end mark
     payload = options + b"\x09\x00\x00\x00\x00\x00\x00"  # placeholder version bytes

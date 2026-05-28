@@ -437,6 +437,17 @@ def run_scan(
     # Phase 56: state filtering — defaults emit all 3 states
     include_closed: bool = True,
     include_filtered: bool = True,
+    # Phase 61: new module wiring
+    db_fingerprint_enabled: bool = False,   # MySQL/MSSQL/PG/Mongo/Redis/etc.
+    db_credentials: Optional[dict] = None,  # per-product creds OR VaultProfile
+    snmp_inventory_enabled: bool = False,   # SNMP credentialed software inv
+    snmp_creds: Optional[dict] = None,      # community / v3_*
+    web_appscan_enabled: bool = False,      # OWASP-class scan
+    web_appscan_login: Optional[dict] = None,
+    container_scan_enabled: bool = False,
+    kube_token: Optional[str] = None,
+    subdomain_enum_enabled: bool = False,   # for domain targets
+    subdomain_wordlist: Optional[list[str]] = None,
     progress: ProgressCb = None,
 ) -> ScanResult:
     """Run a full scan and return a ScanResult.
@@ -965,6 +976,90 @@ def run_scan(
                 extra_findings["verified_cves_v2"] = v2_results
         except Exception as e:
             log.warning("v2 verify probes failed: %s", e)
+
+    # ── Phase 61 wiring: db_fingerprint / snmp_inventory / web_appscan /
+    # container_scan / subdomain_enum — all gated on their respective flags.
+    if db_fingerprint_enabled and hosts:
+        if progress:
+            progress("Deep database fingerprinting (MySQL/PG/MSSQL/Mongo/Redis/ES/...)")
+        try:
+            from .db_fingerprint import (fingerprint_host_databases,
+                                            cve_lookup_for_databases)
+            db_results: dict[str, dict] = {}
+            for h in hosts:
+                r = fingerprint_host_databases(
+                    h.ip, h.ports, db_credentials=db_credentials
+                )
+                if r:
+                    db_results[h.ip] = r
+                    # Look up CVEs for fingerprinted DBs and attach to ports
+                    cve_lookup_for_databases(h.ip, h.ports, r)
+            if db_results:
+                extra_findings["db_fingerprint"] = db_results
+        except Exception as e:
+            log.warning("db_fingerprint failed: %s", e)
+
+    if snmp_inventory_enabled and hosts:
+        if progress:
+            progress("SNMP credentialed inventory (hrSWInstalled walk)…")
+        try:
+            from .snmp_inventory import snmp_inventory_hosts
+            creds = snmp_creds or {"version": "2c", "community": "public"}
+            snmp_results = snmp_inventory_hosts(hosts, creds)
+            if snmp_results:
+                extra_findings["snmp_inventory"] = snmp_results
+        except Exception as e:
+            log.warning("snmp_inventory failed: %s", e)
+
+    if web_appscan_enabled and hosts:
+        if progress:
+            progress("OWASP-class web app scanner (form fuzz + API discovery)…")
+        try:
+            from .web_appscan import scan_hosts_webapps
+            wa_results = scan_hosts_webapps(
+                hosts, include_time_based=sqli_time_based
+            )
+            if wa_results:
+                extra_findings["web_appscan"] = wa_results
+        except Exception as e:
+            log.warning("web_appscan failed: %s", e)
+
+    if container_scan_enabled and hosts:
+        if progress:
+            progress("Container + K8s scanning (Docker daemon, CIS audit, Trivy)…")
+        try:
+            from .container_scan import scan_hosts_containers
+            cont_results = scan_hosts_containers(
+                hosts, kube_token=kube_token, run_trivy=True
+            )
+            if cont_results:
+                extra_findings["container_scan"] = cont_results
+        except Exception as e:
+            log.warning("container_scan failed: %s", e)
+
+    if subdomain_enum_enabled and hosts:
+        # Only meaningful when target was a domain
+        if "." in target and "/" not in target and progress:
+            progress("Subdomain enumeration + takeover scan…")
+        try:
+            from .subdomain_extended import enumerate_subdomains
+            if "." in target and "/" not in target:
+                sub_results = enumerate_subdomains(
+                    target, wordlist=subdomain_wordlist,
+                    include_permutations=True
+                )
+                if sub_results:
+                    extra_findings["subdomain_enum"] = sub_results
+        except Exception as e:
+            log.warning("subdomain_enum failed: %s", e)
+
+    # Phase 61: combined-risk scoring once EPSS/KEV are populated
+    if epss_kev and hosts:
+        try:
+            from .epss_kev import summarize_epss_kev_for_hosts
+            extra_findings["risk_summary"] = summarize_epss_kev_for_hosts(hosts)
+        except Exception as e:
+            log.debug("risk summary failed: %s", e)
 
     if web_fuzz_enabled and hosts:
         if progress:

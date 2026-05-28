@@ -27,7 +27,18 @@ log = logging.getLogger(__name__)
 
 
 # Each entry: cname_substring_to_match, fingerprint_in_response_body
-TAKEOVER_FINGERPRINTS: list[dict] = [
+# Phase 61: prefer the extended 75-service fingerprint DB from
+# subdomain_extended; fall back to the original ~10-entry list below.
+def _load_fingerprints() -> list[dict]:
+    try:
+        from .subdomain_extended import EXTENDED_TAKEOVER_FINGERPRINTS
+        return list(EXTENDED_TAKEOVER_FINGERPRINTS)
+    except ImportError:
+        return []
+
+
+# Original fallback list (kept for environments without subdomain_extended)
+_FALLBACK_FINGERPRINTS: list[dict] = [
     {
         "service": "GitHub Pages",
         "cname_contains": ["github.io"],
@@ -152,6 +163,15 @@ TAKEOVER_FINGERPRINTS: list[dict] = [
         "severity": "MEDIUM",
     },
 ]
+
+
+# Phase 61: resolve the effective fingerprint list at module-load time.
+# If subdomain_extended is available, use the 75-service extended DB;
+# otherwise fall back to the 10-entry list above. Mutable so users can
+# inject their own entries.
+TAKEOVER_FINGERPRINTS: list[dict] = (
+    _load_fingerprints() or list(_FALLBACK_FINGERPRINTS)
+)
 
 
 def _resolve_cname(name: str, dns_server: str = "8.8.8.8",

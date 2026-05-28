@@ -882,29 +882,45 @@ def credentialed_scan(host: str, port: int = 22, *,
             pass
 
 
-def credentialed_scan_hosts(hosts: list, creds: dict,
+def credentialed_scan_hosts(hosts: list, creds,
                              max_cve_lookups: int = 50,
                              workers: int = 8) -> dict[str, dict]:
     """Run credentialed scan against multiple hosts in parallel.
 
-    Args:
-      hosts: list of Host objects (uses host.ip)
-      creds: {"username": ..., "password": ..., "key_filename": ...}
+    Phase 61: `creds` can now be either:
+      - Legacy dict {"username", "password", "key_filename"}
+      - VaultProfile from credential_vault (multi-credential try-in-order)
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     out: dict[str, dict] = {}
 
+    # Resolve creds to a list of dicts to try in order
+    cred_attempts: list[dict] = []
+    if hasattr(creds, "vault"):  # VaultProfile
+        for cs in creds.vault("ssh"):
+            cred_attempts.append({
+                "_cred_set": cs,
+                "username": cs.username,
+                "password": cs.password,
+                "key_filename": cs.key_filename,
+            })
+    elif isinstance(creds, dict):
+        cred_attempts.append({
+            "username": creds.get("username", "root"),
+            "password": creds.get("password"),
+            "key_filename": creds.get("key_filename"),
+        })
+    if not cred_attempts:
+        cred_attempts.append({"username": "root"})  # last-resort default
+
     def scan(h):
-        # Phase 57: SSH must be OPEN, not just present in the port list
-        # (Phase 56 emits closed/filtered too). Also accept content-detected
-        # SSH on non-22 ports — closes the "SSH on 2222" coverage gap.
+        # Phase 57: SSH must be OPEN — content-aware (port 22 OR service=='ssh')
         ssh_open = any(
             p.state == "open" and (p.number == 22 or p.service == "ssh")
             for p in h.ports
         )
         if not ssh_open:
             return (h.ip, None)
-        # Pick the SSH port — prefer 22, fall back to first open SSH-content port
         ssh_port = next(
             (p.number for p in h.ports
              if p.state == "open" and p.number == 22),
@@ -912,15 +928,28 @@ def credentialed_scan_hosts(hosts: list, creds: dict,
         ) or next(
             (p.number for p in h.ports
              if p.state == "open" and p.service == "ssh"),
-            22,  # last-resort default
+            22,
         )
-        return (h.ip, credentialed_scan(
-            h.ip, port=ssh_port,  # Phase 57: dynamic SSH port (not always 22)
-            username=creds.get("username", "root"),
-            password=creds.get("password"),
-            key_filename=creds.get("key_filename"),
-            max_cve_lookups=max_cve_lookups,
-        ))
+        # Phase 61: try each credential in vault order; record success/failure
+        for attempt in cred_attempts:
+            result = credentialed_scan(
+                h.ip, port=ssh_port,
+                username=attempt["username"] or "root",
+                password=attempt.get("password"),
+                key_filename=attempt.get("key_filename"),
+                max_cve_lookups=max_cve_lookups,
+            )
+            if result:
+                cs = attempt.get("_cred_set")
+                if cs is not None:
+                    cs.record_success()
+                result["cred_used"] = (cs.label if cs else
+                                         attempt["username"])
+                return (h.ip, result)
+            cs = attempt.get("_cred_set")
+            if cs is not None:
+                cs.record_failure()
+        return (h.ip, None)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for f in as_completed([pool.submit(scan, h) for h in hosts]):

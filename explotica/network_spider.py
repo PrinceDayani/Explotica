@@ -31,26 +31,57 @@ log = logging.getLogger(__name__)
 # ── SNMP route table extraction ──────────────────────────────────────────
 def snmp_walk_routes(host: str, community: str = "public",
                       timeout: float = 4.0) -> list[dict]:
-    """Walk SNMP ipCidrRouteTable (OID 1.3.6.1.2.1.4.24.4.1) for route entries.
+    """Walk SNMP ipRouteTable for routing entries.
 
     Returns list of {dest, mask, next_hop, type, metric} dicts.
-    Hand-rolled BER walk — no pysnmp dep.
+
+    Phase 61: now uses native snmp_native.bulk_walk for true multi-PDU
+    GetBulkRequest walks. The previous single-GetNext approach never
+    finished a real route table. Falls back to snmpwalk binary, then
+    to a sysDescr probe.
     """
-    # We use a single GetNextRequest per round-trip. For simplicity, we'll
-    # try the broader ipRouteTable (OID 1.3.6.1.2.1.4.21) which is the
-    # standard route table on most devices.
+    from .snmp_native import bulk_walk
 
-    # First, try a simpler approach: use snmpwalk binary if available
-    routes = _snmpwalk_via_shell(host, community, timeout)
-    if routes:
-        return routes
+    routes_raw: dict[str, dict] = {}
+    try:
+        for oid, value in bulk_walk(host, "1.3.6.1.2.1.4.21",
+                                       community=community,
+                                       timeout=timeout, max_oids=4096):
+            # OID format: .1.3.6.1.2.1.4.21.1.<col>.<a>.<b>.<c>.<d>
+            parts = oid.split(".")
+            if len(parts) < 14:
+                continue
+            try:
+                column = int(parts[-5])
+                dest_ip = ".".join(parts[-4:])
+            except (ValueError, IndexError):
+                continue
+            entry = routes_raw.setdefault(dest_ip, {"dest": dest_ip})
+            if column == 1:        # ipRouteDest
+                entry["dest"] = str(value)
+            elif column == 11:     # ipRouteMask
+                entry["mask"] = str(value)
+            elif column == 7:      # ipRouteNextHop
+                entry["next_hop"] = str(value)
+            elif column == 3:      # ipRouteMetric1
+                entry["metric"] = value
+            elif column == 8:      # ipRouteType
+                entry["type"] = value
+    except Exception as e:
+        log.debug("snmp bulk_walk %s failed: %s; trying binary fallback",
+                  host, e)
+        routes = _snmpwalk_via_shell(host, community, timeout)
+        if routes:
+            return routes
 
-    # Fall back to single SNMP query for sysDescr to confirm SNMP works,
-    # but actual route extraction requires multi-PDU walk we don't implement
+    if routes_raw:
+        return [r for r in routes_raw.values() if r.get("dest")]
+
+    # Sanity probe so caller knows whether SNMP itself is reachable
     from .udp_probes import probe_snmp
     r = probe_snmp(host, community=community, timeout=timeout)
     if r:
-        return [{"note": "SNMP responsive but multi-PDU walk not implemented",
+        return [{"note": "SNMP responsive but no routes returned",
                   "sysDescr": r.get("sysDescr", "")[:120],
                   "community": community}]
     return []

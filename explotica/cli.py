@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from typing import Optional
 import sys
 from pathlib import Path
 
@@ -46,6 +47,45 @@ def _parse_winrm_creds(creds_str: str, transport: str = "ntlm") -> dict:
     return {"username": user, "password": password, "transport": transport}
 
 console = Console()
+
+
+# ── Phase 61: helpers for new CLI options ──────────────────────────────
+def _resolve_db_credentials(args):
+    """Resolve --db-creds and/or --use-cred-vault into the form expected
+    by scanner.run_scan(db_credentials=...).
+
+    --db-creds is a comma-separated 'product:user:pass' list.
+    --use-cred-vault loads from credential_vault and returns VaultProfile.
+    """
+    if getattr(args, "use_cred_vault", False):
+        try:
+            from .credential_vault import get_profile
+            return get_profile()
+        except Exception:
+            pass
+    raw = getattr(args, "db_creds", None)
+    if not raw:
+        return None
+    parsed: dict[str, dict] = {}
+    for entry in raw.split(","):
+        parts = entry.split(":", 2)
+        if len(parts) >= 2:
+            product = parts[0].strip()
+            user = parts[1].strip()
+            password = parts[2].strip() if len(parts) > 2 else ""
+            parsed[product] = {"user": user, "password": password}
+    return parsed
+
+
+def _load_wordlist(path: Optional[str]) -> Optional[list[str]]:
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    except OSError as e:
+        log.warning("could not read wordlist %s: %s", path, e)
+        return None
 
 
 def parse_ports(spec: str) -> list[int]:
@@ -473,6 +513,42 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sqli-time", action="store_true",
                    help="Include time-based blind SQLi (adds 5s delay per param). "
                         "Use with --web-fuzz.")
+    # ── Phase 61: new modules ──────────────────────────────────────────
+    p.add_argument("--db-fingerprint", action="store_true",
+                   help="Deep database fingerprinting via full native protocols "
+                        "(MySQL handshake+auth+SELECT, MSSQL TDS 7.4, PG, Oracle "
+                        "TNS, Mongo buildInfo, Redis INFO, Elasticsearch, "
+                        "CouchDB, InfluxDB, Memcached). Maps version→CPE→CVE.")
+    p.add_argument("--db-creds", default=None,
+                   help="Per-product DB credentials. Format: "
+                        "mysql:user:pass,postgres:user:pass,mssql:user:pass")
+    p.add_argument("--use-cred-vault", action="store_true",
+                   help="Load credentials from credential_vault profile "
+                        "(~/.config/explotica/credentials.json) — multi-cred "
+                        "rotation with priority/success-tracking.")
+    p.add_argument("--snmp-inventory", action="store_true",
+                   help="SNMP credentialed inventory: walks hrSWInstalledTable "
+                        "+ hrSWRunTable + ifTable. Software list → NVD CVEs.")
+    p.add_argument("--snmp-community", default="public",
+                   help="SNMP community string for --snmp-inventory")
+    p.add_argument("--web-appscan", action="store_true",
+                   help="OWASP-class web app scanner: form discovery + per-input "
+                        "fuzz (SQLi/XSS/SSRF/traversal/open-redirect) + "
+                        "OpenAPI/Swagger auto-discovery + session-aware. "
+                        "Heavier than --web-fuzz.")
+    p.add_argument("--container-scan", action="store_true",
+                   help="Container + K8s scanning: Docker daemon enum, CIS "
+                        "Benchmark audit (8 rules per container), Trivy image "
+                        "scan, K8s pod enum, kubelet-unauth detection.")
+    p.add_argument("--kube-token", default=None,
+                   help="Kubernetes bearer token for --container-scan "
+                        "(unauthenticated kube-apiserver also probed).")
+    p.add_argument("--subdomain-enum", action="store_true",
+                   help="Subdomain enumeration with 200-word default list + "
+                        "permutation engine (5000 candidates). Includes "
+                        "75-service takeover fingerprint scan. Domain target only.")
+    p.add_argument("--subdomain-wordlist", default=None,
+                   help="Path to custom subdomain wordlist (one per line)")
     p.add_argument("--all-the-things", action="store_true",
                    help="EVERYTHING — full-coverage + ALL active opt-in checks. "
                         "Requires authorized engagement (account lockout / login attempts).")
@@ -911,6 +987,17 @@ def main(argv: list[str] | None = None) -> int:
                 # Phase 56 state filtering
                 include_closed=not args.open_only,
                 include_filtered=not args.open_only and not args.exclude_filtered,
+                # ── Phase 61: new module wiring ────────────────────────
+                db_fingerprint_enabled=args.db_fingerprint,
+                db_credentials=_resolve_db_credentials(args),
+                snmp_inventory_enabled=args.snmp_inventory,
+                snmp_creds={"version": "2c",
+                              "community": args.snmp_community},
+                web_appscan_enabled=args.web_appscan,
+                container_scan_enabled=args.container_scan,
+                kube_token=args.kube_token,
+                subdomain_enum_enabled=args.subdomain_enum,
+                subdomain_wordlist=_load_wordlist(args.subdomain_wordlist),
                 progress=progress,
             )
         except NotImplementedError as e:

@@ -231,10 +231,15 @@ def probe_ics_port(host: str, port: int, timeout: float = 4.0) -> Optional[dict]
 
 
 def probe_ics_host(host: str, ports: list[int],
-                   timeout: float = 4.0) -> dict[int, dict]:
-    """Run all applicable ICS probes against ports on a host."""
-    findings = {}
-    # Also probe UDP BACnet regardless of TCP scan
+                   timeout: float = 4.0,
+                   extended: bool = True) -> dict[int, dict]:
+    """Run all applicable ICS probes against ports on a host.
+
+    Phase 61: also dispatches extended protocols (OPC-UA / IEC-104 / CIP /
+    Niagara / CODESYS / etc.) via ics_extended when `extended=True`.
+    """
+    findings: dict[int, dict] = {}
+    # Always probe UDP BACnet regardless of TCP scan
     bacnet = probe_bacnet(host, timeout=timeout)
     if bacnet:
         findings[47808] = bacnet
@@ -243,9 +248,27 @@ def probe_ics_host(host: str, ports: list[int],
             r = probe_ics_port(host, p, timeout=timeout)
             if r:
                 findings[p] = r
+    if extended:
+        try:
+            from .ics_extended import probe_extended_ics
+            ext_results = probe_extended_ics(host, set(ports), timeout=timeout)
+            # Merge — extended results win on conflict (they have richer data)
+            findings.update(ext_results)
+        except ImportError:
+            pass
+        except Exception as e:
+            log.debug("extended ICS probes failed for %s: %s", host, e)
     return findings
 
 
 def ics_port_set() -> set[int]:
     """Ports we have ICS probes for (for orchestrator hints)."""
-    return set(ICS_PROBES.keys()) | {47808}
+    base = set(ICS_PROBES.keys()) | {47808}
+    # Phase 61: include extended protocol ports
+    try:
+        from .ics_extended import EXTENDED_ICS_PROBES
+        base.update(port for port, _name, _fn in EXTENDED_ICS_PROBES)
+        base.add(34962)  # Profinet DCP
+    except ImportError:
+        pass
+    return base
