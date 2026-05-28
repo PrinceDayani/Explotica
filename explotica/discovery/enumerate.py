@@ -120,11 +120,21 @@ def _route_entries_from_scapy(conf) -> list:
 
 
 def _route_entries_from_shell() -> list:
-    """Fallback: parse `ip route` output for routing entries.
+    """Fallback: parse `ip route` (Linux) or `route print` (Windows) for routes.
 
-    Returns list of tuples: (network_int, netmask_int, gateway_str, iface, output_ip, metric)
-    to match scapy's format.
+    Returns list of tuples: (network_int, netmask_int, gateway_str, iface,
+    output_ip, metric) to match scapy's format.
+
+    Phase 66: cross-platform — Linux first, Windows fallback added.
     """
+    import os as _os
+    if _os.name == "nt":
+        return _route_entries_windows()
+    return _route_entries_linux()
+
+
+def _route_entries_linux() -> list:
+    """Linux: parse `ip -4 route` output."""
     import subprocess
     try:
         out = subprocess.run(["ip", "-4", "route"], capture_output=True,
@@ -152,7 +162,6 @@ def _route_entries_from_shell() -> list:
                 iface = parts[i + 1]
             elif tok == "src" and i + 1 < len(parts):
                 out_ip = parts[i + 1]
-        # Convert dest → (network_int, netmask_int)
         try:
             if dest == "default":
                 net = ipaddress.IPv4Network("0.0.0.0/0", strict=False)
@@ -163,6 +172,62 @@ def _route_entries_from_shell() -> list:
         net_int = int(net.network_address)
         mask_int = int(net.netmask)
         routes.append((net_int, mask_int, gw, iface, out_ip, 0))
+    return routes
+
+
+def _route_entries_windows() -> list:
+    """Windows: parse `route print -4` output for IPv4 routes.
+
+    Format under "IPv4 Route Table":
+        Network Destination    Netmask          Gateway       Interface  Metric
+        0.0.0.0                0.0.0.0          192.168.1.1   192.168.1.5    25
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["route", "print", "-4"],
+                              capture_output=True, text=True, timeout=6)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    routes = []
+    in_active_section = False
+    for line in out.stdout.splitlines():
+        stripped = line.strip()
+        # Section detection
+        if "Active Routes" in stripped:
+            in_active_section = True
+            continue
+        if "Persistent Routes" in stripped or "===" in stripped:
+            in_active_section = False
+            continue
+        if not in_active_section or not stripped:
+            continue
+        # Skip headers and dividers
+        if stripped.startswith(("Network Destination", "----")):
+            continue
+        parts = stripped.split()
+        if len(parts) < 5:
+            continue
+        try:
+            # Format: dest, mask, gateway, interface, metric
+            dest_str = parts[0]
+            mask_str = parts[1]
+            gw = parts[2]
+            iface_ip = parts[3]
+            try:
+                metric = int(parts[4])
+            except ValueError:
+                metric = 0
+            net = ipaddress.IPv4Network(dest_str + "/" + mask_str,
+                                          strict=False)
+            routes.append((int(net.network_address), int(net.netmask),
+                            gw if gw != "On-link" else "0.0.0.0",
+                            "",  # Windows route table doesn't expose iface name
+                            iface_ip if iface_ip != "0.0.0.0" else "",
+                            metric))
+        except (ValueError, ipaddress.AddressValueError, IndexError):
+            continue
     return routes
 
 

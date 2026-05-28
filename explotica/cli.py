@@ -613,6 +613,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--log-json", action="store_true",
                    help="Use one-line JSON log format")
     # ── Phase 63: checkpoint flags ────────────────────────────────────────
+    p.add_argument("--platform-caps", action="store_true",
+                   help="Print platform capability matrix and exit (what's "
+                        "available on this OS, which binaries are installed, "
+                        "which optional libs are usable)")
     p.add_argument("--checkpoint", default=None,
                    help="Write partial scan to PATH every N hosts so crashes "
                         "don't lose work. Auto-set to the --json path if "
@@ -622,6 +626,12 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     # --shell launches the REPL
+    # Phase 66: --platform-caps prints capability matrix and exits
+    if getattr(args, "platform_caps", False):
+        from .core.platform_caps import detect
+        print(detect().summary())
+        return 0
+
     if args.shell:
         from .ui.shell import launch_shell
         return launch_shell()

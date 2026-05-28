@@ -311,8 +311,13 @@ class MonitorDaemon:
         self.running = False
 
     def run(self):
+        # Phase 66: signal.SIGTERM doesn't exist on Windows — guard it
         signal.signal(signal.SIGINT, self.stop)
-        signal.signal(signal.SIGTERM, self.stop)
+        if hasattr(signal, "SIGTERM"):
+            try:
+                signal.signal(signal.SIGTERM, self.stop)
+            except (ValueError, OSError) as e:
+                log.debug("SIGTERM not installable: %s", e)
         log.info("daemon: starting target=%s interval=%ds out=%s db=%s",
                  self.target, self.interval_s, self.out_dir, self.db_path)
         while self.running:
