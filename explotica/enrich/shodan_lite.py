@@ -26,6 +26,8 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
+from ..core.constants import USER_AGENT
+
 log = logging.getLogger(__name__)
 
 INTERNETDB_URL = "https://internetdb.shodan.io"
@@ -84,7 +86,7 @@ def lookup_ip(ip: str, timeout: float = 6.0) -> Optional[dict]:
 
     url = f"{INTERNETDB_URL}/{ip}"
     req = urllib.request.Request(url, headers={
-        "User-Agent": "explotica/0.7.0 (network-recon-toolkit)",
+        "User-Agent": f"{USER_AGENT} (network-recon-toolkit)",
         "Accept": "application/json",
     })
     try:

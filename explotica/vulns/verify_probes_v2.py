@@ -41,6 +41,8 @@ import socket
 import ssl
 from typing import Optional
 
+from ..core.constants import USER_AGENT
+
 log = logging.getLogger(__name__)
 
 
@@ -56,7 +58,7 @@ def _http_get(host: str, port: int, path: str, *,
             sock = ctx.wrap_socket(sock, server_hostname=host)
         hlines = [f"GET {path} HTTP/1.0",
                   f"Host: {host}",
-                  "User-Agent: explotica/0.7.0",
+                  f"User-Agent: {USER_AGENT}",
                   "Connection: close"]
         for k, v in (headers or {}).items():
             hlines.append(f"{k}: {v}")

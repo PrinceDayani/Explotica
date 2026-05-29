@@ -24,6 +24,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Optional
 
+from ..core.constants import USER_AGENT
 from ..core.models import CVE
 
 log = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ _kev_set: Optional[set[str]] = None
 
 def _fetch_url(url: str, timeout: float = 30.0) -> Optional[bytes]:
     req = urllib.request.Request(
-        url, headers={"User-Agent": "explotica/0.7.0"}
+        url, headers={"User-Agent": USER_AGENT}
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

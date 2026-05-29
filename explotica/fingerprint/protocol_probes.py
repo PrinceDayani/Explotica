@@ -14,6 +14,8 @@ import socket
 import struct
 from typing import Callable, Optional
 
+from ..core.constants import USER_AGENT
+
 log = logging.getLogger(__name__)
 
 
@@ -53,7 +55,7 @@ def probe_rtsp(host: str, port: int = 554, timeout: float = 3.0) -> ProbeResult:
         sock.settimeout(timeout)
         req = (f"OPTIONS rtsp://{host}:{port} RTSP/1.0\r\n"
                f"CSeq: 1\r\n"
-               f"User-Agent: explotica/0.7.0\r\n\r\n").encode()
+               f"User-Agent: {USER_AGENT}\r\n\r\n").encode()
         sock.sendall(req)
         data = sock.recv(2048)
         sock.close()
@@ -278,7 +280,7 @@ def probe_ipp(host: str, port: int = 631, timeout: float = 3.0) -> ProbeResult:
         sock.settimeout(timeout)
         sock.sendall(
             f"GET / HTTP/1.0\r\nHost: {host}\r\n"
-            f"User-Agent: explotica/0.7.0\r\n\r\n".encode()
+            f"User-Agent: {USER_AGENT}\r\n\r\n".encode()
         )
         data = sock.recv(2048)
         sock.close()
@@ -338,7 +340,7 @@ def probe_elasticsearch(host: str, port: int = 9200, timeout: float = 3.0) -> Pr
         sock.settimeout(timeout)
         sock.sendall(
             f"GET / HTTP/1.0\r\nHost: {host}\r\n"
-            f"User-Agent: explotica/0.7.0\r\n\r\n".encode()
+            f"User-Agent: {USER_AGENT}\r\n\r\n".encode()
         )
         data = b""
         while len(data) < 4096:
@@ -373,7 +375,7 @@ def probe_wsd(host: str, port: int = 5357, timeout: float = 3.0) -> ProbeResult:
         sock.settimeout(timeout)
         sock.sendall(
             f"GET / HTTP/1.0\r\nHost: {host}\r\n"
-            f"User-Agent: explotica/0.7.0\r\n\r\n".encode()
+            f"User-Agent: {USER_AGENT}\r\n\r\n".encode()
         )
         data = sock.recv(2048)
         sock.close()

@@ -148,8 +148,13 @@ def enrich_port_with_exploits(port: Port, timeout: int = 30) -> None:
 
 
 def enrich_host_with_exploits(host: Host, timeout: int = 30) -> None:
-    """Walk a host's ports, look up exploits for each fingerprinted product."""
-    for p in host.ports:
+    """Walk a host's ports, look up exploits for each fingerprinted product.
+
+    Phase 56 state contract: only iterate OPEN ports. Closed/filtered
+    ports cannot have a fingerprinted product, so searchsploit lookups
+    against them are wasted subprocess spawns.
+    """
+    for p in host.open_ports():
         try:
             enrich_port_with_exploits(p, timeout=timeout)
         except Exception as e:
