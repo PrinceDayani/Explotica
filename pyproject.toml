@@ -80,6 +80,13 @@ databases = [
     "redis>=5.0.0",          # Redis
 ]
 
+# Active Directory + Kerberos (production-grade AS-REQ / AS-REP via impacket)
+# Phase 67: without impacket we fall back to a pure-Python ASN.1 stub that
+# returns confidence="low" — install this extra for production AD work.
+ad = [
+    "impacket>=0.11.0",
+]
+
 # Development / testing
 dev = [
     "pytest>=8.0.0",
@@ -105,6 +112,7 @@ all = [
     "pymssql>=2.2.10",
     "pymongo>=4.5.0",
     "redis>=5.0.0",
+    "impacket>=0.11.0",
 ]
 
 [project.scripts]

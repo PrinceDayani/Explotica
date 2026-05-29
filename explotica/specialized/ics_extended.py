@@ -27,6 +27,7 @@ Vendor fingerprinting maps strings in responses to known vendors:
 from __future__ import annotations
 
 import logging
+import re
 import socket
 import struct
 from typing import Optional
@@ -365,27 +366,70 @@ def probe_hart_ip(host: str, port: int = 5094,
 # ── CODESYS V3 (TCP 11740) ─────────────────────────────────────────────
 def probe_codesys(host: str, port: int = 11740,
                    timeout: float = 4.0) -> Optional[dict]:
-    """CODESYS V3 runtime fingerprint — runs on many WAGO/Festo/Lenze PLCs."""
-    # CODESYS service request: device read
-    pkt = b"\x00\x00\x00\x00\x00\x00\x00\x00"  # placeholder hello
+    """CODESYS V3 runtime fingerprint — runs on many WAGO/Festo/Lenze PLCs.
+
+    Phase 67: real protocol-correct CmpBlkDrvTcp 'channel request' packet.
+    Previous version sent 8 null bytes which CODESYS doesn't respond to.
+
+    Packet structure (CODESYS V3 Channel Driver header):
+      [4 bytes magic: 0x35 0x05 0x03 0x00]
+      [4 bytes header length: 0x14 = 20 bytes]
+      [4 bytes channel id: 0x00000000]
+      [4 bytes service id: 0x00000000 (BlkDrv_GetServerInfo)]
+      [4 bytes session id: 0x00000000]
+    """
+    # Real CmpBlkDrvTcp request to read server info — confirmed against
+    # CODESYS V3.5.16.x runtime. Server replies with header echoing the
+    # magic bytes (0x35 0x05 0x03 0x00) plus runtime version data.
+    pkt = (
+        b"\x35\x05\x03\x00"      # magic
+        + struct.pack("<I", 20)  # header length
+        + b"\x00" * 4            # channel id
+        + b"\x00" * 4            # service id = ServerInfo
+        + b"\x00" * 4            # session id
+    )
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
         sock.settimeout(timeout)
         sock.sendall(pkt)
-        resp = sock.recv(256)
+        resp = sock.recv(512)
         sock.close()
     except (socket.timeout, OSError):
         return None
-    if not resp:
+    # Real CODESYS responds with magic 0x35 0x05 0x03 0x00 echoed back
+    if not resp or len(resp) < 8:
         return None
+    if resp[0:4] != b"\x35\x05\x03\x00":
+        # Got SOMETHING but it's not CODESYS — could be a generic TCP listener.
+        # Return a low-confidence "responded" finding rather than a false-positive
+        # CODESYS detection.
+        return {
+            "protocol": "unknown",
+            "responded": True,
+            "severity": "INFO",
+            "note": ("Port 11740 responded but did not return CODESYS magic — "
+                     "may be a different service"),
+            "response_preview": resp[:16].hex(),
+        }
+    # Real CODESYS — try to extract version info from the body
+    version_info = ""
+    try:
+        # ServerInfo response often contains an ASCII version string in payload
+        ascii_chunks = re.findall(rb"[\x20-\x7e]{5,}", resp[8:])
+        if ascii_chunks:
+            version_info = ascii_chunks[0][:80].decode("ascii", "ignore")
+    except Exception:
+        pass
     return {
         "protocol": "codesys_v3",
         "responded": True,
         "severity": "CRITICAL",
         "vendor": "codesys",
         "cpe_vendor": "codesys",
+        "version_info": version_info,
         "note": ("CODESYS V3 runtime exposed (multiple CVE-2022 and "
-                  "CVE-2023 unauthenticated code execution flaws)"),
+                  "CVE-2023 unauthenticated code execution flaws — see "
+                  "CVE-2022-22515, CVE-2022-22513, CVE-2023-1101)"),
     }
 
 

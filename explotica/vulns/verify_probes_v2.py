@@ -1,24 +1,37 @@
-"""More CVE verification probes — top high-impact unpatched vulns.
+"""High-impact CVE detection probes — production-honest categorization.
 
-Each probe sends a CONFIRM-DON'T-EXPLOIT request that distinguishes
-vulnerable from patched without weaponizing the bug. These match the
-discipline of Nessus's NASL plugin set.
+Phase 67 — split into two categories for production honesty:
 
-Currently covered (additional 14 CVEs on top of Phase 38's 7):
-  - CVE-2019-19781 Citrix ADC/NetScaler path traversal
-  - CVE-2021-26855 ProxyLogon (Exchange SSRF)
-  - CVE-2022-26134 Confluence OGNL injection
-  - CVE-2023-22515 Confluence Data Center privilege escalation
-  - CVE-2022-22965 Spring4Shell
-  - CVE-2023-34362 MOVEit Transfer SQLi
-  - CVE-2022-1388 F5 BIG-IP iControl REST auth bypass
-  - CVE-2021-21972 VMware vCenter
-  - CVE-2022-40684 Fortinet FortiOS auth bypass
-  - CVE-2021-22205 GitLab RCE via ExifTool
-  - CVE-2022-1040 Sophos firewall auth bypass
-  - CVE-2024-1709 ConnectWise ScreenConnect auth bypass
-  - CVE-2024-27198 JetBrains TeamCity auth bypass
-  - CVE-2022-47966 Zoho ManageEngine SAML RCE
+  TRUE VERIFICATION (status="vulnerable"):
+    The probe sends a CVE-specific payload that ONLY a vulnerable target
+    responds to. False positives near zero. These are the gold standard.
+      - CVE-2019-19781 Citrix ADC path traversal (smb.conf via ../vpns)
+      - CVE-2021-26855 ProxyLogon (X-FEServer / X-CalculatedBETarget hdrs)
+
+  PRODUCT DETECTION (status="potentially_vulnerable"):
+    The probe identifies the product (Confluence, Spring, F5 BIG-IP, etc.)
+    but cannot determine the patch level without the bug payload (which
+    would be exploitation). Use these as TRIAGE inputs — confirm patch
+    status via vendor security advisories or banner version. The result
+    is labeled "potentially_vulnerable" rather than "vulnerable" so it
+    can't be mistaken for evidence-based verification.
+      - CVE-2022-26134 Confluence OGNL injection
+      - CVE-2023-22515 Confluence Data Center
+      - CVE-2022-22965 Spring4Shell
+      - CVE-2022-1388 F5 BIG-IP iControl REST
+      - CVE-2021-21972 VMware vCenter
+      - CVE-2022-40684 Fortinet FortiOS
+      - CVE-2021-22205 GitLab RCE
+      - CVE-2022-1040 Sophos firewall
+      - CVE-2024-1709 ConnectWise ScreenConnect
+      - CVE-2024-27198 TeamCity
+      - CVE-2022-47966 Zoho ManageEngine
+      - CVE-2023-34362 MOVEit Transfer
+
+  The CONFIRM-DON'T-EXPLOIT discipline means we never send the actual
+  exploit payload — we only confirm the surface exists. Match Nessus's
+  NASL plugin philosophy where exploitation is gated behind explicit
+  policy.
 """
 
 from __future__ import annotations

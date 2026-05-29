@@ -144,9 +144,59 @@ def kerberos_user_check(kdc_ip: str, domain: str, username: str,
                          timeout: float = 3.0) -> dict:
     """Probe Kerberos KDC with an AS-REQ for `username@DOMAIN`.
 
-    Returns dict with classification: 'exists' / 'unknown' / 'no_preauth' / 'unknown_error'.
-    NOTE: Pure-Python ASN.1 stub — for production use impacket's GetNPUsers.
+    Returns dict with classification: 'exists' / 'unknown' / 'no_preauth' /
+    'unknown_error' / 'impacket_used' / 'low_confidence'.
+
+    Phase 67 — production hardening:
+    1. If `impacket` is installed, use its full RFC-4120 AS-REQ implementation
+       (high confidence, official ASN.1 encoder, supports all etypes).
+    2. Otherwise, fall back to our minimal pure-Python probe and mark the
+       result with confidence="low" so consumers can flag it as best-effort.
+
+    To get production-grade results: `pip install impacket`.
     """
+    # ── Path 1: impacket (preferred for production) ──
+    try:
+        from impacket.krb5.kerberosv5 import getKerberosTGT, KerberosError
+        from impacket.krb5.types import Principal
+        from impacket.krb5 import constants as kc
+        try:
+            user_principal = Principal(
+                username,
+                type=kc.PrincipalNameType.NT_PRINCIPAL.value,
+            )
+            getKerberosTGT(
+                clientName=user_principal,
+                password="",  # empty — we just want to probe existence
+                domain=domain.upper(),
+                lmhash="", nthash="",
+                kdcHost=kdc_ip,
+            )
+            # If this succeeds without preauth, user is roastable
+            return {"status": "no_preauth", "username": username,
+                    "asreproastable": True, "confidence": "high",
+                    "method": "impacket"}
+        except KerberosError as e:
+            # Map impacket error codes to our shape
+            ec = getattr(e, "getErrorCode", lambda: 0)()
+            if ec == kc.ErrorCodes.KDC_ERR_C_PRINCIPAL_UNKNOWN.value:
+                return {"status": "unknown", "username": username, "code": 6,
+                        "confidence": "high", "method": "impacket"}
+            if ec == kc.ErrorCodes.KDC_ERR_PREAUTH_REQUIRED.value:
+                return {"status": "exists", "username": username, "code": 25,
+                        "preauth_required": True, "confidence": "high",
+                        "method": "impacket"}
+            return {"status": "unknown_error", "username": username,
+                    "code": ec, "confidence": "high", "method": "impacket"}
+        except Exception as e:
+            log.debug("impacket AS-REQ %s/%s crashed: %s",
+                      username, domain, e)
+            # Fall through to our minimal probe
+    except ImportError:
+        log.debug("impacket not installed — using minimal AS-REQ probe "
+                  "(LOW confidence — install impacket for production)")
+
+    # ── Path 2: minimal pure-Python probe (LOW confidence fallback) ──
     pkt = _build_as_req(domain, username)
     try:
         sock = socket.create_connection((kdc_ip, 88), timeout=timeout)
@@ -184,21 +234,27 @@ def kerberos_user_check(kdc_ip: str, domain: str, username: str,
                 )
                 if code == 6:
                     return {"status": "unknown", "username": username,
-                            "code": code}
+                            "code": code, "confidence": "low",
+                            "method": "pure-python"}
                 elif code == 25:
                     return {"status": "exists", "username": username,
-                            "code": code, "preauth_required": True}
+                            "code": code, "preauth_required": True,
+                            "confidence": "low", "method": "pure-python"}
                 elif code == 24:
                     return {"status": "exists", "username": username,
-                            "code": code, "note": "preauth bad"}
+                            "code": code, "note": "preauth bad",
+                            "confidence": "low", "method": "pure-python"}
                 else:
                     return {"status": "unknown_error", "username": username,
-                            "code": code}
+                            "code": code, "confidence": "low",
+                            "method": "pure-python"}
     # If no error code found, might be AS-REP — user exists with DONT_REQ_PREAUTH
     if resp_data[0] == 0x6b:  # AS-REP tag
         return {"status": "no_preauth", "username": username,
-                "asreproastable": True}
-    return {"status": "no_response", "username": username}
+                "asreproastable": True, "confidence": "low",
+                "method": "pure-python"}
+    return {"status": "no_response", "username": username,
+            "confidence": "low", "method": "pure-python"}
 
 
 # ── Common username wordlist for enumeration ──────────────────────────────
