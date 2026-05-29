@@ -5,7 +5,9 @@ Phase 5a (this module):
   - Identify default gateway(s)
   - Derive the set of directly-connected subnets to scan
 
-Phase 5b (planned): SNMP route walk, traceroute hop discovery, mDNS sniff.
+SNMP route walk lives in discovery/network_spider.py (Phase 46).
+Traceroute lives in discovery/netfabric.py (Phase 13d).
+mDNS sniff is not yet implemented.
 
 Cross-platform via scapy's `conf.route` (the same kernel routing table the
 OS uses for forwarding decisions). No psutil/netifaces dependency.

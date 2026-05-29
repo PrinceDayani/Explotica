@@ -358,26 +358,13 @@ def _grab_host_banners(host: Host, banner_timeout: float,
     return host
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# THE ORCHESTRATOR — YOU WRITE THIS.
-#
-# Read the helpers above. They are your building blocks. Compose them.
-#
-# Requirements:
-#   1. Run discovery first (use _discover).
-#   2. For each live host, do: enrich → port-scan → banner-grab.
-#   3. Decide: do hosts in parallel? (recommended) If yes, what max_workers?
-#   4. Call `progress(...)` with short status strings so the CLI can show them.
-#   5. Build and return a ScanResult with started_at/finished_at/duration_s set.
-#
-# Tradeoffs to consider:
-#   - Too many host-level threads → router drops packets, false negatives.
-#   - Banner grab is the slowest. You COULD skip banners on hosts with >N ports.
-#   - You can do enrich + port-scan concurrently per host (they don't overlap),
-#     but the simpler "sequential per host, parallel across hosts" is fine.
-#
-# Suggested signature is below — fill the body.
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# run_scan — the orchestrator. Coordinates discovery → enrichment →
+# port-scan → banner-grab → vuln-scan → optional active modules → output.
+# Multiple hosts run in parallel via ThreadPoolExecutor (host_workers).
+# Phase 56 state contract: all probe/enrichment paths consult Port.state
+# and only act on open ports.
+# ─────────────────────────────────────────────────────────────────────────
 
 def run_scan(
     target: str,
