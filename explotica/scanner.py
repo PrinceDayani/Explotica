@@ -902,7 +902,11 @@ def run_scan(
             from .active.smtp_test import audit_smtp
             smtp_results: dict = {}
             for h in hosts:
-                for p in h.ports:
+                # Phase 56 contract: SMTP probe only on OPEN ports.
+                # audit_smtp opens a TCP+EHLO+VRFY+EXPN session; against
+                # a closed/filtered port that wastes a full SMTP timeout
+                # (~5-10s per port) with no possible finding.
+                for p in h.open_ports():
                     if p.number in (25, 587, 465):
                         r = audit_smtp(h.ip, p.number)
                         if r:
