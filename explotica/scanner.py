@@ -36,7 +36,7 @@ from .enrich.smb_scan import scan_smb
 from .enrich.ssh_enum import enum_ssh
 from .discovery.syn_scan import syn_scan, syn_scan_available
 from .enrich.tls_scan import scan_tls
-from .discovery.udp_probes import probe_all_udp
+from .discovery import udp_scan
 from .enrich.web_crawler import crawl as web_crawl
 from .fingerprint.oui import lookup as oui_lookup
 from .discovery.ports import TOP_100_PORTS, scan_ports
@@ -216,14 +216,28 @@ def _unmask_host(host: Host) -> None:
         list(pool.map(probe_one, candidates))
 
 
-def _udp_probe_host(host: Host) -> None:
-    """Run SNMP/mDNS/SSDP/NetBIOS UDP probes; attach result to host.udp_services."""
+def _udp_probe_host(host: Host, *, full_range: bool = False) -> None:
+    """Adaptive UDP scan — attach discovered services to host.udp_services.
+
+    Phase 69: replaces the old fixed 4-probe (SNMP/mDNS/SSDP/NetBIOS) approach
+    with the udp_scan engine — protocol-correct payloads across ~40 services,
+    connected-socket open/closed/filtered state detection (no admin needed),
+    ICMP-aware adaptive pacing, and rich parsers that surface security findings
+    (IPMI null-auth, NTP monlist amplification, anonymous SNMP, open RPC, ...).
+
+    `full_range=True` sweeps all 65535 UDP ports; default is the curated
+    high-value set, which keeps network-wide scans fast.
+    """
     try:
-        results = probe_all_udp(host.ip, timeout=2.0)
-        if results:
-            host.udp_services = results
+        if full_range:
+            ports = udp_scan.scan_udp(host.ip)
+        else:
+            ports = udp_scan.scan_udp_fast(host.ip)
+        summary = udp_scan.summarize_udp(ports)
+        if summary:
+            host.udp_services = summary
     except Exception as e:
-        log.debug("udp probes on %s failed: %s", host.ip, e)
+        log.debug("udp scan on %s failed: %s", host.ip, e)
 
 
 def _rich_intel_host(host: Host) -> None:
@@ -385,6 +399,7 @@ def run_scan(
     epss_kev: bool = False,
     unmask: bool = False,
     udp_probe: bool = False,
+    udp_full: bool = False,
     web_crawl_enabled: bool = False,
     shodan_enabled: bool = False,
     ssh_enum_enabled: bool = False,
@@ -622,7 +637,9 @@ def run_scan(
                 if unmask:
                     wave_a.append(("unmask", lambda: _unmask_host(h)))
                 if udp_probe:
-                    wave_a.append(("udp", lambda: _udp_probe_host(h)))
+                    wave_a.append(("udp",
+                                    lambda: _udp_probe_host(h,
+                                                            full_range=udp_full)))
                 if rich_intel:
                     wave_a.append(("rich_intel", lambda: _rich_intel_host(h)))
                 if ssh_enum_enabled:

@@ -333,8 +333,24 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
             if host.udp_services.get("netbios"):
                 ns = host.udp_services["netbios"].get("names", [])
                 udp_summary.append(f"NetBIOS({len(ns)})")
+            # Phase 69: surface the newly-discovered UDP services too.
+            _udp_labels = {
+                "ntp": "NTP", "dns": "DNS", "ike": "IKE/VPN", "ipmi": "IPMI",
+                "rpcbind": "RPC", "stun": "STUN", "sip": "SIP",
+                "memcached": "memcached", "mssql-browser": "MSSQL-browser",
+                "coap": "CoAP", "bacnet": "BACnet", "chargen": "chargen",
+                "llmnr": "LLMNR",
+            }
+            for _key, _label in _udp_labels.items():
+                if host.udp_services.get(_key):
+                    udp_summary.append(_label)
             if udp_summary:
                 host_display += f"\n[dim cyan]UDP: {', '.join(udp_summary)}[/dim cyan]"
+            # Security findings raised by the UDP parsers (high signal).
+            _findings = [v["finding"] for v in host.udp_services.values()
+                         if isinstance(v, dict) and v.get("finding")]
+            for _f in _findings[:6]:
+                host_display += f"\n[yellow]  [!] UDP: {_f}[/yellow]"
 
         # Phase 56: closed + filtered summary in dim italics so the user can
         # see them without flooding the table
@@ -423,8 +439,12 @@ def main(argv: list[str] | None = None) -> int:
                         "ports (JetDirect, RTSP, Redis, MongoDB, MySQL, "
                         "Postgres, SIP, IPP, Elasticsearch, etc.)")
     p.add_argument("--udp-probe", action="store_true",
-                   help="Send SNMP, mDNS, SSDP, NetBIOS-NS queries to every "
-                        "host. Discovers UDP-only services TCP scans miss.")
+                   help="Adaptive UDP scan of ~40 high-value services (DNS, "
+                        "SNMP, NTP, IKE, IPMI, RPC, mDNS, SSDP, NetBIOS, SIP, "
+                        "memcached, ...) with state detection + rich parsers.")
+    p.add_argument("--udp-full", action="store_true",
+                   help="With --udp-probe: sweep all 65535 UDP ports instead of "
+                        "the curated high-value set (much slower).")
     p.add_argument("--web-crawl", action="store_true",
                    help="Crawl HTTP(S) services starting from / — extracts "
                         "links, forms, JavaScript API endpoints.")
@@ -679,6 +699,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # --full-coverage preset: maximum vuln discovery
+    # --udp-full implies --udp-probe (you can't sweep the full range without
+    # turning the UDP scan on).
+    if getattr(args, "udp_full", False):
+        args.udp_probe = True
+
     if args.full_coverage:
         args.vuln_scan = True
         args.deep = True
@@ -901,6 +926,7 @@ def main(argv: list[str] | None = None) -> int:
                     epss_kev=args.epss_kev,
                     unmask=args.unmask,
                     udp_probe=args.udp_probe,
+                    udp_full=getattr(args, "udp_full", False),
                     web_crawl_enabled=args.web_crawl,
                     shodan_enabled=args.shodan,
                     ssh_enum_enabled=args.ssh_enum,
@@ -1027,6 +1053,7 @@ def main(argv: list[str] | None = None) -> int:
                 epss_kev=args.epss_kev,
                 unmask=args.unmask,
                 udp_probe=args.udp_probe,
+                udp_full=getattr(args, "udp_full", False),
                 web_crawl_enabled=args.web_crawl,
                 shodan_enabled=args.shodan,
                 ssh_enum_enabled=args.ssh_enum,
