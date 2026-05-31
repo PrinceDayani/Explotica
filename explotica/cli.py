@@ -38,6 +38,30 @@ def _parse_ssh_creds(creds_str: str, key_filename: str = None) -> dict:
     }
 
 
+def _parse_ad_creds(args) -> "dict | None":
+    """Build the ad_credentials dict for Phase 70 credentialed AD audits.
+
+    Returns None unless --ad-creds is supplied AND at least one audit flag is
+    set, so we never attempt an authenticated bind the user didn't ask for.
+    """
+    if not getattr(args, "ad_creds", None):
+        return None
+    if not (args.bloodhound or args.adcs_audit or args.ticket_risk):
+        return None
+    creds = args.ad_creds
+    if ":" in creds:
+        user, password = creds.split(":", 1)
+    else:
+        user, password = creds, ""
+    return {
+        "user": user,
+        "password": password,
+        "dc": getattr(args, "ad_dc", None),
+        "ssl": bool(getattr(args, "ad_ssl", False)),
+        "out": getattr(args, "bloodhound_out", "bloodhound_explotica.zip"),
+    }
+
+
 def _parse_winrm_creds(creds_str: str, transport: str = "ntlm") -> dict:
     """Parse user:password for WinRM credentialed scan."""
     if ":" in creds_str:
@@ -509,6 +533,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--asrep-roast", action="store_true",
                    help="AS-REP roast: extract hashcat-format hashes from users without "
                         "preauth. Requires --ad-enum DOMAIN.")
+    # Phase 70: credentialed AD deep audits (authenticated NTLM LDAP bind)
+    p.add_argument("--ad-creds", metavar="USER:PASSWORD",
+                   help="Domain credentials for authenticated AD audits "
+                        "(--bloodhound/--adcs-audit/--ticket-risk). NTLM bind.")
+    p.add_argument("--ad-dc", metavar="HOST",
+                   help="Domain controller to bind to (default: discover via "
+                        "DNS SRV from --ad-enum DOMAIN)")
+    p.add_argument("--ad-ssl", action="store_true",
+                   help="Use LDAPS (port 636) for credentialed AD audits")
+    p.add_argument("--bloodhound", action="store_true",
+                   help="Authenticated BloodHound-CE collection -> importable "
+                        "zip (real SIDs, group membership, ACL edges). "
+                        "Requires --ad-enum DOMAIN + --ad-creds.")
+    p.add_argument("--bloodhound-out", metavar="PATH",
+                   default="bloodhound_explotica.zip",
+                   help="Output path for the BloodHound zip "
+                        "(default: bloodhound_explotica.zip)")
+    p.add_argument("--adcs-audit", action="store_true",
+                   help="ADCS certificate-template ESC1-ESC8 audit. "
+                        "Requires --ad-enum DOMAIN + --ad-creds.")
+    p.add_argument("--ticket-risk", action="store_true",
+                   help="Golden/Silver ticket enabler detection (krbtgt age, "
+                        "RC4 service keys). Requires --ad-enum + --ad-creds.")
     p.add_argument("--smtp-audit", action="store_true",
                    help="SMTP open-relay test + VRFY/EXPN user enum on port 25/587")
     p.add_argument("--os-fp-db", action="store_true",
@@ -1082,6 +1129,10 @@ def main(argv: list[str] | None = None) -> int:
                 cloud_keyword=args.check_cloud,
                 ad_enum_domain=args.ad_enum,
                 asrep_roast=args.asrep_roast,
+                ad_credentials=_parse_ad_creds(args),
+                bloodhound_collect=args.bloodhound,
+                adcs_audit=args.adcs_audit,
+                ticket_risk=args.ticket_risk,
                 smtp_audit=args.smtp_audit,
                 os_fp_db=args.os_fp_db,
                 verify_cve_probes=args.verify_cves,
@@ -1299,6 +1350,50 @@ def main(argv: list[str] | None = None) -> int:
                 console.print(
                     f"  🔥 [bold red]AS-REP HASHES EXTRACTED:[/bold red] "
                     f"{len(hashes)} (crack with hashcat -m 18200)"
+                )
+        if ef.get("bloodhound"):
+            bh = ef["bloodhound"]
+            if bh.get("collected"):
+                c = bh.get("counts", {})
+                console.print(
+                    f"  🩸 [bold]BloodHound collected:[/bold] "
+                    f"{c.get('users', 0)} users / {c.get('groups', 0)} groups "
+                    f"/ {c.get('computers', 0)} computers → {bh.get('output')}"
+                )
+            else:
+                console.print(
+                    f"  🩸 [yellow]BloodHound collection failed:[/yellow] "
+                    f"{bh.get('error', 'unknown')}"
+                )
+        if ef.get("adcs_audit"):
+            adcs = ef["adcs_audit"]
+            if adcs.get("error"):
+                console.print(
+                    f"  📜 [yellow]ADCS audit failed:[/yellow] {adcs['error']}")
+            else:
+                findings = adcs.get("findings", [])
+                crit = [f for f in findings
+                        if f.get("severity") in ("CRITICAL", "HIGH")]
+                console.print(
+                    f"  📜 [bold]ADCS audit:[/bold] {len(adcs.get('templates', []))} "
+                    f"templates, {len(adcs.get('cas', []))} CA(s), "
+                    f"[bold red]{len(crit)} ESC finding(s)[/bold red]"
+                )
+                for f in crit[:5]:
+                    console.print(
+                        f"    [red]{f['esc']}[/red] {f.get('template', f.get('ca', ''))}"
+                        f" — {f.get('title', '')[:70]}")
+        if ef.get("ticket_risk"):
+            tr = ef["ticket_risk"]
+            if tr.get("error"):
+                console.print(
+                    f"  🎫 [yellow]Ticket-risk audit failed:[/yellow] {tr['error']}")
+            else:
+                s = tr.get("summary", {})
+                console.print(
+                    f"  🎫 [bold]Kerberos ticket risk:[/bold] "
+                    f"{s.get('golden_ticket_risks', 0)} golden-ticket enabler(s), "
+                    f"{s.get('silver_ticket_risks', 0)} silver-ticket enabler(s)"
                 )
         if ef.get("honeypot_indicators"):
             console.print(

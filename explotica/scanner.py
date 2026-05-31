@@ -373,6 +373,22 @@ def _grab_host_banners(host: Host, banner_timeout: float,
     return host
 
 
+def _resolve_dc_host(domain: str) -> Optional[str]:
+    """Resolve a domain controller hostname for `domain` via DNS SRV.
+
+    Returns the first DC's target hostname (LdapClient connects by name) or
+    None when discovery fails. Used by the Phase 70 credentialed AD audits
+    when no explicit --ad-dc is supplied.
+    """
+    try:
+        from .ad.ad_enum import discover_dcs
+        dcs = discover_dcs(domain)
+        return dcs[0]["target"] if dcs else None
+    except Exception as e:  # noqa: BLE001 — discovery is best-effort
+        log.debug("DC resolution for %s failed: %s", domain, e)
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # run_scan — the orchestrator. Coordinates discovery → enrichment →
 # port-scan → banner-grab → vuln-scan → optional active modules → output.
@@ -424,6 +440,11 @@ def run_scan(
     cloud_keyword: Optional[str] = None,
     ad_enum_domain: Optional[str] = None,
     asrep_roast: bool = False,
+    # Phase 70: credentialed AD deep audits (NTLM-bound LDAP)
+    ad_credentials: Optional[dict] = None,   # {"user","password","dc","ssl"}
+    bloodhound_collect: bool = False,
+    adcs_audit: bool = False,
+    ticket_risk: bool = False,
     smtp_audit: bool = False,
     # Phase 36-38
     os_fp_db: bool = False,
@@ -970,6 +991,55 @@ def run_scan(
                 extra_findings["asrep_roast"] = run_roast(ad_enum_domain)
             except Exception as e:
                 log.warning("AS-REP roast failed: %s", e)
+
+    # Phase 70: credentialed AD deep audits — authenticated LDAP (NTLM bind).
+    # These require explicit domain credentials AND an explicit flag, so they
+    # are strongly opt-in. They are read-only directory reads (low noise) but
+    # still produce a logon event, so we surface failures honestly rather than
+    # claiming a result that did not happen.
+    if ad_enum_domain and ad_credentials and (
+            bloodhound_collect or adcs_audit or ticket_risk):
+        dc_host = ad_credentials.get("dc") or _resolve_dc_host(ad_enum_domain)
+        if not dc_host:
+            log.warning("AD deep audit skipped: could not resolve a DC for %s "
+                        "(supply --ad-dc HOST)", ad_enum_domain)
+        else:
+            common = dict(domain=ad_enum_domain,
+                          username=ad_credentials["user"],
+                          password=ad_credentials["password"],
+                          use_ssl=bool(ad_credentials.get("ssl")))
+            if bloodhound_collect:
+                if progress:
+                    progress(f"BloodHound collection on {dc_host}…")
+                try:
+                    from .ad.bloodhound import run_collection
+                    extra_findings["bloodhound"] = run_collection(
+                        dc_host, out_path=ad_credentials.get(
+                            "out", "bloodhound_explotica.zip"), **common)
+                except Exception as e:
+                    log.warning("BloodHound collection failed: %s", e)
+                    extra_findings["bloodhound"] = {
+                        "collected": False, "error": str(e)}
+            if adcs_audit:
+                if progress:
+                    progress(f"ADCS ESC audit on {dc_host}…")
+                try:
+                    from .ad.adcs import run_adcs_audit
+                    extra_findings["adcs_audit"] = run_adcs_audit(
+                        dc_host, **common)
+                except Exception as e:
+                    log.warning("ADCS audit failed: %s", e)
+                    extra_findings["adcs_audit"] = {"error": str(e)}
+            if ticket_risk:
+                if progress:
+                    progress(f"Kerberos ticket-risk audit on {dc_host}…")
+                try:
+                    from .ad.ticket_risk import run_ticket_risk_audit
+                    extra_findings["ticket_risk"] = run_ticket_risk_audit(
+                        dc_host, **common)
+                except Exception as e:
+                    log.warning("ticket-risk audit failed: %s", e)
+                    extra_findings["ticket_risk"] = {"error": str(e)}
 
     if honeypot_check and hosts:
         if progress:

@@ -95,3 +95,63 @@ class TestVerifyProbesV2Honesty:
                     # Verify the probe at least does CVE-specific verification
                     # (not just product detection)
                     pass  # Citrix / ProxyLogon legitimately do this
+
+
+class TestBloodHoundNoFabricatedSids:
+    """Phase 70B honesty contract: the BloodHound export must NEVER fabricate
+    realistic-looking SIDs. Pre-70, ad_enum emitted
+    S-1-5-21-PLACEHOLDER-<hash> identifiers an analyst could import and
+    mistake for a real collection. Real SIDs come only from an authenticated
+    LDAP read; the unauth path must clearly mark synthetic identifiers."""
+
+    def test_ad_enum_export_delegates_to_honest_partial(self):
+        # Behavioural, not source-grep: the function must delegate to the
+        # honest partial exporter rather than build SIDs itself. (The docstring
+        # legitimately names the removed PLACEHOLDER pattern to explain history,
+        # so we assert behaviour, not the presence of a word.)
+        from explotica.ad import ad_enum
+        src = inspect.getsource(ad_enum.to_bloodhound_format)
+        assert "partial_export_from_enum" in src, \
+            "to_bloodhound_format must delegate to the honest partial export"
+        # And it must not contain the SID-fabrication f-string that built fakes.
+        assert 'f"S-1-5-21-PLACEHOLDER' not in src, \
+            "to_bloodhound_format must not construct placeholder SIDs"
+
+    def test_unauth_export_flags_partial_and_synthetic(self):
+        from explotica.ad import ad_enum
+        out = ad_enum.to_bloodhound_format(
+            "corp.local", [{"target": "dc01.corp.local", "port": 389}],
+            [{"username": "alice", "status": "no_preauth"}])
+        import json
+        blob = json.dumps(out)
+        assert out.get("partial") is True, \
+            "Unauthenticated export must be flagged partial"
+        assert "S-1-5-21" not in blob, \
+            "Unauthenticated export must not contain fabricated domain SIDs"
+        assert "synthetic:" in blob, \
+            "Synthetic identifiers must be clearly prefixed"
+
+    def test_real_collection_emits_real_sid(self):
+        """The authenticated transformer must surface the real objectSid, not a
+        hash-derived placeholder."""
+        from explotica.ad import bloodhound
+        import struct
+
+        def encode_sid(sid):
+            parts = sid.split("-")
+            subs = [int(p) for p in parts[3:]]
+            return (bytes([int(parts[1]), len(subs)])
+                    + int(parts[2]).to_bytes(6, "big")
+                    + b"".join(struct.pack("<I", s) for s in subs))
+
+        real_sid = "S-1-5-21-1-2-3-1105"
+        entry = {"attributes": {
+            "objectSid": [encode_sid(real_sid)],
+            "sAMAccountName": ["alice"],
+            "userAccountControl": ["512"],
+            "primaryGroupID": ["513"]}}
+        ctx = {"domain": "CORP.LOCAL", "domain_sid": "S-1-5-21-1-2-3",
+               "sid_index": {}, "dn_to_sid": {}}
+        bh = bloodhound.user_to_bh(entry, ctx)
+        assert bh["ObjectIdentifier"] == real_sid
+        assert "PLACEHOLDER" not in bh["ObjectIdentifier"]
