@@ -293,51 +293,21 @@ def kerberos_enum_users(kdc_ip: str, domain: str,
 # ── BloodHound JSON export ────────────────────────────────────────────────
 def to_bloodhound_format(domain: str, dcs: list[dict],
                           users: list[dict]) -> dict:
-    """Generate a minimal BloodHound-compatible JSON structure.
+    """Honest BloodHound output for the *unauthenticated* Kerberos-enum path.
 
-    Real BloodHound expects 5+ JSON files (computers, users, groups, OUs, GPOs).
-    This is a minimal users + computers (DCs) dump that BloodHound can import.
+    Phase 70B: the previous implementation fabricated realistic-looking
+    ``S-1-5-21-PLACEHOLDER-<hash>`` SIDs, which is exactly the kind of
+    fake-data the foundation audit set out to kill — an analyst could import
+    it and believe a real collection happened. We can't read a real
+    ``objectSid`` without an authenticated LDAP bind, so we no longer pretend.
+
+    This delegates to ``bloodhound.partial_export_from_enum``, which returns a
+    clearly-flagged partial graph with ``synthetic:`` identifiers. For a real,
+    importable BloodHound-CE dataset, use ``bloodhound.run_collection`` with
+    domain credentials (it reads real SIDs, group membership, and ACL edges).
     """
-    bh_users = []
-    domain_upper = domain.upper()
-    for u in users:
-        name = u["username"]
-        bh_users.append({
-            "ObjectIdentifier": f"S-1-5-21-PLACEHOLDER-{hash(name) & 0xffffffff}",
-            "Properties": {
-                "name": f"{name.upper()}@{domain_upper}",
-                "domain": domain_upper,
-                "enabled": True,
-                "dontreqpreauth": u.get("status") == "no_preauth",
-                "discovered_via": "explotica_kerberos_enum",
-            },
-            "PrimaryGroupSID": None,
-            "Aces": [],
-        })
-
-    bh_computers = []
-    for dc in dcs:
-        bh_computers.append({
-            "ObjectIdentifier": f"S-1-5-21-PLACEHOLDER-{hash(dc['target']) & 0xffffffff}",
-            "Properties": {
-                "name": dc["target"].upper(),
-                "domain": domain_upper,
-                "is_dc": True,
-                "ldap_port": dc.get("port"),
-                "discovered_via": "explotica_dns_srv",
-            },
-            "PrimaryGroupSID": None,
-            "Aces": [],
-        })
-
-    return {
-        "users": {"meta": {"type": "users", "count": len(bh_users)},
-                  "data": bh_users},
-        "computers": {"meta": {"type": "computers", "count": len(bh_computers)},
-                       "data": bh_computers},
-        "domain": domain_upper,
-        "exported_by": "explotica/0.1",
-    }
+    from .bloodhound import partial_export_from_enum
+    return partial_export_from_enum(domain, dcs, users)
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────
