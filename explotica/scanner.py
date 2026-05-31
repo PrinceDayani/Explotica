@@ -216,7 +216,8 @@ def _unmask_host(host: Host) -> None:
         list(pool.map(probe_one, candidates))
 
 
-def _udp_probe_host(host: Host, *, full_range: bool = False) -> None:
+def _udp_probe_host(host: Host, *, full_range: bool = False,
+                    prefer_raw: bool = False) -> None:
     """Adaptive UDP scan — attach discovered services to host.udp_services.
 
     Phase 69: replaces the old fixed 4-probe (SNMP/mDNS/SSDP/NetBIOS) approach
@@ -230,9 +231,9 @@ def _udp_probe_host(host: Host, *, full_range: bool = False) -> None:
     """
     try:
         if full_range:
-            ports = udp_scan.scan_udp(host.ip)
+            ports = udp_scan.scan_udp(host.ip, prefer_raw=prefer_raw)
         else:
-            ports = udp_scan.scan_udp_fast(host.ip)
+            ports = udp_scan.scan_udp_fast(host.ip, prefer_raw=prefer_raw)
         summary = udp_scan.summarize_udp(ports)
         if summary:
             host.udp_services = summary
@@ -400,6 +401,7 @@ def run_scan(
     unmask: bool = False,
     udp_probe: bool = False,
     udp_full: bool = False,
+    udp_raw: bool = False,
     web_crawl_enabled: bool = False,
     shodan_enabled: bool = False,
     ssh_enum_enabled: bool = False,
@@ -638,8 +640,9 @@ def run_scan(
                     wave_a.append(("unmask", lambda: _unmask_host(h)))
                 if udp_probe:
                     wave_a.append(("udp",
-                                    lambda: _udp_probe_host(h,
-                                                            full_range=udp_full)))
+                                    lambda: _udp_probe_host(
+                                        h, full_range=udp_full,
+                                        prefer_raw=udp_raw)))
                 if rich_intel:
                     wave_a.append(("rich_intel", lambda: _rich_intel_host(h)))
                 if ssh_enum_enabled:

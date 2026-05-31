@@ -445,6 +445,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--udp-full", action="store_true",
                    help="With --udp-probe: sweep all 65535 UDP ports instead of "
                         "the curated high-value set (much slower).")
+    p.add_argument("--udp-raw", action="store_true",
+                   help="With --udp-probe: use the raw-ICMP turbo tier (needs "
+                        "scapy + root/Npcap) for true filtered-vs-closed "
+                        "accuracy. Falls back to connected-socket mode if "
+                        "unavailable.")
     p.add_argument("--web-crawl", action="store_true",
                    help="Crawl HTTP(S) services starting from / — extracts "
                         "links, forms, JavaScript API endpoints.")
@@ -699,9 +704,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # --full-coverage preset: maximum vuln discovery
-    # --udp-full implies --udp-probe (you can't sweep the full range without
-    # turning the UDP scan on).
-    if getattr(args, "udp_full", False):
+    # --udp-full / --udp-raw imply --udp-probe (they tune a UDP scan, so the
+    # scan must be on).
+    if getattr(args, "udp_full", False) or getattr(args, "udp_raw", False):
         args.udp_probe = True
 
     if args.full_coverage:
@@ -927,6 +932,7 @@ def main(argv: list[str] | None = None) -> int:
                     unmask=args.unmask,
                     udp_probe=args.udp_probe,
                     udp_full=getattr(args, "udp_full", False),
+                    udp_raw=getattr(args, "udp_raw", False),
                     web_crawl_enabled=args.web_crawl,
                     shodan_enabled=args.shodan,
                     ssh_enum_enabled=args.ssh_enum,
@@ -1054,6 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
                 unmask=args.unmask,
                 udp_probe=args.udp_probe,
                 udp_full=getattr(args, "udp_full", False),
+                udp_raw=getattr(args, "udp_raw", False),
                 web_crawl_enabled=args.web_crawl,
                 shodan_enabled=args.shodan,
                 ssh_enum_enabled=args.ssh_enum,

@@ -358,12 +358,35 @@ def _attach_intel(port_obj: Port, port: int, data: object) -> None:
         port_obj.banner = str(intel["finding"])[:512]
 
 
+# ── Raw-ICMP turbo tier routing (Phase 71) ───────────────────────────────────
+def _maybe_raw(ips: list[str], ports: list[int], *, prefer_raw: bool,
+               timeout: float, retries: int, max_rate: float,
+               progress) -> Optional[dict[str, list[Port]]]:
+    """If raw mode is requested AND available, run it; else return None so the
+    caller falls back to the privilege-free connected-socket engine."""
+    if not prefer_raw:
+        return None
+    try:
+        from .udp_scan_raw import raw_udp_available, raw_udp_scan
+        if not raw_udp_available():
+            log.info("prefer_raw set but raw scan unavailable (need scapy + "
+                     "root/Npcap); using connected-socket engine")
+            return None
+        rate = int(max_rate) if max_rate and max_rate > 0 else 1500
+        return raw_udp_scan(ips, ports, timeout=max(timeout, 3.0),
+                            rate_pps=rate, retries=max(1, retries),
+                            progress=progress)
+    except Exception as e:  # noqa: BLE001 — never let raw path break the scan
+        log.debug("raw udp path failed, falling back: %s", e)
+        return None
+
+
 # ── Public entry points ───────────────────────────────────────────────────────
 def scan_udp(ip: str, ports: Optional[list[int]] = None, *,
              timeout: float = 1.2, retries: int = 2,
              workers: int = 256, deep: bool = True,
              min_rto: float = 0.25, max_rto: float = 3.0,
-             max_rate: float = 0.0,
+             max_rate: float = 0.0, prefer_raw: bool = False,
              progress=None) -> list[Port]:
     """Scan UDP ports on ONE host. Returns a Port for every probed port.
 
@@ -382,6 +405,10 @@ def scan_udp(ip: str, ports: Optional[list[int]] = None, *,
         ports = ALL_UDP_PORTS
     if not ports:
         return []
+    raw = _maybe_raw([ip], ports, prefer_raw=prefer_raw, timeout=timeout,
+                     retries=retries, max_rate=max_rate, progress=progress)
+    if raw is not None:
+        return raw.get(ip, [])
     out = _scan_core([ip], ports, retries=retries, workers=workers, deep=deep,
                      default_timeout=timeout, min_rto=min_rto, max_rto=max_rto,
                      max_rate=max_rate, progress=progress)
@@ -392,12 +419,15 @@ def scan_udp_multi(ips: Iterable[str], ports: Optional[list[int]] = None, *,
                    timeout: float = 1.2, retries: int = 2,
                    workers: int = 512, deep: bool = True,
                    min_rto: float = 0.25, max_rto: float = 3.0,
-                   max_rate: float = 0.0,
+                   max_rate: float = 0.0, prefer_raw: bool = False,
                    progress=None) -> dict[str, list[Port]]:
     """Scan UDP ports across MANY hosts, interleaved (the throughput path).
 
     Per-host ICMP rate limits overlap instead of serialize: while one host is
     throttled the shared worker pool drains the others. Returns {ip: [Port,...]}.
+
+    prefer_raw routes to the raw-ICMP turbo tier when scapy + root/Npcap are
+    available (true filtered vs closed), else falls back transparently.
     """
     ip_list = list(dict.fromkeys(ips))      # de-dupe, preserve order
     if not ip_list:
@@ -406,17 +436,22 @@ def scan_udp_multi(ips: Iterable[str], ports: Optional[list[int]] = None, *,
         ports = ALL_UDP_PORTS
     if not ports:
         return {ip: [] for ip in ip_list}
+    raw = _maybe_raw(ip_list, ports, prefer_raw=prefer_raw, timeout=timeout,
+                     retries=retries, max_rate=max_rate, progress=progress)
+    if raw is not None:
+        return raw
     return _scan_core(ip_list, ports, retries=retries, workers=workers,
                       deep=deep, default_timeout=timeout, min_rto=min_rto,
                       max_rto=max_rto, max_rate=max_rate, progress=progress)
 
 
 def scan_udp_fast(ip: str, *, timeout: float = 1.2, retries: int = 2,
-                  workers: int = 64, progress=None) -> list[Port]:
+                  workers: int = 64, prefer_raw: bool = False,
+                  progress=None) -> list[Port]:
     """Curated high-value UDP triage (~40 ports with crafted payloads)."""
     return scan_udp(ip, udp_payloads.HIGH_VALUE_UDP_PORTS,
                     timeout=timeout, retries=retries, workers=workers,
-                    deep=True, progress=progress)
+                    deep=True, prefer_raw=prefer_raw, progress=progress)
 
 
 def summarize_udp(ports: list[Port]) -> dict:
