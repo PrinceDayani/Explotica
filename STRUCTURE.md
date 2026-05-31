@@ -25,7 +25,7 @@ explotica/
 ├── credentialed/  ← creds_scan, winrm_scan, db_fingerprint, snmp_inventory, credential_vault
 ├── enrich/        ← tls_scan, http_scan, http_audit, smb_scan, ssh_enum, dns_enum, web_crawler, playwright_crawler, osint, shodan_lite
 ├── active/        ← web_fuzz, web_appscan, web_security, default_creds, takeover, subdomain_extended, smtp_test, container_scan
-├── ad/            ← ad_enum, kerberoast
+├── ad/            ← ad_enum, kerberoast, ldap_client, secdesc, bloodhound, adcs, ticket_risk
 ├── specialized/   ← ics, ics_extended, cloud_assets, honeypot, compliance
 ├── output/        ← report, report_pdf, dashboard
 ├── ui/            ← tui, tui_config, shell, interactive

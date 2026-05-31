@@ -3,6 +3,43 @@
 All notable changes to Explotica are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — Phase 70: Active Directory deep-audit cluster
+
+Closes four limitations-doc gaps with real, offline-verified implementations
+(no mock/placeholder data):
+
+### Added
+- `explotica/ad/ldap_client.py` — pure-Python authenticated LDAP v3 client:
+  BER codec, RFC 4515 filter compiler, simple + NTLMv2 (SASL GSS-SPNEGO) bind,
+  paged search, and objectSid/objectGUID/FILETIME/UAC decoders. In-module MD4
+  (OpenSSL 3 dropped it from hashlib). The keystone every credentialed AD
+  capability needed.
+- `explotica/ad/secdesc.py` — MS-DTYP security-descriptor/DACL/ACE parser
+  mapping access masks + object-type GUIDs to BloodHound edges (GenericAll,
+  WriteDacl, WriteOwner, ForceChangePassword, AddMember, AllExtendedRights,
+  GetChanges/All -> synthesized DCSync, ReadGMSAPassword, WriteSPN).
+- `explotica/ad/bloodhound.py` — real BloodHound-CE collector/exporter with
+  genuine SIDs, group membership, ACL edges, GPOs, and an honest
+  `partial_export_from_enum()` for the unauth path that refuses to fabricate
+  SIDs.
+- `explotica/ad/adcs.py` — ADCS ESC1-ESC8 audit over real msPKI attributes +
+  enrollment ACLs; ESC8 web-enrollment network probe; ESC6 flagged for
+  CA-registry verification (not falsely claimed).
+- `explotica/ad/ticket_risk.py` — Golden/Silver ticket *enabler* detection
+  (krbtgt password age, RC4-only service keys), honestly scoped as risk
+  detection, not active-forgery detection.
+- CLI: `--ad-creds`, `--ad-dc`, `--ad-ssl`, `--bloodhound[-out]`,
+  `--adcs-audit`, `--ticket-risk`, with rich summary reporting.
+
+### Changed
+- `ad_enum.to_bloodhound_format` now delegates to the honest partial exporter
+  instead of fabricating `S-1-5-21-PLACEHOLDER-<hash>` SIDs.
+
+### Tests
+- 82 new offline tests (BER/MD4/NTLMv2 vectors, ACE->edge mapping incl. DCSync,
+  ESC condition logic, ticket-risk thresholds, no-fabrication guards). Suite:
+  250 passing.
+
 ## [0.8.0] — Phase 62: Production Readiness
 
 ### Added
