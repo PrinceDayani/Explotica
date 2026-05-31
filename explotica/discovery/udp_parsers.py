@@ -336,6 +336,93 @@ def parse_chargen(data: bytes) -> Optional[dict]:
     }
 
 
+# ── Ubiquiti discovery ────────────────────────────────────────────────────────
+def parse_ubiquiti(data: bytes) -> Optional[dict]:
+    # Reply: version/cmd/len header, then TLVs (type:1, len:2, value).
+    if len(data) < 4:
+        return {"responded": True, "raw_bytes": len(data)}
+    out: dict = {"responded": True, "ubiquiti": True}
+    off = 4
+    n = len(data)
+    fields: list[str] = []
+    mac = None
+    while off + 3 <= n:
+        ttype = data[off]
+        tlen = int.from_bytes(data[off + 1:off + 3], "big")
+        off += 3
+        val = data[off:off + tlen]
+        off += tlen
+        if ttype in (0x01, 0x02) and len(val) >= 6:           # MAC (+ IP)
+            mac = ":".join(f"{b:02x}" for b in val[:6])
+        elif ttype in (0x03, 0x0b, 0x0c, 0x0d, 0x14):         # text fields
+            s = val.decode("ascii", errors="ignore").strip("\x00 ").strip()
+            if s and s.isprintable():
+                fields.append(s)
+    if mac:
+        out["mac"] = mac
+    if fields:
+        out["info"] = sorted(set(fields))[:8]
+    out["finding"] = ("Ubiquiti device leaks identity via discovery (UDP/10001): "
+                      + (", ".join(out.get("info", [])[:3]) or mac or "device"))
+    return out
+
+
+# ── Steam / Source A2S_INFO ───────────────────────────────────────────────────
+def parse_a2s(data: bytes) -> Optional[dict]:
+    # 0xFFFFFFFF prefix + 'I' (0x49) header + protocol byte + C-strings.
+    if len(data) < 6 or data[4] != 0x49:
+        return {"responded": True, "raw_bytes": len(data)}
+    body = data[6:]
+    strings = body.split(b"\x00")
+    out = {"responded": True, "game_server": True}
+    if len(strings) >= 1:
+        out["name"] = strings[0].decode("utf-8", errors="replace")[:80]
+    if len(strings) >= 2:
+        out["map"] = strings[1].decode("utf-8", errors="replace")[:40]
+    if len(strings) >= 4:
+        out["game"] = strings[3].decode("utf-8", errors="replace")[:40]
+    return out
+
+
+# ── Mumble / Murmur ping ──────────────────────────────────────────────────────
+def parse_mumble(data: bytes) -> Optional[dict]:
+    if len(data) < 24:
+        return {"responded": True, "raw_bytes": len(data)}
+    # bytes 0-3: version (0, major, minor, patch); 4-11: echoed ident;
+    # 12-15 users, 16-19 max users, 20-23 bandwidth.
+    version = f"{data[1]}.{data[2]}.{data[3]}"
+    users = int.from_bytes(data[12:16], "big")
+    maxusers = int.from_bytes(data[16:20], "big")
+    return {"responded": True, "mumble": True, "version": version,
+            "users": users, "max_users": maxusers}
+
+
+# ── WS-Discovery ──────────────────────────────────────────────────────────────
+def parse_ws_discovery(data: bytes) -> Optional[dict]:
+    text = data.decode("utf-8", errors="replace")
+    out = {"responded": True, "ws_discovery": True}
+    types = _between(text, "<d:Types>", "</d:Types>") or _between(
+        text, ":Types>", "</")
+    xaddrs = _between(text, "<d:XAddrs>", "</d:XAddrs>") or _between(
+        text, ":XAddrs>", "</")
+    if types:
+        out["types"] = types.strip()[:120]
+    if xaddrs:
+        out["xaddrs"] = xaddrs.strip()[:200]
+        out["finding"] = f"WS-Discovery device at {xaddrs.strip()[:80]}"
+    return out
+
+
+def _between(text: str, start: str, end: str) -> Optional[str]:
+    i = text.find(start)
+    if i < 0:
+        return None
+    j = text.find(end, i + len(start))
+    if j < 0:
+        return None
+    return text[i + len(start):j]
+
+
 # ── generic ───────────────────────────────────────────────────────────────────
 def parse_generic(data: bytes) -> Optional[dict]:
     return {"responded": True, "raw_bytes": len(data),
@@ -373,6 +460,10 @@ _DISPATCH = {
     "mssql-browser": parse_mssql_browser,
     "sip": parse_sip,
     "chargen": parse_chargen,
+    "ubiquiti": parse_ubiquiti,
+    "a2s": parse_a2s,
+    "mumble": parse_mumble,
+    "ws-discovery": parse_ws_discovery,
 }
 
 

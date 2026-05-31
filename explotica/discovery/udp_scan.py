@@ -331,8 +331,10 @@ def _scan_core(ips: list[str], ports: list[int], *,
 
 
 def _deep_probes_all(states: dict[str, HostState], timeout: float) -> None:
-    """Fire secondary security payloads at open ports (NTP monlist, etc.)."""
+    """Deep pass on open ports: secondary security payloads + second-hop
+    enrichment chains (SNMP walk, SSDP device-XML fetch)."""
     for hs in states.values():
+        # 1) Secondary security payloads (NTP monlist, etc.).
         for port, (proto, payload) in udp_payloads.SECONDARY_PAYLOADS.items():
             po = hs.resolved.get(port)
             if po is None or po.state != "open":
@@ -344,6 +346,12 @@ def _deep_probes_all(states: dict[str, HostState], timeout: float) -> None:
                     merged = dict(po.service_intel or {})
                     merged[proto] = intel
                     po.service_intel = merged
+        # 2) Second-hop enrichment — the chains that beat nmap.
+        try:
+            from .udp_enrich import enrich_udp_ports
+            enrich_udp_ports(hs.ip, list(hs.resolved.values()))
+        except Exception as e:  # noqa: BLE001 — enrichment is best-effort
+            log.debug("udp enrichment on %s failed: %s", hs.ip, e)
 
 
 def _attach_intel(port_obj: Port, port: int, data: object) -> None:

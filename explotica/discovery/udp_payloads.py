@@ -232,6 +232,41 @@ def _chargen() -> bytes:
     return b"\x0d\x0a"
 
 
+# ── Ubiquiti discovery (10001) — leaks model/firmware/MAC/hostname ────────────
+def _ubnt_discover() -> bytes:
+    # UBNT discovery v1 request: version=1, cmd=0, payload-len=0. Devices reply
+    # with a TLV blob containing MAC, IP, firmware, model and hostname.
+    return b"\x01\x00\x00\x00"
+
+
+# ── Steam / Source A2S_INFO (27015) — game-server full info ───────────────────
+def _a2s_info() -> bytes:
+    return b"\xff\xff\xff\xff\x54Source Engine Query\x00"
+
+
+# ── Mumble/Murmur ping (64738) — version + user counts, no auth ───────────────
+def _mumble_ping() -> bytes:
+    # type=0 (request) + 8-byte ident echoed back in the reply.
+    return b"\x00\x00\x00\x00" + b"\x12\x34\x56\x78\x9a\xbc\xde\xf0"
+
+
+# ── WS-Discovery (3702) — SOAP Probe; cameras/printers return a device catalog ─
+def _ws_discovery_probe() -> bytes:
+    return (
+        b'<?xml version="1.0" encoding="utf-8"?>'
+        b'<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+        b'xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" '
+        b'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+        b'<s:Header>'
+        b'<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action>'
+        b'<a:MessageID>urn:uuid:13371337-1337-1337-1337-133713371337</a:MessageID>'
+        b'<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>'
+        b'</s:Header>'
+        b'<s:Body><d:Probe/></s:Body>'
+        b'</s:Envelope>'
+    )
+
+
 # ── The registry ──────────────────────────────────────────────────────────────
 # port → (protocol_label, payload_bytes). The protocol_label routes the
 # response to the right parser in udp_parsers.py.
@@ -253,8 +288,12 @@ PAYLOADS: dict[int, tuple[str, bytes]] = {
     5353:  ("mdns",         _mdns_services()),
     5355:  ("llmnr",        _llmnr_query()),
     5683:  ("coap",         _coap_wellknown()),
+    3702:  ("ws-discovery", _ws_discovery_probe()),
+    10001: ("ubiquiti",     _ubnt_discover()),
     11211: ("memcached",    _memcached_stats()),
+    27015: ("a2s",          _a2s_info()),
     47808: ("bacnet",       _bacnet_whois()),
+    64738: ("mumble",       _mumble_ping()),
 }
 
 # A second probe for ports where one payload elicits ordinary data and another
@@ -265,10 +304,14 @@ SECONDARY_PAYLOADS: dict[int, tuple[str, bytes]] = {
 
 # Ports we consider "high-value" — the curated set used when the caller asks
 # for a fast triage instead of the full 65535-port sweep.
-HIGH_VALUE_UDP_PORTS: list[int] = sorted(PAYLOADS.keys()) + [
-    67, 68, 88, 177, 389, 427, 443, 514, 1645, 1701, 1812, 2049, 4500,
-    5061, 6481, 17185, 27015, 27960, 32768, 49152, 51820,
-]
+# Crafted-payload ports first, then extra well-known UDP services we still want
+# to probe (with the empty fallback). dict.fromkeys de-dupes + preserves order.
+HIGH_VALUE_UDP_PORTS: list[int] = list(dict.fromkeys(
+    sorted(PAYLOADS.keys()) + [
+        67, 68, 88, 177, 389, 427, 443, 514, 1645, 1701, 1812, 2049, 4500,
+        5061, 6481, 17185, 27960, 32768, 49152, 51820,
+    ]
+))
 
 
 def payload_for(port: int) -> tuple[str, bytes]:

@@ -339,7 +339,8 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
                 "rpcbind": "RPC", "stun": "STUN", "sip": "SIP",
                 "memcached": "memcached", "mssql-browser": "MSSQL-browser",
                 "coap": "CoAP", "bacnet": "BACnet", "chargen": "chargen",
-                "llmnr": "LLMNR",
+                "llmnr": "LLMNR", "ubiquiti": "Ubiquiti", "a2s": "GameServer",
+                "mumble": "Mumble", "ws-discovery": "WS-Discovery",
             }
             for _key, _label in _udp_labels.items():
                 if host.udp_services.get(_key):
