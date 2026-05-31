@@ -83,7 +83,7 @@ def raw_udp_available() -> bool:
 # other unreachable means *something* blocked us — that's "filtered", not
 # "closed". Conflating them (as Windows' 10054 does) is the bug we're fixing.
 def icmp_unreachable_state(icmp_type: int, icmp_code: int) -> tuple[str, str]:
-    """Map an ICMP (type, code) to (port_state, reason)."""
+    """Map an ICMPv4 (type, code) to (port_state, reason)."""
     if icmp_type == 3:
         if icmp_code == 3:
             return ("closed", "ICMP port-unreachable (3/3)")
@@ -93,6 +93,20 @@ def icmp_unreachable_state(icmp_type: int, icmp_code: int) -> tuple[str, str]:
         return ("filtered",
                 f"ICMP {labels.get(icmp_code, 'unreachable')} (3/{icmp_code})")
     return ("filtered", f"ICMP type {icmp_type}")
+
+
+def icmpv6_unreachable_state(icmp_code: int) -> tuple[str, str]:
+    """Map an ICMPv6 Destination-Unreachable code (type 1) to (state, reason).
+
+    RFC 4443: code 4 = port unreachable = CLOSED; every other code (no route,
+    admin prohibited, address unreachable, …) = filtered.
+    """
+    if icmp_code == 4:
+        return ("closed", "ICMPv6 port-unreachable (1/4)")
+    labels = {0: "no-route", 1: "admin-prohibited", 2: "beyond-scope",
+              3: "address-unreachable", 5: "src-addr-policy", 6: "reject-route"}
+    return ("filtered",
+            f"ICMPv6 {labels.get(icmp_code, 'unreachable')} (1/{icmp_code})")
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -119,11 +133,12 @@ def raw_udp_scan(targets: Iterable[str], ports: list[int], *,
 
     logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
     logging.getLogger("scapy").setLevel(logging.ERROR)
-    from scapy.all import IP, UDP, Raw, AsyncSniffer, send, conf  # noqa
+    from scapy.all import IP, IPv6, UDP, Raw, AsyncSniffer, send, conf  # noqa
     conf.verb = 0
 
     target_set = set(targets)
     port_set = set(ports)
+    has_v6 = any(":" in ip for ip in targets)
     # State table: default everything to open|filtered; replies overwrite it.
     states: dict[tuple[str, int], tuple[str, str]] = {
         (ip, p): ("open|filtered", "no response") for ip in targets for p in ports
@@ -136,7 +151,9 @@ def raw_udp_scan(targets: Iterable[str], ports: list[int], *,
         except Exception:
             pass
 
-    sniffer = AsyncSniffer(filter="icmp or udp", store=False, prn=on_pkt)
+    # icmp6 added to the BPF so ICMPv6 port-unreachables are captured too.
+    bpf = "icmp or icmp6 or udp" if has_v6 else "icmp or udp"
+    sniffer = AsyncSniffer(filter=bpf, store=False, prn=on_pkt)
     sniffer.start()
 
     src_port = random.randint(20000, 60000)
@@ -145,9 +162,10 @@ def raw_udp_scan(targets: Iterable[str], ports: list[int], *,
     total = len(targets) * len(ports) * max(1, retries)
     for _ in range(max(1, retries)):
         for ip in targets:
+            l3 = IPv6(dst=ip) if ":" in ip else IP(dst=ip)
             for p in ports:
                 _, payload = udp_payloads.payload_for(p)
-                pkt = IP(dst=ip) / UDP(sport=src_port, dport=p) / Raw(load=payload)
+                pkt = l3 / UDP(sport=src_port, dport=p) / Raw(load=payload)
                 try:
                     send(pkt, verbose=False)
                 except Exception as e:
@@ -174,10 +192,19 @@ def raw_udp_scan(targets: Iterable[str], ports: list[int], *,
 
 
 def _handle_packet(pkt, target_set, port_set, states, reply_bytes) -> None:
-    """Sniffer callback body — split out so it stays unit-reviewable."""
+    """Sniffer callback body — split out so it stays unit-reviewable.
+
+    Handles four reply shapes: UDP reply (v4/v6) => open, ICMPv4 unreachable and
+    ICMPv6 destination-unreachable => closed/filtered by code.
+    """
     # A UDP reply from a target's service port == that port is OPEN.
-    if pkt.haslayer("UDP") and pkt.haslayer("IP") and not pkt.haslayer("ICMP"):
-        src = pkt["IP"].src
+    if (pkt.haslayer("UDP")
+            and not pkt.haslayer("ICMP")
+            and not pkt.haslayer("ICMPv6DestUnreach")):
+        src = pkt["IPv6"].src if pkt.haslayer("IPv6") else (
+            pkt["IP"].src if pkt.haslayer("IP") else None)
+        if src is None:
+            return
         sport = int(pkt["UDP"].sport)
         if src in target_set and sport in port_set:
             key = (src, sport)
@@ -187,19 +214,30 @@ def _handle_packet(pkt, target_set, port_set, states, reply_bytes) -> None:
             except Exception:
                 pass
         return
-    # An ICMP unreachable carries our original IP+UDP header — map it back.
+    # ICMPv4 unreachable — quoted inner packet is IPerror / UDPerror.
     if pkt.haslayer("ICMP"):
         icmp = pkt["ICMP"]
-        itype, icode = int(icmp.type), int(icmp.code)
-        # scapy exposes the quoted inner packet as IPerror / UDPerror layers.
-        if pkt.haslayer("IPerror") and pkt.haslayer("UDPerror"):
-            orig_dst = pkt["IPerror"].dst
-            orig_dport = int(pkt["UDPerror"].dport)
-            if orig_dst in target_set and orig_dport in port_set:
-                key = (orig_dst, orig_dport)
-                # Don't let a stray ICMP overwrite a confirmed-open port.
-                if states.get(key, (None,))[0] != "open":
-                    states[key] = icmp_unreachable_state(itype, icode)
+        if int(icmp.type) == 3 and pkt.haslayer("IPerror") \
+                and pkt.haslayer("UDPerror"):
+            key = (pkt["IPerror"].dst, int(pkt["UDPerror"].dport))
+            _record_unreachable(states, target_set, port_set, key,
+                                icmp_unreachable_state(int(icmp.type),
+                                                       int(icmp.code)))
+        return
+    # ICMPv6 destination-unreachable — quoted inner is IPerror6 / UDPerror.
+    if pkt.haslayer("ICMPv6DestUnreach"):
+        code = int(pkt["ICMPv6DestUnreach"].code)
+        if pkt.haslayer("IPerror6") and pkt.haslayer("UDPerror"):
+            key = (pkt["IPerror6"].dst, int(pkt["UDPerror"].dport))
+            _record_unreachable(states, target_set, port_set, key,
+                                icmpv6_unreachable_state(code))
+
+
+def _record_unreachable(states, target_set, port_set, key, verdict) -> None:
+    """Apply an ICMP-derived verdict, never overwriting a confirmed-open port."""
+    if key[0] in target_set and key[1] in port_set:
+        if states.get(key, (None,))[0] != "open":
+            states[key] = verdict
 
 
 def _attach_intel(port_obj: Port, port: int, data: bytes) -> None:

@@ -164,6 +164,28 @@ class _TokenBucket:
             return False
 
 
+def _is_ipv6(ip: str) -> bool:
+    return ":" in ip
+
+
+def _connect_target(ip: str, port: int):
+    """Build the connect() target tuple for IPv4 or IPv6.
+
+    IPv6 works exactly like IPv4 here — ICMPv6 'port unreachable' (type 1,
+    code 4) surfaces on a connected socket as the same ConnectionRefused/Reset
+    error, so the whole engine is address-family agnostic. Scoped link-local
+    addresses (fe80::…%iface) go through getaddrinfo so the zone id is carried.
+    """
+    if _is_ipv6(ip) and "%" in ip:
+        try:
+            info = socket.getaddrinfo(ip, port, socket.AF_INET6,
+                                      socket.SOCK_DGRAM)
+            return info[0][4]                  # full sockaddr incl port + scope
+        except OSError:
+            pass
+    return (ip, port)
+
+
 # ── Single connected-UDP probe ────────────────────────────────────────────────
 def _probe_once(ip: str, port: int, payload: bytes,
                 timeout: float) -> tuple[str, object, Optional[float]]:
@@ -175,13 +197,14 @@ def _probe_once(ip: str, port: int, payload: bytes,
 
     The connected socket is what makes ICMP port-unreachable observable without
     raw sockets: the refusal surfaces as ConnectionResetError (Windows) /
-    ConnectionRefusedError (Linux) on send() or recv().
+    ConnectionRefusedError (Linux) on send() or recv(). IPv4 and IPv6 both.
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    family = socket.AF_INET6 if _is_ipv6(ip) else socket.AF_INET
+    s = socket.socket(family, socket.SOCK_DGRAM)
     s.settimeout(timeout)
     t0 = time.monotonic()
     try:
-        s.connect((ip, port))
+        s.connect(_connect_target(ip, port))
         s.send(payload)
         data = s.recv(4096)
         return ("data", data, time.monotonic() - t0)

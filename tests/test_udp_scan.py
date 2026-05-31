@@ -188,6 +188,35 @@ def test_scan_udp_multi_dedupes_hosts():
     assert list(res) == ["127.0.0.1"]
 
 
+# ── Phase 73: IPv6 support ────────────────────────────────────────────────────
+def test_connect_target_ipv4_is_plain_tuple():
+    assert S._connect_target("192.0.2.1", 161) == ("192.0.2.1", 161)
+    assert S._is_ipv6("192.0.2.1") is False
+
+
+def test_connect_target_ipv6_detected():
+    assert S._is_ipv6("2001:db8::1") is True
+    # Non-scoped v6 also uses a plain (ip, port) tuple.
+    assert S._connect_target("2001:db8::1", 53) == ("2001:db8::1", 53)
+
+
+def test_scan_ipv6_loopback_closed():
+    # ::1 closed UDP ports must classify like 127.0.0.1 — ICMPv6 surfaces the
+    # same connected-socket error. Accept open|filtered on sandboxes that drop it.
+    import socket as _sock
+    if not _sock.has_ipv6:
+        return
+    try:
+        res = S.scan_udp("::1", [40911, 40912], timeout=0.8, retries=0,
+                         deep=False)
+    except OSError:
+        return                                # no IPv6 stack on this runner
+    assert len(res) == 2
+    for p in res:
+        assert p.protocol == "udp"
+        assert p.state in ("closed", "open|filtered")
+
+
 def test_scan_udp_is_single_host_wrapper_over_core():
     # scan_udp must return the same Port list scan_udp_multi gives for that host.
     one = S.scan_udp("127.0.0.1", [40204, 40205], timeout=0.5, retries=0,

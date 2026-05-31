@@ -30,6 +30,18 @@ def test_non_type3_icmp_is_filtered():
     assert state == "filtered"
 
 
+def test_icmpv6_port_unreachable_is_closed():
+    state, reason = R.icmpv6_unreachable_state(4)
+    assert state == "closed"
+    assert "1/4" in reason
+
+
+def test_icmpv6_other_codes_filtered():
+    for code in (0, 1, 2, 3, 5, 6):
+        state, _ = R.icmpv6_unreachable_state(code)
+        assert state == "filtered", f"v6 code {code} should be filtered"
+
+
 def test_unknown_code_defaults_filtered():
     state, _ = R.icmp_unreachable_state(3, 7)
     assert state == "filtered"
