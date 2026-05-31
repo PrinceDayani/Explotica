@@ -168,6 +168,147 @@ def ssdp_fetch_device(location: str, timeout: float = 3.0) -> dict:
     return out
 
 
+# ── mDNS: follow-up PTR → SRV → TXT → A resolution ────────────────────────────
+import struct
+
+
+def _dns_read_name(data: bytes, off: int) -> tuple[str, int]:
+    """Read a (possibly compressed) DNS name. Returns (name, next_offset)."""
+    labels: list[str] = []
+    next_off = None
+    jumps = 0
+    n = len(data)
+    while off < n and jumps < 16:
+        length = data[off]
+        if length == 0:
+            off += 1
+            break
+        if length & 0xC0 == 0xC0:                # compression pointer
+            if off + 1 >= n:
+                break
+            ptr = ((length & 0x3F) << 8) | data[off + 1]
+            if next_off is None:
+                next_off = off + 2
+            off = ptr
+            jumps += 1
+            continue
+        labels.append(data[off + 1:off + 1 + length].decode("utf-8", "ignore"))
+        off += 1 + length
+    return ".".join(labels), (next_off if next_off is not None else off)
+
+
+def _dns_parse_records(data: bytes) -> list[dict]:
+    """Parse all RRs (answer + authority + additional) into typed dicts."""
+    if len(data) < 12:
+        return []
+    qd, an, ns, ar = struct.unpack(">HHHH", data[4:12])
+    off = 12
+    for _ in range(qd):                          # skip questions
+        _, off = _dns_read_name(data, off)
+        off += 4
+    records: list[dict] = []
+    for _ in range(an + ns + ar):
+        if off + 1 > len(data):
+            break
+        name, off = _dns_read_name(data, off)
+        if off + 10 > len(data):
+            break
+        rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+        off += 10
+        rdata = data[off:off + rdlen]
+        rec = {"name": name, "type": rtype}
+        if rtype == 12:                          # PTR
+            rec["ptr"], _ = _dns_read_name(data, off)
+        elif rtype == 33 and len(rdata) >= 6:    # SRV
+            prio, weight, port = struct.unpack(">HHH", rdata[:6])
+            target, _ = _dns_read_name(data, off + 6)
+            rec.update({"port": port, "target": target})
+        elif rtype == 16:                        # TXT
+            rec["txt"] = _parse_txt(rdata)
+        elif rtype == 1 and len(rdata) == 4:     # A
+            rec["a"] = ".".join(str(b) for b in rdata)
+        elif rtype == 28 and len(rdata) == 16:   # AAAA
+            rec["aaaa"] = rdata.hex()
+        records.append(rec)
+        off += rdlen
+    return records
+
+
+def _parse_txt(rdata: bytes) -> list[str]:
+    out, i = [], 0
+    while i < len(rdata):
+        ln = rdata[i]
+        out.append(rdata[i + 1:i + 1 + ln].decode("utf-8", "ignore"))
+        i += 1 + ln
+    return [s for s in out if s]
+
+
+def _mdns_query(service: str) -> bytes:
+    header = struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0)
+    qname = b"".join(bytes([len(l)]) + l.encode()
+                     for l in service.split(".") if l) + b"\x00"
+    return header + qname + struct.pack(">HH", 12, 1)    # PTR / IN
+
+
+def mdns_resolve(ip: str, service_types: list[str], timeout: float = 2.0,
+                 max_services: int = 8) -> dict:
+    """Follow up an mDNS catalog: PTR→SRV→TXT→A for each service type.
+
+    Returns {service_type: [{instance, target, port, txt, addr}]}. Best-effort.
+    """
+    out: dict = {}
+    for service in service_types[:max_services]:
+        if not service.endswith(".local") and ".local" not in service:
+            continue
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(timeout)
+            try:
+                s.connect((ip, 5353))
+                s.send(_mdns_query(service))
+                records: list[dict] = []
+                while True:                          # drain multi-packet replies
+                    try:
+                        records.extend(_dns_parse_records(s.recv(4096)))
+                    except (socket.timeout, OSError):
+                        break
+            finally:
+                s.close()
+        except OSError:
+            continue
+        instances = _assemble_instances(records)
+        if instances:
+            out[service] = instances
+    return out
+
+
+def _assemble_instances(records: list[dict]) -> list[dict]:
+    """Stitch PTR/SRV/TXT/A records from one response into instance entries."""
+    srv = {r["name"]: r for r in records if r["type"] == 33}
+    txt = {r["name"]: r.get("txt") for r in records if r["type"] == 16}
+    addrs = {r["name"]: r.get("a") for r in records if r["type"] == 1}
+    instances: list[dict] = []
+    seen = set()
+    for r in records:
+        names = [r["ptr"]] if r["type"] == 12 and "ptr" in r else []
+        if r["type"] == 33:
+            names.append(r["name"])
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            entry = {"instance": name}
+            s = srv.get(name)
+            if s:
+                entry["port"] = s.get("port")
+                entry["target"] = s.get("target")
+                entry["addr"] = addrs.get(s.get("target"))
+            if txt.get(name):
+                entry["txt"] = txt[name][:12]
+            instances.append(entry)
+    return instances[:20]
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 def enrich_udp_ports(ip: str, ports: list) -> None:
     """Run the second-hop chains against a host's OPEN udp ports, merging the
@@ -203,6 +344,30 @@ def enrich_udp_ports(ip: str, ports: list) -> None:
                                 f"UPnP device: {dev.get('manufacturer','')} "
                                 f"{label}").strip()
                         intel["ssdp"] = ssdp
+                        p.service_intel = intel
+            elif p.number == 623:
+                # IPMI 2.0 → attempt the RAKP hash dump (CVE-2013-4786).
+                intel = dict(p.service_intel or {})
+                ipmi = dict(intel.get("ipmi") or {})
+                if ipmi.get("ipmi_2_0", True):
+                    from .ipmi_rakp import dump_hash
+                    h = dump_hash(ip)
+                    if h:
+                        ipmi["rakp_hash"] = h
+                        ipmi["finding"] = h["finding"]
+                        ipmi["severity"] = "high"
+                        intel["ipmi"] = ipmi
+                        p.service_intel = intel
+            elif p.number == 5353:
+                # mDNS catalog → resolve each service type to host/port/props.
+                intel = dict(p.service_intel or {})
+                mdns = dict(intel.get("mdns") or {})
+                svcs = mdns.get("services") or []
+                if svcs:
+                    resolved = mdns_resolve(ip, svcs)
+                    if resolved:
+                        mdns["resolved"] = resolved
+                        intel["mdns"] = mdns
                         p.service_intel = intel
         except Exception as e:  # noqa: BLE001 — never break the scan
             log.debug("enrich %s:%d failed: %s", ip, p.number, e)

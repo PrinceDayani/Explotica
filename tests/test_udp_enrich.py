@@ -118,3 +118,79 @@ def test_enrich_skips_closed_ports(monkeypatch):
     p = Port(number=161, protocol="udp", state="closed")
     E.enrich_udp_ports("10.0.0.1", [p])
     assert called == []                          # never enrich a closed port
+
+
+# ── mDNS PTR→SRV→TXT→A resolution (Phase 74) ──────────────────────────────────
+def _name(s):
+    return b"".join(bytes([len(x)]) + x.encode() for x in s.split(".") if x) \
+        + b"\x00"
+
+
+def _mdns_response():
+    import struct
+    inst = "Printer._ipp._tcp.local"
+    hdr = struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 3)
+    ptr = _name("_ipp._tcp.local") + struct.pack(">HHIH", 12, 1, 120,
+                                                 len(_name(inst))) + _name(inst)
+    srvrd = struct.pack(">HHH", 0, 0, 631) + _name("printer.local")
+    srv = _name(inst) + struct.pack(">HHIH", 33, 1, 120, len(srvrd)) + srvrd
+    txtrd = bytes([7]) + b"ty=HP41"
+    txt = _name(inst) + struct.pack(">HHIH", 16, 1, 120, len(txtrd)) + txtrd
+    a = _name("printer.local") + struct.pack(">HHIH", 1, 1, 120, 4) \
+        + bytes([192, 168, 1, 9])
+    return hdr + ptr + srv + txt + a
+
+
+def test_dns_parses_all_record_types():
+    recs = E._dns_parse_records(_mdns_response())
+    types = sorted(r["type"] for r in recs)
+    assert types == [1, 12, 16, 33]              # A, PTR, TXT, SRV
+
+
+def test_dns_read_name_follows_compression():
+    import struct
+    # "printer.local" at offset 12, then a pointer to it at the end.
+    base = struct.pack(">HHHHHH", 0, 0, 0, 0, 0, 0) + _name("printer.local")
+    ptr_off = len(base)
+    data = base + b"\xc0\x0c"                     # pointer to offset 12
+    name, _ = E._dns_read_name(data, ptr_off)
+    assert name == "printer.local"
+
+
+def test_assemble_instances_stitches_srv_txt_a():
+    recs = E._dns_parse_records(_mdns_response())
+    inst = E._assemble_instances(recs)[0]
+    assert inst["instance"] == "Printer._ipp._tcp.local"
+    assert inst["port"] == 631
+    assert inst["target"] == "printer.local"
+    assert inst["addr"] == "192.168.1.9"
+    assert inst["txt"] == ["ty=HP41"]
+
+
+def test_mdns_query_is_ptr_in():
+    import struct
+    q = E._mdns_query("_ipp._tcp.local")
+    assert q.endswith(struct.pack(">HH", 12, 1))   # PTR / IN
+    assert b"_ipp" in q
+
+
+def test_enrich_resolves_mdns(monkeypatch):
+    monkeypatch.setattr(E, "mdns_resolve",
+                        lambda ip, svcs, *a, **k: {"_ipp._tcp.local":
+                                                   [{"instance": "P", "port": 631}]})
+    p = Port(number=5353, protocol="udp", state="open", service="mdns",
+             service_intel={"mdns": {"services": ["_ipp._tcp.local"]}})
+    E.enrich_udp_ports("10.0.0.9", [p])
+    assert p.service_intel["mdns"]["resolved"]["_ipp._tcp.local"][0]["port"] == 631
+
+
+def test_enrich_dumps_ipmi_rakp(monkeypatch):
+    from explotica.discovery import ipmi_rakp as K
+    monkeypatch.setattr(K, "dump_hash",
+                        lambda ip, *a, **k: {"hashcat_7300": "deadbeef:cafe",
+                                             "finding": "RAKP hash"})
+    p = Port(number=623, protocol="udp", state="open", service="ipmi",
+             service_intel={"ipmi": {"ipmi_2_0": True}})
+    E.enrich_udp_ports("10.0.0.7", [p])
+    assert p.service_intel["ipmi"]["rakp_hash"]["hashcat_7300"] == "deadbeef:cafe"
+    assert p.service_intel["ipmi"]["severity"] == "high"
