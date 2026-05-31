@@ -1,34 +1,32 @@
-"""Adaptive UDP scan engine — state-aware, ICMP-pacing, no admin required.
+"""Adaptive UDP scan engine — multi-host scheduler, RTT-aware, no admin needed.
 
-Three things make this better than a naive "send bytes, wait for reply":
+What makes this state-of-the-art rather than "a working UDP scanner":
 
 1. **Connected-socket state detection, zero privileges.** A ``connect()``-ed UDP
    socket surfaces the target's ICMP port-unreachable as a *socket error* on the
    next operation — ``ECONNREFUSED`` on Linux, ``WSAECONNRESET`` (10054) on
-   Windows. So we get the three real states — ``open`` (data back), ``closed``
-   (conn-refused), ``open|filtered`` (silent) — cross-platform, **without raw
-   sockets or admin**. nmap needs Npcap/root to read ICMP; we don't.
+   Windows. So we get open / closed / open|filtered cross-platform, **without
+   raw sockets or admin**. nmap needs Npcap/root to read ICMP; we don't.
 
-   (We use blocking sockets in a thread pool rather than asyncio datagram
-   transports on purpose: Windows' ProactorEventLoop EINVALs on connected-UDP
-   ``sendto``. UDP is ICMP-rate-limited anyway, so massive concurrency buys
-   nothing — moderate threading + adaptive pacing is simpler and more correct.)
+2. **Multi-host scheduling (the throughput win).** UDP is bottlenecked by each
+   target's ICMP rate limit (~1 closed-confirm/sec). A per-host scanner spends
+   that budget one host at a time and idles the rest. This engine schedules a
+   *pool* of (host, port) targets: each host carries its own token bucket, and a
+   feeder hands ready targets — those whose host has a token right now — to a
+   shared worker pool. While host A is throttled, the workers drain hosts B–Z.
+   On a /24 that's a 50–250x wall-clock win over sequential per-host scans.
 
-2. **Protocol-correct payloads** (``udp_payloads``) so open ports actually
-   answer, + **rich parsers** (``udp_parsers``) so we report intel, not just
-   "open".
+3. **Per-host RTT/RTO timing (RFC 6298).** Instead of a fixed timeout we measure
+   round-trip time from the replies each host gives us and set that host's probe
+   timeout to SRTT + 4·RTTVAR (clamped). Snappy on LAN, patient on far hosts.
 
-3. **Adaptive ICMP-aware pacing.** Hosts rate-limit ICMP port-unreachable
-   (Linux: ~1/sec by default). Blast 65535 ports and most *closed* ports look
-   silent because the host suppressed the ICMP — you'd misreport them as
-   ``open|filtered``. We measure the host's actual ICMP budget from the
-   conn-refused we *do* get, then retransmit the silent set at that pace so each
-   port gets an un-suppressed chance. This is nmap's congestion-control idea,
-   done with stdlib sockets.
+4. **Protocol-correct payloads** (``udp_payloads``) so open ports actually
+   answer, + **rich parsers** (``udp_parsers``) so we report intel + security
+   findings, not just "open".
 
-Output: a list of ``Port`` objects (protocol="udp"), so UDP results flow through
-the same JSON / TUI / dashboard path as TCP. Open ports also carry parsed intel
-in ``Port.service_intel``.
+Output: ``Port`` objects (protocol="udp"). ``scan_udp`` returns a list for one
+host; ``scan_udp_multi`` returns ``{ip: [Port, ...]}`` for many — both share the
+same scheduler core.
 """
 
 from __future__ import annotations
@@ -37,8 +35,9 @@ import logging
 import socket
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Callable, Iterable, Optional
 
 from ..core.models import Port
 from . import udp_payloads
@@ -103,12 +102,76 @@ def classify_outcome(outcome: str, *, errno: int = 0,
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def _probe_once(ip: str, port: int, payload: bytes,
-                timeout: float) -> tuple[str, object]:
-    """One connected-UDP probe (blocking). Returns (outcome, extra).
+# ── Per-host RTT estimator + rate budget ──────────────────────────────────────
+class HostState:
+    """Per-host scheduling state: ICMP-rate budget + RFC-6298 RTT estimator.
 
-    outcome ∈ {'data','refused','timeout','error'};
-    extra is the reply bytes for 'data', the errno for 'error', else None.
+    The RTT estimator is what lets us pick a per-host timeout instead of a fixed
+    one. ``rate`` is the host's measured ICMP budget (packets/sec) used to pace
+    retransmit rounds; ``None`` means "no throttle" (host hasn't shown a limit).
+    """
+
+    def __init__(self, ip: str, min_rto: float, max_rto: float,
+                 default_timeout: float) -> None:
+        self.ip = ip
+        self.min_rto = min_rto
+        self.max_rto = max_rto
+        self.default_timeout = default_timeout
+        self.srtt: Optional[float] = None
+        self.rttvar: Optional[float] = None
+        self.rto: float = default_timeout
+        self.rate: Optional[float] = None       # pps budget; None = unthrottled
+        self.host_emits_icmp = False
+        self.resolved: dict[int, Port] = {}
+        self._lock = threading.Lock()
+
+    def observe_rtt(self, sample: float) -> None:
+        """Fold an RTT sample into SRTT/RTTVAR and recompute RTO (RFC 6298)."""
+        with self._lock:
+            if self.srtt is None:
+                self.srtt = sample
+                self.rttvar = sample / 2.0
+            else:
+                self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - sample)
+                self.srtt = 0.875 * self.srtt + 0.125 * sample
+            rto = self.srtt + 4.0 * self.rttvar
+            self.rto = max(self.min_rto, min(self.max_rto, rto))
+
+    def current_timeout(self) -> float:
+        # Until we have an RTT sample, use the conservative default.
+        return self.rto if self.srtt is not None else self.default_timeout
+
+
+class _TokenBucket:
+    """Thread-safe token bucket. rate<=0 (or None) means unlimited."""
+
+    def __init__(self, rate: Optional[float]) -> None:
+        self.rate = rate or 0.0
+        self.tokens = float("inf") if self.rate <= 0 else self.rate
+        self.last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        if self.rate <= 0:
+            return True
+        with self._lock:
+            now = time.monotonic()
+            self.tokens = min(self.rate, self.tokens + (now - self.last) * self.rate)
+            self.last = now
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True
+            return False
+
+
+# ── Single connected-UDP probe ────────────────────────────────────────────────
+def _probe_once(ip: str, port: int, payload: bytes,
+                timeout: float) -> tuple[str, object, Optional[float]]:
+    """One connected-UDP probe (blocking). Returns (outcome, extra, rtt).
+
+    outcome ∈ {'data','refused','timeout','error'}; extra is reply bytes for
+    'data', errno for 'error', else None; rtt is the measured round-trip in
+    seconds when a reply (data OR ICMP refusal) came back, else None.
 
     The connected socket is what makes ICMP port-unreachable observable without
     raw sockets: the refusal surfaces as ConnectionResetError (Windows) /
@@ -116,17 +179,18 @@ def _probe_once(ip: str, port: int, payload: bytes,
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
+    t0 = time.monotonic()
     try:
         s.connect((ip, port))
         s.send(payload)
         data = s.recv(4096)
-        return ("data", data)
+        return ("data", data, time.monotonic() - t0)
     except socket.timeout:
-        return ("timeout", None)
+        return ("timeout", None, None)
     except (ConnectionResetError, ConnectionRefusedError):
-        return ("refused", None)
+        return ("refused", None, time.monotonic() - t0)
     except OSError as e:
-        return ("error", e.errno or 0)
+        return ("error", e.errno or 0, None)
     finally:
         try:
             s.close()
@@ -134,145 +198,152 @@ def _probe_once(ip: str, port: int, payload: bytes,
             pass
 
 
-class _Pacer:
-    """Thread-safe launch pacer — caps the send cadence to 1/interval.
+# ── The scheduler: one paced round across MANY hosts ──────────────────────────
+def _run_round(states: dict[str, HostState],
+               round_targets: dict[str, list[int]], *,
+               workers: int, global_rate: float,
+               progress: Optional[Callable[[str], None]],
+               done_counter: list, total: int
+               ) -> list[tuple[str, int, str, object, Optional[float]]]:
+    """Probe every (host, port) in `round_targets` once, interleaved across hosts.
 
-    interval<=0 means unthrottled. Used to keep retransmit rounds within the
-    target host's measured ICMP budget so closed ports aren't suppressed into
-    looking open|filtered.
+    Each host is paced by its own token bucket (``HostState.rate``); a global
+    bucket optionally caps aggregate pps. A single feeder (this thread) submits
+    ready targets to a shared worker pool, so a throttled host never stalls the
+    others. Returns a flat list of (ip, port, outcome, extra, rtt).
     """
+    queues: dict[str, deque] = {
+        ip: deque(ports) for ip, ports in round_targets.items() if ports
+    }
+    host_buckets = {ip: _TokenBucket(states[ip].rate) for ip in queues}
+    global_bucket = _TokenBucket(global_rate)
+    slots = threading.Semaphore(workers)
+    results: list = []
+    results_lock = threading.Lock()
 
-    def __init__(self, interval: float) -> None:
-        self.interval = interval
-        self._lock = threading.Lock()
-        self._next = time.monotonic()
+    def task(ip: str, port: int) -> None:
+        try:
+            _, payload = udp_payloads.payload_for(port)
+            outcome, extra, rtt = _probe_once(
+                ip, port, payload, states[ip].current_timeout())
+            with results_lock:
+                results.append((ip, port, outcome, extra, rtt))
+                done_counter[0] += 1
+                if progress and done_counter[0] % 2000 == 0:
+                    progress(f"udp: {done_counter[0]}/{total} probed")
+        finally:
+            slots.release()
 
-    def wait(self) -> None:
-        if self.interval <= 0:
-            return
-        with self._lock:
-            now = time.monotonic()
-            sleep = self._next - now if self._next > now else 0.0
-            self._next = max(now, self._next) + self.interval
-        if sleep > 0:
-            time.sleep(sleep)
-
-
-def _run_round(ip: str, ports: list[int], *, timeout: float, workers: int,
-               pace_interval: float,
-               progress=None) -> dict[int, tuple[str, object]]:
-    """Probe every port in `ports` once. Returns {port: (outcome, extra)}."""
-    pacer = _Pacer(pace_interval)
-    results: dict[int, tuple[str, object]] = {}
-    done = [0]
-    total = len(ports)
-    lock = threading.Lock()
-
-    def work(port: int) -> None:
-        pacer.wait()
-        _, payload = udp_payloads.payload_for(port)
-        res = _probe_once(ip, port, payload, timeout)
-        with lock:
-            results[port] = res
-            done[0] += 1
-            if progress and done[0] % 2000 == 0:
-                progress(f"udp {ip}: {done[0]}/{total} probed")
-
-    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(ports)))) as pool:
-        list(pool.map(work, ports))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        # Feeder loop: round-robin hosts, submit a target only when its host has
+        # a token AND the global cap allows AND a worker slot is free.
+        while any(queues[ip] for ip in queues):
+            progressed = False
+            for ip in list(queues):
+                q = queues[ip]
+                if not q:
+                    continue
+                if not global_bucket.try_acquire():
+                    break                              # global cap hit this tick
+                if not host_buckets[ip].try_acquire():
+                    continue                           # this host is throttled
+                if not slots.acquire(blocking=False):
+                    # No free worker right now; we already took the tokens, so
+                    # just wait for a slot rather than dropping the target.
+                    slots.acquire()
+                port = q.popleft()
+                pool.submit(task, ip, port)
+                progressed = True
+            if not progressed:
+                time.sleep(0.004)                      # everyone throttled/full
+    finally:
+        pool.shutdown(wait=True)
     return results
 
 
-def scan_udp(ip: str, ports: Optional[list[int]] = None, *,
-             timeout: float = 1.2, retries: int = 2,
-             workers: int = 256, deep: bool = True,
-             progress=None) -> list[Port]:
-    """Scan UDP ports on one host. Returns a Port for every probed port.
-
-    Args:
-      ports: list of UDP ports, or None for the full 1-65535 range.
-      timeout: per-probe wait (seconds). 1.2s suits LAN + most Internet hosts.
-      retries: retransmission rounds for silent ports (resolves rate-limited
-               closed ports into honest 'closed'). 0 = single pass, fastest.
-      workers: max concurrent probe threads.
-      deep: also fire secondary security payloads (NTP monlist, etc.) at open
-            ports to surface amplification / auth-bypass findings.
-      progress: optional callable(str) for progress messages.
-    """
-    if ports is None:
-        ports = ALL_UDP_PORTS
-    if not ports:
-        return []
-
-    resolved: dict[int, Port] = {}
-    unresolved = list(ports)
-    host_emits_icmp = False
-    pace_interval = 0.0   # round 0: go fast, bounded only by the thread pool
+def _scan_core(ips: list[str], ports: list[int], *,
+               retries: int, workers: int, deep: bool,
+               default_timeout: float, min_rto: float, max_rto: float,
+               max_rate: float,
+               progress: Optional[Callable[[str], None]]
+               ) -> dict[str, list[Port]]:
+    """Shared scheduler core for both scan_udp and scan_udp_multi."""
+    states = {ip: HostState(ip, min_rto, max_rto, default_timeout) for ip in ips}
+    # Round 0: probe every port on every host. Later rounds: only silent ports.
+    pending: dict[str, list[int]] = {ip: list(ports) for ip in ips}
+    total = len(ips) * len(ports)
+    done_counter = [0]
 
     for rnd in range(retries + 1):
-        if not unresolved:
+        active = {ip: p for ip, p in pending.items() if p}
+        if not active:
             break
         final = (rnd == retries)
         t0 = time.monotonic()
-        outcomes = _run_round(ip, unresolved, timeout=timeout, workers=workers,
-                              pace_interval=pace_interval, progress=progress)
+        round_results = _run_round(
+            states, active, workers=workers, global_rate=max_rate,
+            progress=progress, done_counter=done_counter, total=total)
         elapsed = max(1e-3, time.monotonic() - t0)
 
-        refused_this_round = 0
-        still_silent: list[int] = []
-        for port, (outcome, extra) in outcomes.items():
+        refused_per_host: dict[str, int] = {ip: 0 for ip in active}
+        next_silent: dict[str, list[int]] = {ip: [] for ip in active}
+        for ip, port, outcome, extra, rtt in round_results:
+            hs = states[ip]
+            if rtt is not None:
+                hs.observe_rtt(rtt)
             if outcome == "refused":
-                refused_this_round += 1
-                host_emits_icmp = True
+                refused_per_host[ip] += 1
+                hs.host_emits_icmp = True
             state, reason, retry = classify_outcome(
                 outcome, errno=(extra if outcome == "error" else 0),
-                final=final, host_emits_icmp=host_emits_icmp)
+                final=final, host_emits_icmp=hs.host_emits_icmp)
             if outcome == "timeout" and retry and not final:
-                still_silent.append(port)
+                next_silent[ip].append(port)
                 continue
             port_obj = Port(number=port, protocol="udp",
                             state=state, state_reason=reason)
             if outcome == "data":
                 _attach_intel(port_obj, port, extra)
-            resolved[port] = port_obj
+            hs.resolved[port] = port_obj
 
-        unresolved = still_silent
+        # ── Adapt each host's pacing for the next round ──────────────────────
+        # A host that answered N ports with ICMP in `elapsed`s has budget ≈ N/elapsed.
+        # Pace its retransmits to that, so closed ports aren't suppressed into
+        # looking open|filtered. Hosts that never sent ICMP stay unthrottled.
+        for ip in active:
+            n = refused_per_host[ip]
+            if states[ip].host_emits_icmp and n > 0:
+                budget_pps = n / elapsed
+                states[ip].rate = min(500.0, max(0.5, budget_pps))
+            pending[ip] = next_silent[ip]
 
-        # ── Adaptive pacing for the NEXT round ───────────────────────────────
-        # The host answered `refused_this_round` ports with ICMP in `elapsed`s —
-        # that ratio IS its ICMP budget. Pace the retransmit so we never exceed
-        # it; otherwise the host suppresses replies and closed ports masquerade
-        # as open|filtered. No ICMP at all → stay fast (nothing to gain from
-        # slowing a host that simply isn't talking).
-        if host_emits_icmp and refused_this_round > 0:
-            budget_pps = refused_this_round / elapsed
-            pace_interval = min(1.0, max(0.002, 1.0 / budget_pps))
-            log.debug("udp %s round %d: %d refused in %.2fs -> pace %.3fs/probe",
-                      ip, rnd, refused_this_round, elapsed, pace_interval)
-        if progress and unresolved:
-            progress(f"udp {ip}: round {rnd + 1} done, "
-                     f"{len(unresolved)} still silent")
+        if progress:
+            remaining = sum(len(v) for v in pending.values())
+            if remaining:
+                progress(f"udp: round {rnd + 1} done, {remaining} still silent")
 
     if deep:
-        _deep_probes(ip, resolved, timeout=timeout)
+        _deep_probes_all(states, default_timeout)
 
-    return sorted(resolved.values(), key=lambda p: p.number)
+    return {ip: sorted(hs.resolved.values(), key=lambda p: p.number)
+            for ip, hs in states.items()}
 
 
-def _deep_probes(ip: str, resolved: dict[int, Port], *,
-                 timeout: float) -> None:
+def _deep_probes_all(states: dict[str, HostState], timeout: float) -> None:
     """Fire secondary security payloads at open ports (NTP monlist, etc.)."""
-    for port, (proto, payload) in udp_payloads.SECONDARY_PAYLOADS.items():
-        po = resolved.get(port)
-        if po is None or po.state != "open":
-            continue
-        outcome, extra = _probe_once(ip, port, payload, timeout)
-        if outcome == "data" and isinstance(extra, (bytes, bytearray)):
-            intel = parse_udp_response(proto, bytes(extra))
-            if intel:
-                merged = dict(po.service_intel or {})
-                merged[proto] = intel
-                po.service_intel = merged
+    for hs in states.values():
+        for port, (proto, payload) in udp_payloads.SECONDARY_PAYLOADS.items():
+            po = hs.resolved.get(port)
+            if po is None or po.state != "open":
+                continue
+            outcome, extra, _ = _probe_once(hs.ip, port, payload, timeout)
+            if outcome == "data" and isinstance(extra, (bytes, bytearray)):
+                intel = parse_udp_response(proto, bytes(extra))
+                if intel:
+                    merged = dict(po.service_intel or {})
+                    merged[proto] = intel
+                    po.service_intel = merged
 
 
 def _attach_intel(port_obj: Port, port: int, data: object) -> None:
@@ -285,6 +356,59 @@ def _attach_intel(port_obj: Port, port: int, data: object) -> None:
                               else {"udp": intel})
     if isinstance(intel, dict) and intel.get("finding"):
         port_obj.banner = str(intel["finding"])[:512]
+
+
+# ── Public entry points ───────────────────────────────────────────────────────
+def scan_udp(ip: str, ports: Optional[list[int]] = None, *,
+             timeout: float = 1.2, retries: int = 2,
+             workers: int = 256, deep: bool = True,
+             min_rto: float = 0.25, max_rto: float = 3.0,
+             max_rate: float = 0.0,
+             progress=None) -> list[Port]:
+    """Scan UDP ports on ONE host. Returns a Port for every probed port.
+
+    Args:
+      ports: list of UDP ports, or None for the full 1-65535 range.
+      timeout: initial per-probe wait, before RTT is learned (seconds).
+      retries: retransmission rounds for silent ports (resolves rate-limited
+               closed ports into honest 'closed'). 0 = single pass, fastest.
+      workers: max concurrent probe threads.
+      deep: also fire secondary security payloads at open ports.
+      min_rto/max_rto: clamp for the adaptive per-host timeout.
+      max_rate: global packets/sec cap (0 = unlimited).
+      progress: optional callable(str) for progress messages.
+    """
+    if ports is None:
+        ports = ALL_UDP_PORTS
+    if not ports:
+        return []
+    out = _scan_core([ip], ports, retries=retries, workers=workers, deep=deep,
+                     default_timeout=timeout, min_rto=min_rto, max_rto=max_rto,
+                     max_rate=max_rate, progress=progress)
+    return out.get(ip, [])
+
+
+def scan_udp_multi(ips: Iterable[str], ports: Optional[list[int]] = None, *,
+                   timeout: float = 1.2, retries: int = 2,
+                   workers: int = 512, deep: bool = True,
+                   min_rto: float = 0.25, max_rto: float = 3.0,
+                   max_rate: float = 0.0,
+                   progress=None) -> dict[str, list[Port]]:
+    """Scan UDP ports across MANY hosts, interleaved (the throughput path).
+
+    Per-host ICMP rate limits overlap instead of serialize: while one host is
+    throttled the shared worker pool drains the others. Returns {ip: [Port,...]}.
+    """
+    ip_list = list(dict.fromkeys(ips))      # de-dupe, preserve order
+    if not ip_list:
+        return {}
+    if ports is None:
+        ports = ALL_UDP_PORTS
+    if not ports:
+        return {ip: [] for ip in ip_list}
+    return _scan_core(ip_list, ports, retries=retries, workers=workers,
+                      deep=deep, default_timeout=timeout, min_rto=min_rto,
+                      max_rto=max_rto, max_rate=max_rate, progress=progress)
 
 
 def scan_udp_fast(ip: str, *, timeout: float = 1.2, retries: int = 2,

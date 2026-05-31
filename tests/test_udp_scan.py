@@ -126,3 +126,73 @@ def test_loopback_closed_ports_detected():
     # blackhole loopback ICMP → 'open|filtered'. Accept either, reject 'open'.
     for st in states.values():
         assert st in ("closed", "open|filtered")
+
+
+# ── Phase 70: RTT estimator (RFC 6298) ────────────────────────────────────────
+def test_hoststate_rtt_first_sample_seeds_estimator():
+    hs = S.HostState("1.2.3.4", min_rto=0.25, max_rto=3.0, default_timeout=1.2)
+    # Before any sample, timeout is the conservative default.
+    assert hs.current_timeout() == 1.2
+    hs.observe_rtt(0.10)
+    assert hs.srtt == 0.10 and hs.rttvar == 0.05
+    # RTO = srtt + 4*rttvar = 0.10 + 0.20 = 0.30, within clamp.
+    assert abs(hs.rto - 0.30) < 1e-9
+    assert hs.current_timeout() == hs.rto
+
+
+def test_hoststate_rto_is_clamped():
+    hs = S.HostState("1.2.3.4", min_rto=0.25, max_rto=3.0, default_timeout=1.2)
+    hs.observe_rtt(0.001)             # tiny RTT → RTO would be < min, clamps up
+    assert hs.rto == 0.25
+    hs2 = S.HostState("1.2.3.4", min_rto=0.25, max_rto=3.0, default_timeout=1.2)
+    hs2.observe_rtt(5.0)              # huge RTT → RTO clamps down to max
+    assert hs2.rto == 3.0
+
+
+def test_hoststate_rtt_converges_with_jitter():
+    hs = S.HostState("1.2.3.4", min_rto=0.05, max_rto=3.0, default_timeout=1.2)
+    for sample in [0.20, 0.21, 0.19, 0.20, 0.20]:
+        hs.observe_rtt(sample)
+    # SRTT should track ~0.20s; RTO comfortably above it.
+    assert 0.15 < hs.srtt < 0.25
+    assert hs.rto > hs.srtt
+
+
+# ── Phase 70: token bucket pacing ─────────────────────────────────────────────
+def test_token_bucket_unlimited_when_rate_zero():
+    b = S._TokenBucket(0)
+    assert all(b.try_acquire() for _ in range(1000))
+
+
+def test_token_bucket_throttles():
+    b = S._TokenBucket(2.0)           # 2 tokens/sec, starts with 2
+    grants = sum(1 for _ in range(10) if b.try_acquire())
+    # Should hand out roughly the initial burst (2), then refuse the rest.
+    assert 1 <= grants <= 3
+
+
+# ── Phase 70: multi-host scheduler API ────────────────────────────────────────
+def test_scan_udp_multi_returns_dict_per_host():
+    res = S.scan_udp_multi(["127.0.0.1", "127.0.0.2"], [40201, 40202],
+                           timeout=0.6, retries=0, deep=False)
+    assert set(res) == {"127.0.0.1", "127.0.0.2"}
+    for plist in res.values():
+        assert len(plist) == 2
+        for p in plist:
+            assert p.protocol == "udp"
+
+
+def test_scan_udp_multi_dedupes_hosts():
+    res = S.scan_udp_multi(["127.0.0.1", "127.0.0.1"], [40203],
+                           timeout=0.5, retries=0, deep=False)
+    assert list(res) == ["127.0.0.1"]
+
+
+def test_scan_udp_is_single_host_wrapper_over_core():
+    # scan_udp must return the same Port list scan_udp_multi gives for that host.
+    one = S.scan_udp("127.0.0.1", [40204, 40205], timeout=0.5, retries=0,
+                     deep=False)
+    many = S.scan_udp_multi(["127.0.0.1"], [40204, 40205], timeout=0.5,
+                            retries=0, deep=False)["127.0.0.1"]
+    assert [p.number for p in one] == [p.number for p in many]
+    assert [p.state for p in one] == [p.state for p in many]
