@@ -386,8 +386,8 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
             if filtered_count:
                 tail.append(f"{filtered_count} filtered")
             ports_cell.append(
-                f"[dim italic]({', '.join(tail)})[/dim italic]\n",
-                style="dim",
+                f"({', '.join(tail)})\n",
+                style="dim italic",
             )
 
         row = [
