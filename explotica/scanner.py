@@ -229,7 +229,7 @@ def _unmask_host(host: Host) -> None:
 
 
 def _udp_probe_host(host: Host, *, full_range: bool = False,
-                    prefer_raw: bool = False) -> None:
+                    prefer_raw: bool = False, evasion=None) -> None:
     """Adaptive UDP scan — attach discovered services to host.udp_services.
 
     Phase 69: replaces the old fixed 4-probe (SNMP/mDNS/SSDP/NetBIOS) approach
@@ -243,9 +243,11 @@ def _udp_probe_host(host: Host, *, full_range: bool = False,
     """
     try:
         if full_range:
-            ports = udp_scan.scan_udp(host.ip, prefer_raw=prefer_raw)
+            ports = udp_scan.scan_udp(host.ip, prefer_raw=prefer_raw,
+                                      evasion=evasion)
         else:
-            ports = udp_scan.scan_udp_fast(host.ip, prefer_raw=prefer_raw)
+            ports = udp_scan.scan_udp_fast(host.ip, prefer_raw=prefer_raw,
+                                           evasion=evasion)
         summary = udp_scan.summarize_udp(ports)
         if summary:
             host.udp_services = summary
@@ -431,6 +433,7 @@ def run_scan(
     udp_probe: bool = False,
     udp_full: bool = False,
     udp_raw: bool = False,
+    udp_evasion=None,
     web_crawl_enabled: bool = False,
     shodan_enabled: bool = False,
     ssh_enum_enabled: bool = False,
@@ -471,6 +474,11 @@ def run_scan(
     verify_cves_v2: bool = False,
     web_fuzz_enabled: bool = False,
     sqli_time_based: bool = False,
+    # Phase 73: advanced web cluster (opt-in, active)
+    jwt_crack: bool = False,
+    graphql_audit: bool = False,
+    dom_xss: bool = False,
+    idor_passive: bool = False,
     nmap_timeout: int = 180,
     # Phase 56: state filtering — defaults emit all 3 states
     include_closed: bool = True,
@@ -677,7 +685,8 @@ def run_scan(
                     wave_a.append(("udp",
                                     lambda: _udp_probe_host(
                                         h, full_range=udp_full,
-                                        prefer_raw=udp_raw)))
+                                        prefer_raw=udp_raw,
+                                        evasion=udp_evasion)))
                 if rich_intel:
                     wave_a.append(("rich_intel", lambda: _rich_intel_host(h)))
                 if ssh_enum_enabled:
@@ -913,6 +922,38 @@ def run_scan(
                 extra_findings["web_security"] = ws_results
         except Exception as e:
             log.warning("web security check failed: %s", e)
+
+    # Phase 73: advanced web cluster (JWT crack / GraphQL audit / DOM XSS /
+    # passive IDOR). Opt-in and active, so gated behind explicit flags.
+    if (jwt_crack or graphql_audit or dom_xss or idor_passive) and hosts:
+        if progress:
+            progress("Advanced web audits (JWT/GraphQL/DOM-XSS/IDOR)…")
+        try:
+            from .active.web_cluster import run_web_cluster
+            from .core.port_classifier import is_https, is_http
+            web_results: dict = {}
+            for h in hosts:
+                ports_tls = [(p.number, is_https(p)) for p in h.open_ports()
+                             if is_http(p) or is_https(p)]
+                if not ports_tls:
+                    continue
+                # Gather any discovered URLs for passive IDOR detection.
+                urls: list[str] = []
+                for p in h.open_ports():
+                    ci = p.crawl_info or {}
+                    urls.extend(ci.get("urls", []) or [])
+                    if p.service_intel:
+                        urls.extend(p.service_intel.get("api_endpoints", []) or [])
+                r = run_web_cluster(
+                    h.ip, ports_tls, discovered_urls=urls,
+                    jwt_crack=jwt_crack, graphql_audit=graphql_audit,
+                    dom_xss=dom_xss, idor_passive=idor_passive)
+                if r:
+                    web_results[h.ip] = r
+            if web_results:
+                extra_findings["web_advanced"] = web_results
+        except Exception as e:
+            log.warning("advanced web cluster failed: %s", e)
 
     if check_default_creds and hosts:
         # Phase 63: respect safe-mode (this is a LOCKOUT-RISK check)

@@ -481,6 +481,19 @@ def main(argv: list[str] | None = None) -> int:
                         "scapy + root/Npcap) for true filtered-vs-closed "
                         "accuracy. Falls back to connected-socket mode if "
                         "unavailable.")
+    p.add_argument("--udp-source-port", type=int, metavar="PORT",
+                   help="UDP evasion: send probes from this source port "
+                        "(e.g. 53) to slip past port-based firewall ACLs.")
+    p.add_argument("--udp-data-length", type=int, default=0, metavar="N",
+                   help="UDP evasion: append N random bytes to each probe to "
+                        "defeat fixed-size/signature IDS rules.")
+    p.add_argument("--udp-decoys", metavar="IP,IP,...",
+                   help="UDP evasion (raw tier): comma-separated spoofed source "
+                        "IPs interleaved with the real probe to mask the "
+                        "scanner's address.")
+    p.add_argument("--udp-fragment", action="store_true",
+                   help="UDP evasion (raw tier): IP-fragment probes into tiny "
+                        "pieces to evade some IDS reassembly.")
     p.add_argument("--web-crawl", action="store_true",
                    help="Crawl HTTP(S) services starting from / — extracts "
                         "links, forms, JavaScript API endpoints.")
@@ -758,9 +771,22 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # --full-coverage preset: maximum vuln discovery
-    # --udp-full / --udp-raw imply --udp-probe (they tune a UDP scan, so the
-    # scan must be on).
-    if getattr(args, "udp_full", False) or getattr(args, "udp_raw", False):
+    # --udp-full / --udp-raw / evasion flags imply --udp-probe (they tune a UDP
+    # scan, so the scan must be on).
+    _udp_decoys = getattr(args, "udp_decoys", None)
+    _udp_evasion = None
+    if (getattr(args, "udp_source_port", None) or getattr(args, "udp_data_length", 0)
+            or _udp_decoys or getattr(args, "udp_fragment", False)):
+        from .discovery.udp_scan import Evasion
+        _udp_evasion = Evasion(
+            source_port=getattr(args, "udp_source_port", None),
+            data_length=getattr(args, "udp_data_length", 0) or 0,
+            decoys=tuple(x.strip() for x in _udp_decoys.split(",")
+                         if x.strip()) if _udp_decoys else (),
+            fragment=getattr(args, "udp_fragment", False),
+        )
+    if (getattr(args, "udp_full", False) or getattr(args, "udp_raw", False)
+            or _udp_evasion is not None):
         args.udp_probe = True
 
     if args.full_coverage:

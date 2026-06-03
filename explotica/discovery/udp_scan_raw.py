@@ -112,7 +112,7 @@ def icmpv6_unreachable_state(icmp_code: int) -> tuple[str, str]:
 
 def raw_udp_scan(targets: Iterable[str], ports: list[int], *,
                  timeout: float = 4.0, rate_pps: int = 1500,
-                 retries: int = 1,
+                 retries: int = 1, evasion=None,
                  progress=None) -> dict[str, list[Port]]:
     """Stateless raw UDP scan of many hosts × many ports.
 
@@ -156,18 +156,51 @@ def raw_udp_scan(targets: Iterable[str], ports: list[int], *,
     sniffer = AsyncSniffer(filter=bpf, store=False, prn=on_pkt)
     sniffer.start()
 
-    src_port = random.randint(20000, 60000)
+    # Evasion knobs (raw tier can do all four).
+    ev_srcport = getattr(evasion, "source_port", None)
+    ev_datalen = getattr(evasion, "data_length", 0) or 0
+    ev_decoys = tuple(getattr(evasion, "decoys", ()) or ())
+    ev_fragment = bool(getattr(evasion, "fragment", False))
+    if ev_decoys or ev_fragment:
+        try:
+            from scapy.all import fragment as _fragment  # noqa
+        except Exception:
+            _fragment = None
+    else:
+        _fragment = None
+
+    src_port = ev_srcport or random.randint(20000, 60000)
     inter = 1.0 / rate_pps if rate_pps > 0 else 0.0
     sent = 0
     total = len(targets) * len(ports) * max(1, retries)
+
+    def _emit(l3, p, payload):
+        pkt = l3 / UDP(sport=src_port, dport=p) / Raw(load=payload)
+        if ev_fragment and _fragment is not None and ":" not in l3.dst:
+            for frag in _fragment(pkt, fragsize=8):
+                send(frag, verbose=False)
+        else:
+            send(pkt, verbose=False)
+
     for _ in range(max(1, retries)):
         for ip in targets:
             l3 = IPv6(dst=ip) if ":" in ip else IP(dst=ip)
             for p in ports:
                 _, payload = udp_payloads.payload_for(p)
-                pkt = l3 / UDP(sport=src_port, dport=p) / Raw(load=payload)
+                if ev_datalen > 0:
+                    payload = payload + os.urandom(ev_datalen)
                 try:
-                    send(pkt, verbose=False)
+                    # Decoys first: spoofed-source packets interleaved with ours
+                    # so the target can't tell which source is the real scanner.
+                    for decoy in ev_decoys:
+                        try:
+                            d3 = IPv6(src=decoy, dst=ip) if ":" in ip \
+                                else IP(src=decoy, dst=ip)
+                            send(d3 / UDP(sport=src_port, dport=p)
+                                 / Raw(load=payload), verbose=False)
+                        except Exception:
+                            pass
+                    _emit(l3, p, payload)
                 except Exception as e:
                     log.debug("raw udp send %s:%d failed: %s", ip, p, e)
                 sent += 1
