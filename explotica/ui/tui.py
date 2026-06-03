@@ -1088,8 +1088,15 @@ def run(scan_json_path: str) -> int:
 
         # ── Worker pool callbacks ────────────────────────────────────────
         def _on_pool_change(self) -> None:
-            """WorkerPool fires this on any process state change (cross-thread)."""
-            self.call_from_thread(self._render_process_pane)
+            """WorkerPool fires this on any process state change. It may run
+            either on the app thread (the synchronous on_change() inside
+            pool.start(), invoked from a UI action) or on a worker thread (scan
+            completion). call_from_thread() raises if called on the app's own
+            thread, so dispatch based on which thread we're currently on."""
+            if threading.get_ident() == self._thread_id:
+                self._render_process_pane()
+            else:
+                self.call_from_thread(self._render_process_pane)
 
         def _on_scan_complete(self, proc: ScanProcess,
                                 new_data: dict) -> None:
