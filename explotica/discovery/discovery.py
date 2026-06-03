@@ -33,12 +33,36 @@ def _import_scapy():
 
 
 def expand_targets(target: str) -> list[str]:
-    """Accept CIDR ('192.168.1.0/24'), range, or single IP. Return list of IPs."""
+    """Accept CIDR ('192.168.1.0/24'), range, single IP, or hostname.
+
+    Hostnames/domains are resolved to their IPv4 address(es) via DNS so
+    internet targets can be given by name (e.g. 'scanme.nmap.org'). Falls
+    back to passing the raw string through if resolution fails.
+    """
     try:
         net = ipaddress.ip_network(target, strict=False)
         return [str(ip) for ip in net.hosts()] if net.num_addresses > 1 else [str(net.network_address)]
     except ValueError:
+        # Not an IP/CIDR — treat as a hostname and resolve via DNS.
+        try:
+            infos = socket.getaddrinfo(target, None, family=socket.AF_INET)
+            ips = sorted({info[4][0] for info in infos})
+            if ips:
+                return ips
+        except socket.gaierror:
+            log.warning("Could not resolve hostname %r; passing through as-is", target)
         return [target]
+
+
+def assume_up_hosts(target: str) -> list[Host]:
+    """Build Host objects for every target IP without probing liveness.
+
+    The '-Pn' path: used when host discovery is skipped (internet hosts behind
+    firewalls that silently drop ICMP echo but still serve open ports). Every
+    expanded IP is marked is_up=True and handed straight to the port scanner.
+    Hostnames are resolved to IPs via expand_targets first.
+    """
+    return [Host(ip=ip, is_up=True) for ip in expand_targets(target)]
 
 
 def arp_scan(cidr: str, timeout: float = 2.0) -> list[Host]:

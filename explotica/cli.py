@@ -432,6 +432,12 @@ def main(argv: list[str] | None = None) -> int:
                         "default-deny firewalls where filtered count = 65,500.")
     p.add_argument("--no-arp", action="store_true",
                    help="Skip ARP (use ICMP sweep). Use for non-LAN targets.")
+    p.add_argument("-Pn", "--no-ping", dest="no_ping", action="store_true",
+                   help="Skip host discovery — treat every target as online and "
+                        "port-scan it directly (the nmap -Pn equivalent). Required "
+                        "for internet hosts that drop ICMP echo; without it a "
+                        "firewalled-but-alive host is reported down and skipped. "
+                        "Hostnames/domains are resolved via DNS.")
     p.add_argument("--no-banners", action="store_true",
                    help="Skip banner grabbing (faster).")
     p.add_argument("--vuln-scan", action="store_true",
@@ -965,6 +971,7 @@ def main(argv: list[str] | None = None) -> int:
                 sub_result = run_scan(
                     sn.cidr,
                     use_arp=not args.no_arp,
+                    skip_discovery=args.no_ping,
                     ports=port_list,
                     port_timeout=args.port_timeout,
                     banner_timeout=args.banner_timeout,
@@ -1093,6 +1100,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_scan(
                 args.target,
                 use_arp=not args.no_arp,
+                skip_discovery=args.no_ping,
                 ports=ports,
                 port_timeout=args.port_timeout,
                 banner_timeout=args.banner_timeout,

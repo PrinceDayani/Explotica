@@ -14,7 +14,8 @@ from typing import Callable, Optional
 
 from . import __version__
 from .fingerprint.banners import grab_banner, grab_banner_full
-from .discovery.discovery import arp_scan, expand_targets, icmp_sweep, resolve_hostname
+from .discovery.discovery import (arp_scan, assume_up_hosts, expand_targets,
+                                  icmp_sweep, resolve_hostname)
 from .core.models import Host, Port, ScanResult
 from .discovery.aio import run_async_scan
 from .enrich.dns_enum import enum_dns
@@ -53,8 +54,19 @@ ProgressCb = Optional[Callable[[str], None]]
 # ────────────────────────────────────────────────────────────────────────────
 
 def _discover(target: str, use_arp: bool, timeout: float,
-              progress: ProgressCb) -> list[Host]:
-    """Discover live hosts. Tries ARP first if requested, else ICMP sweep."""
+              progress: ProgressCb, skip_discovery: bool = False) -> list[Host]:
+    """Discover live hosts. Tries ARP first if requested, else ICMP sweep.
+
+    When skip_discovery is True (the -Pn / --no-ping path), liveness probing is
+    bypassed entirely and every target IP is treated as up. Essential for
+    internet hosts that drop ICMP echo but still serve open ports — without it,
+    a firewalled-but-alive host is wrongly reported down and never port-scanned.
+    """
+    if skip_discovery:
+        hosts = assume_up_hosts(target)
+        if progress:
+            progress(f"Skipping discovery — treating {len(hosts)} target(s) as up")
+        return hosts
     if progress:
         progress(f"Discovering hosts in {target}…")
     if use_arp:
@@ -401,6 +413,7 @@ def run_scan(
     target: str,
     *,
     use_arp: bool = True,
+    skip_discovery: bool = False,   # -Pn: treat all targets as up (internet/firewalled hosts)
     ports: list[int] | None = None,
     discover_timeout: float = 2.0,
     port_timeout: float = 0.4,
@@ -491,7 +504,8 @@ def run_scan(
     t0 = time.perf_counter()
 
     # ── Phase 1: discovery ──────────────────────────────────────────────
-    hosts = _discover(target, use_arp, discover_timeout, progress)
+    hosts = _discover(target, use_arp, discover_timeout, progress,
+                      skip_discovery=skip_discovery)
     if progress:
         progress(f"Found {len(hosts)} live host(s); enriching…")
 
