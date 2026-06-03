@@ -128,8 +128,10 @@ explotica-shell = "explotica.shell:main"
 "Architecture" = "https://github.com/PrinceDayani/Explotica/blob/main/ARCHITECTURE.md"
 
 [tool.setuptools]
-packages = ["explotica"]
 include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["explotica*"]
 
 [tool.setuptools.package-data]
 explotica = [
@@ -137,7 +139,7 @@ explotica = [
 ]
 
 [tool.setuptools.dynamic]
-version = {attr = "explotica.constants.SCANNER_VERSION"}
+version = {attr = "explotica.core.constants.SCANNER_VERSION"}
 
 # ── Tooling configuration ───────────────────────────────────────────────
 
