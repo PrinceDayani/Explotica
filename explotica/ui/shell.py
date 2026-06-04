@@ -39,7 +39,8 @@ console = Console()
 class ExploticaShell(cmd.Cmd):
     intro = (
         "\n[bold blue]🛰️  Explotica Interactive Shell[/bold blue]\n"
-        "[dim]Type 'help' for commands, 'quit' to exit, Tab to autocomplete.[/dim]"
+        "[dim]Type 'help' for commands, 'scans' for past scans, 'quit' to exit. "
+        "Tab-completes commands & paths where readline is available.[/dim]"
     )
     prompt = "[bold green]explotica>[/bold green] "
 
@@ -49,6 +50,31 @@ class ExploticaShell(cmd.Cmd):
         self.scan_path: Optional[Path] = None  # last loaded/saved path
         # cmd uses raw stdin — we print intro via rich
         self.intro_text = self.intro
+        self._update_prompt()
+
+    def _update_prompt(self) -> None:
+        """Reflect the loaded scan in the prompt so you always know your context.
+
+        Empty:  explotica>
+        Loaded: explotica[10.0.0.0/24 | 5h | 12cve/3kev]>
+        """
+        if self.scan_result is None:
+            self.prompt = "[bold green]explotica>[/bold green] "
+            return
+        sr = self.scan_result
+        tgt = sr.target or "?"
+        if len(tgt) > 22:
+            tgt = tgt[:21] + "…"
+        cve = sum(len(p.cves) for h in sr.hosts for p in h.ports)
+        kev = sum(1 for h in sr.hosts for p in h.ports for c in p.cves
+                  if getattr(c, "in_kev", False))
+        ctx = f"{tgt} | {len(sr.hosts)}h"
+        if cve:
+            ctx += f" | {cve}cve" + (f"/{kev}kev" if kev else "")
+        # \\[ renders a literal '[' in Rich markup; the ']' is literal already.
+        self.prompt = (f"[bold green]explotica[/bold green]"
+                       f"[dim]\\[{_esc(ctx)}][/dim]"
+                       f"[bold green]>[/bold green] ")
 
     def _try_autoload(self) -> bool:
         """If no scan in memory, try to load the most recent JSON in ./scans/
@@ -71,6 +97,7 @@ class ExploticaShell(cmd.Cmd):
             data = json.loads(newest.read_text(encoding="utf-8"))
             self.scan_result = ScanResult.from_dict(data)
             self.scan_path = newest
+            self._update_prompt()
             console.print(f"[dim]Auto-loaded most recent scan: [cyan]{newest}[/cyan][/dim]")
             return True
         except Exception as e:
@@ -98,8 +125,39 @@ class ExploticaShell(cmd.Cmd):
     def preloop(self) -> None:
         console.print(Panel.fit(self.intro_text, border_style="blue"))
 
+    def _setup_completion(self) -> bool:
+        """Wire readline tab-completion. We override cmdloop (for the Rich
+        prompt), which skips cmd.Cmd's own readline setup — so we redo it here.
+        Returns True if completion is active (readline present)."""
+        try:
+            import readline
+        except ImportError:
+            return False
+        readline.set_completer(self.complete)
+        readline.set_completer_delims(" \t\n")
+        readline.parse_and_bind("tab: complete")
+        return True
+
+    def _complete_path(self, text: str) -> list[str]:
+        import glob
+        text = text or ""
+        out = []
+        for m in glob.glob(text + "*"):
+            out.append(m + ("/" if Path(m).is_dir() else ""))
+        return out
+
+    def complete_load(self, text, line, begidx, endidx):
+        # Offer both scans/ files and matching paths.
+        from .scan_history import list_scans
+        names = [m.name for m in list_scans() if m.name.startswith(text)]
+        return names + self._complete_path(text)
+
+    def complete_save(self, text, line, begidx, endidx):
+        return self._complete_path(text)
+
     def cmdloop(self, intro=None):
-        # Rich-friendly prompt rendering — use console.input for color prompts
+        # Rich-friendly prompt rendering — use console.input for color prompts.
+        self._has_completion = self._setup_completion()
         while True:
             try:
                 line = console.input(self.prompt)
@@ -134,7 +192,8 @@ class ExploticaShell(cmd.Cmd):
             ("wizard", "Guided setup wizard"),
             ("listnet", "List local subnets without scanning"),
             ("spider <cidr> [--depth N]", "Recursive subnet discovery (network spider)"),
-            ("load <file.json>", "Load previous scan"),
+            ("scans [--risk|--size]", "List past scans (pick with `load <#>`)"),
+            ("load <index|name|file>", "Load a past scan (e.g. `load 1`)"),
             ("save [<file.json>]", "Save current scan"),
             ("clear", "Drop loaded scan"),
             ("─── Browse / query ───", ""),
@@ -164,7 +223,7 @@ class ExploticaShell(cmd.Cmd):
             ("dashboard", "Web dashboard"),
             ("tui", "Textual TUI"),
             ("plugins", "List loaded plugins"),
-            ("history", "Command history"),
+            ("history", "Command history (typed commands; see `scans` for scan files)"),
             ("quit / exit / q", "Leave"),
         ]
         for cmd_name, desc in rows:
@@ -194,6 +253,7 @@ class ExploticaShell(cmd.Cmd):
                 data = json.loads(Path(tmp.name).read_text(encoding="utf-8"))
                 self.scan_result = ScanResult.from_dict(data)
                 self.scan_path = Path(tmp.name)
+                self._update_prompt()
                 console.print(f"\n[green]✓ Scan loaded into memory.[/green] "
                               f"({len(self.scan_result.hosts)} hosts)")
             else:
@@ -206,20 +266,63 @@ class ExploticaShell(cmd.Cmd):
 
     # ── Load / Save / Status ─────────────────────────────────────────────
     def do_load(self, arg: str) -> bool:
-        """Load a scan JSON: `load <file.json>`"""
-        path = Path(arg.strip().strip('"').strip("'"))
-        if not path.exists():
-            console.print(f"[red]File not found:[/red] {path}")
+        """Load a past scan: `load <index|name|file.json>`
+
+        Accepts a number from the `scans` listing (e.g. `load 2`), a bare name
+        in scans/, or a full path.
+        """
+        ref = arg.strip()
+        if not ref:
+            console.print("[red]Usage:[/red] load <index|name|file.json>  "
+                          "[dim](see `scans` for the list)[/dim]")
+            return False
+        from .scan_history import resolve_scan
+        path = resolve_scan(ref)
+        if path is None:
+            console.print(f"[red]Not found:[/red] {ref}  "
+                          "[dim](try `scans` to list available)[/dim]")
             return False
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             from ..core.models import ScanResult
             self.scan_result = ScanResult.from_dict(data)
             self.scan_path = path
+            self._update_prompt()
             console.print(f"[green]✓ Loaded[/green] {len(self.scan_result.hosts)} "
                           f"hosts from [cyan]{path}[/cyan]")
         except (json.JSONDecodeError, OSError, KeyError) as e:
             console.print(f"[red]Could not load:[/red] {e}")
+        return False
+
+    def do_scans(self, arg: str) -> bool:
+        """List past scans in scans/: `scans [--risk|--size]` then `load <n>`."""
+        from .scan_history import list_scans, iso_to_local
+        sort = "recent"
+        if "--risk" in arg:
+            sort = "risk"
+        elif "--size" in arg:
+            sort = "size"
+        metas = list_scans(sort=sort)
+        if not metas:
+            console.print("[dim]No saved scans in ./scans/. Run `scan` first "
+                          "(results are saved automatically).[/dim]")
+            return False
+        t = Table(title=f"Past scans ({sort})", show_lines=False)
+        t.add_column("#", style="dim", justify="right")
+        t.add_column("Target", style="cyan")
+        t.add_column("Up/Hosts", justify="right")
+        t.add_column("Ports", justify="right")
+        t.add_column("CVEs")
+        t.add_column("When", style="dim")
+        t.add_column("File", style="dim")
+        for i, m in enumerate(metas, 1):
+            tgt, hosts, ports, cves, age, name = m.row()
+            cve_style = "[red]" if m.kev_count else ""
+            cve_cell = f"{cve_style}{cves}[/red]" if cve_style else cves
+            t.add_row(str(i), _esc(tgt), hosts, ports, cve_cell, age, _esc(name))
+        console.print(t)
+        console.print("[dim]Load one with[/dim] [cyan]load <#>[/cyan] "
+                      "[dim](e.g. `load 1`).[/dim]")
         return False
 
     def do_save(self, arg: str) -> bool:
@@ -259,6 +362,7 @@ class ExploticaShell(cmd.Cmd):
     def do_clear(self, arg: str) -> bool:
         self.scan_result = None
         self.scan_path = None
+        self._update_prompt()
         console.print("[dim]Scan cleared.[/dim]")
         return False
 
