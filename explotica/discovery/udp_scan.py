@@ -449,7 +449,7 @@ def _maybe_raw(ips: list[str], ports: list[int], *, prefer_raw: bool,
         if not raw_udp_available():
             if evasion is not None and evasion.needs_raw:
                 log.warning("decoy/fragment evasion needs raw sockets (scapy + "
-                            "root/Npcap) — unavailable; those options are ignored")
+                            "root/Npcap) - unavailable; those options ignored")
             else:
                 log.info("prefer_raw set but raw scan unavailable (need scapy + "
                          "root/Npcap); using connected-socket engine")
