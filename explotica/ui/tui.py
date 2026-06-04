@@ -481,7 +481,7 @@ def run(scan_json_path: str) -> int:
                                     value=True, id="cb-epss")
                     yield Checkbox("unmask (protocol probes)",
                                     value=True, id="cb-unmask")
-                    yield Checkbox("udp-probe (SNMP/mDNS/SSDP/NetBIOS)",
+                    yield Checkbox("udp-probe (DNS/SNMP/NTP/IKE/IPMI/RPC/+30)",
                                     value=True, id="cb-udp")
                     yield Checkbox("web-crawl (HTTP crawler)",
                                     value=False, id="cb-crawl")
@@ -515,6 +515,26 @@ def run(scan_json_path: str) -> int:
                                     value=False, id="cb-smtp")
                     yield Checkbox("[b red]web-fuzz[/b red] (ACTIVE — SQLi/XSS/etc.)",
                                     value=False, id="cb-fuzz")
+
+                yield Label("[b]UDP (advanced)[/b] — any of these implies "
+                            "udp-probe",
+                            classes="setup-section-title")
+                with Vertical(id="udp-grid"):
+                    yield Checkbox("udp-full (all 65535 UDP ports — slow)",
+                                    value=False, id="cb-udp-full")
+                    yield Checkbox("udp-raw (raw-ICMP turbo — needs Npcap/root)",
+                                    value=False, id="cb-udp-raw")
+                    yield Checkbox("udp-fragment (frag probes — needs raw)",
+                                    value=False, id="cb-udp-fragment")
+                    yield Input(value="",
+                                 placeholder="udp source port (e.g. 53)",
+                                 id="udp-source-port")
+                    yield Input(value="",
+                                 placeholder="udp data-length pad bytes (e.g. 24)",
+                                 id="udp-data-length")
+                    yield Input(value="",
+                                 placeholder="udp decoys IP,IP (needs raw)",
+                                 id="udp-decoys")
 
                 yield Label("[b]CREDENTIALS[/b] (optional)",
                             classes="setup-section-title")
@@ -633,6 +653,21 @@ def run(scan_json_path: str) -> int:
                 for cb_id, flag in module_map.items():
                     if self.query_one(f"#{cb_id}", Checkbox).value:
                         args.append(flag)
+
+            # Advanced UDP options — applied regardless of profile. The CLI
+            # implies --udp-probe whenever any of these is set, so they work
+            # even from Discovery/Full-Coverage profiles.
+            for cb_id, flag in (("cb-udp-full", "--udp-full"),
+                                ("cb-udp-raw", "--udp-raw"),
+                                ("cb-udp-fragment", "--udp-fragment")):
+                if self.query_one(f"#{cb_id}", Checkbox).value:
+                    args.append(flag)
+            for inp_id, flag in (("udp-source-port", "--udp-source-port"),
+                                 ("udp-data-length", "--udp-data-length"),
+                                 ("udp-decoys", "--udp-decoys")):
+                val = self.query_one(f"#{inp_id}", Input).value.strip()
+                if val:
+                    args.extend([flag, val])
 
             # Credentials
             ssh = self.query_one("#ssh-creds", Input).value.strip()
@@ -1241,9 +1276,9 @@ def run(scan_json_path: str) -> int:
                 cfg_mark = "[yellow]⚙[/yellow]" if h["ip"] in self.per_host_config else " "
                 t.add_row(
                     sel_mark, cfg_mark,
-                    f"[cyan]{h['ip']}[/cyan]",
-                    (h.get("hostname") or "-")[:24],
-                    (h.get("vendor") or "-")[:18],
+                    f"[cyan]{_esc(str(h['ip']))}[/cyan]",
+                    _esc((h.get("hostname") or "-")[:24]),
+                    _esc((h.get("vendor") or "-")[:18]),
                     str(len(ports)),
                     str(cves),
                     worst_text,
@@ -1272,7 +1307,7 @@ def run(scan_json_path: str) -> int:
                 sev = (c.get("severity") or "?").upper()
                 color = SEV_COLORS.get(sev.lower(), "dim")
                 t.add_row(
-                    f"[cyan]{cve_id}[/cyan]",
+                    f"[cyan]{_esc(str(cve_id))}[/cyan]",
                     f"[{color}]{sev}[/{color}]",
                     f"{c.get('cvss'):.1f}" if c.get("cvss") else "-",
                     f"{c.get('epss_score'):.2f}" if c.get("epss_score") else "-",
@@ -1298,8 +1333,8 @@ def run(scan_json_path: str) -> int:
                     prod = f"{sample['product_name']} {sample['product_version']}"
                 t.add_row(
                     str(port),
-                    sample.get("service") or "-",
-                    prod or "-",
+                    _esc(sample.get("service") or "-"),
+                    _esc(prod or "-"),
                     str(len(entries)),
                     str(cves),
                     key=str(port),
@@ -1313,12 +1348,12 @@ def run(scan_json_path: str) -> int:
                 for p in h.get("ports", []):
                     for ex in p.get("exploits", []):
                         t.add_row(
-                            ex.get("edb_id") or "?",
-                            h["ip"],
+                            _esc(str(ex.get("edb_id") or "?")),
+                            _esc(str(h["ip"])),
                             str(p["number"]),
-                            (ex.get("title") or "")[:60],
-                            ex.get("type") or "-",
-                            ex.get("platform") or "-",
+                            _esc((ex.get("title") or "")[:60]),
+                            _esc(ex.get("type") or "-"),
+                            _esc(ex.get("platform") or "-"),
                         )
 
         def _populate_compliance(self) -> None:
