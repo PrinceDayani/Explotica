@@ -126,7 +126,7 @@ def raw_udp_scan(targets: Iterable[str], ports: list[int], *,
     targets = list(dict.fromkeys(targets))
     ports = list(ports)
     if not raw_udp_available():
-        log.warning("raw UDP scan requires root/admin + scapy — not available")
+        log.warning("raw UDP scan requires root/admin + scapy - not available")
         return {}
     if not targets or not ports:
         return {ip: [] for ip in targets}
