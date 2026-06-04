@@ -3,6 +3,37 @@
 All notable changes to Explotica are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — Phase 73: Advanced web-application cluster
+
+Closes six limitations-doc gaps, all offline-verified (no mock data):
+
+### Added
+- `explotica/active/jwt_audit.py` — active JWT manipulation: offline HMAC
+  secret cracking, alg:none / kid / jku / RS256->HS256 confusion forgeries,
+  claim tampering, exp/nbf review. `live_acceptance_test()` is the only network
+  path (acceptance judged solely from real server status).
+- `explotica/active/graphql_audit.py` — query depth/cost analysis, schema
+  cycle detection (unbounded-nesting DoS) + deep-query PoC generation,
+  alias-amplification detection, sensitive-field surfacing, and "Did you
+  mean…?" suggestion harvesting (works when introspection is disabled).
+- `explotica/active/dom_xss.py` — taint-based DOM XSS via Playwright
+  instrumentation (canary sources -> dangerous-sink hooks); data-flow vs
+  callback-confirmed execution. Skips with a reason when Playwright is absent.
+- `explotica/active/session_flows.py` — stateful session engine: cookie jar +
+  per-response anti-CSRF token re-extraction (rotation handling) + multi-step
+  flow executor (login->cart->checkout) with variable capture; real
+  socket/TLS transport.
+- `explotica/active/idor_audit.py` — deepened IDOR: reference typing +
+  predictability, two-context confirmation (victim vs attacker vs
+  denied-baseline) that rejects soft-403s and the attacker's own object.
+- `explotica/active/web_cluster.py` — per-port orchestrator tying the above to
+  live HTTP(S) ports.
+- CLI: `--jwt-crack`, `--graphql-audit`, `--dom-xss`, `--idor-test`.
+
+### Tests
+- 96 new offline tests (JWT crack/forgery, GraphQL cycles/cost, DOM-XSS taint
+  logic, CSRF rotation + flow state, IDOR classification). Suite: 346 passing.
+
 ## [Unreleased] — Phase 70: Active Directory deep-audit cluster
 
 Closes four limitations-doc gaps with real, offline-verified implementations
