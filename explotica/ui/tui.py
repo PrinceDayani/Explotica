@@ -515,6 +515,40 @@ def run(scan_json_path: str) -> int:
                                     value=False, id="cb-smtp")
                     yield Checkbox("[b red]web-fuzz[/b red] (ACTIVE — SQLi/XSS/etc.)",
                                     value=False, id="cb-fuzz")
+                    # ── Active Directory cluster ──
+                    yield Checkbox("syn-scan (stateless SYN — needs root/Npcap)",
+                                    value=False, id="cb-syn")
+                    yield Checkbox("osint (crt.sh/ASN/RDAP)",
+                                    value=False, id="cb-osint")
+                    yield Checkbox("netfabric (DHCP + traceroute)",
+                                    value=False, id="cb-netfabric")
+                    yield Checkbox("subdomain-enum (passive + brute)",
+                                    value=False, id="cb-subdomain")
+                    yield Checkbox("container-scan (Docker/k8s exposure)",
+                                    value=False, id="cb-container")
+                    yield Checkbox("db-fingerprint (DB version/creds)",
+                                    value=False, id="cb-dbfp")
+                    yield Checkbox("snmp-inventory (full SNMP walk)",
+                                    value=False, id="cb-snmpinv")
+                    yield Checkbox("[b cyan]bloodhound[/b cyan] (AD attack graph)",
+                                    value=False, id="cb-bloodhound")
+                    yield Checkbox("[b cyan]adcs-audit[/b cyan] (ESC1-ESC8)",
+                                    value=False, id="cb-adcs")
+                    yield Checkbox("[b cyan]ticket-risk[/b cyan] (golden/silver)",
+                                    value=False, id="cb-ticketrisk")
+                    # ── Web cluster ──
+                    yield Checkbox("web-security (headers/cookies/TLS)",
+                                    value=False, id="cb-websec")
+                    yield Checkbox("[b red]web-appscan[/b red] (ACTIVE app scan)",
+                                    value=False, id="cb-webappscan")
+                    yield Checkbox("[b red]jwt-crack[/b red] (ACTIVE — JWT attacks)",
+                                    value=False, id="cb-jwt")
+                    yield Checkbox("[b red]graphql-audit[/b red] (ACTIVE)",
+                                    value=False, id="cb-graphql")
+                    yield Checkbox("[b red]dom-xss[/b red] (ACTIVE — DOM sinks)",
+                                    value=False, id="cb-domxss")
+                    yield Checkbox("[b red]idor-test[/b red] (ACTIVE — BOLA/IDOR)",
+                                    value=False, id="cb-idor")
 
                 yield Label("[b]UDP (advanced)[/b] — any of these implies "
                             "udp-probe",
@@ -547,6 +581,26 @@ def run(scan_json_path: str) -> int:
                 yield Input(value="",
                              placeholder="AD domain (e.g. corp.local)",
                              id="ad-domain")
+                yield Input(value="",
+                             placeholder="AD creds user:password (for authed LDAP)",
+                             id="ad-creds")
+                yield Input(value="",
+                             placeholder="AD DC host/IP (e.g. dc01.corp.local)",
+                             id="ad-dc")
+                yield Checkbox("AD over LDAPS (--ad-ssl)",
+                                value=False, id="cb-ad-ssl")
+                yield Input(value="",
+                             placeholder="DB creds product:user:pass (comma-sep)",
+                             id="db-creds")
+                yield Input(value="",
+                             placeholder="SNMP community (default: public)",
+                             id="snmp-community")
+                yield Input(value="",
+                             placeholder="SSH private key path",
+                             id="ssh-key")
+                yield Input(value="",
+                             placeholder="Kubernetes bearer token",
+                             id="kube-token")
 
                 yield Label("[b]COMPLIANCE & EXTRAS[/b]",
                             classes="setup-section-title")
@@ -649,6 +703,23 @@ def run(scan_json_path: str) -> int:
                     "cb-defcreds": "--check-default-creds",
                     "cb-takeover": "--check-takeover",
                     "cb-smtp": "--smtp-audit", "cb-fuzz": "--web-fuzz",
+                    # Recon / AD cluster
+                    "cb-syn": "--syn-scan", "cb-osint": "--osint",
+                    "cb-netfabric": "--netfabric",
+                    "cb-subdomain": "--subdomain-enum",
+                    "cb-container": "--container-scan",
+                    "cb-dbfp": "--db-fingerprint",
+                    "cb-snmpinv": "--snmp-inventory",
+                    "cb-bloodhound": "--bloodhound",
+                    "cb-adcs": "--adcs-audit",
+                    "cb-ticketrisk": "--ticket-risk",
+                    # Web cluster
+                    "cb-websec": "--web-security",
+                    "cb-webappscan": "--web-appscan",
+                    "cb-jwt": "--jwt-crack",
+                    "cb-graphql": "--graphql-audit",
+                    "cb-domxss": "--dom-xss",
+                    "cb-idor": "--idor-test",
                 }
                 for cb_id, flag in module_map.items():
                     if self.query_one(f"#{cb_id}", Checkbox).value:
@@ -679,6 +750,18 @@ def run(scan_json_path: str) -> int:
             ad = self.query_one("#ad-domain", Input).value.strip()
             if ad:
                 args.extend(["--ad-enum", ad])
+            # Extra credential / value inputs (apply regardless of profile).
+            for inp_id, flag in (("ad-creds", "--ad-creds"),
+                                 ("ad-dc", "--ad-dc"),
+                                 ("db-creds", "--db-creds"),
+                                 ("snmp-community", "--snmp-community"),
+                                 ("ssh-key", "--ssh-key"),
+                                 ("kube-token", "--kube-token")):
+                val = self.query_one(f"#{inp_id}", Input).value.strip()
+                if val:
+                    args.extend([flag, val])
+            if self.query_one("#cb-ad-ssl", Checkbox).value:
+                args.append("--ad-ssl")
 
             # Compliance / Cloud
             comp = self.query_one("#compliance", Input).value.strip()
