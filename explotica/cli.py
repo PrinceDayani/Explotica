@@ -11,6 +11,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape as _esc
 from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn,
                             TimeElapsedColumn)
 from rich.table import Table
@@ -336,8 +337,10 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
                             style="dim",
                         )
 
-        # Augment hostname column with OS hint when we have it
-        host_display = host.hostname or "-"
+        # Augment hostname column with OS hint when we have it.
+        # hostname / SNMP sysDescr are attacker-influenced — escape them so a
+        # crafted value can't inject Rich markup or raise MarkupError mid-render.
+        host_display = _esc(host.hostname) if host.hostname else "-"
         if host.os_hint:
             host_display = (
                 f"{host_display}\n"
@@ -347,7 +350,7 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
         if host.udp_services:
             udp_summary: list[str] = []
             if host.udp_services.get("snmp"):
-                sd = host.udp_services["snmp"].get("sysDescr", "")[:40]
+                sd = _esc(host.udp_services["snmp"].get("sysDescr", "")[:40])
                 udp_summary.append(f"SNMP ({sd})" if sd else "SNMP")
             if host.udp_services.get("mdns"):
                 svcs = host.udp_services["mdns"].get("services", [])
@@ -375,7 +378,7 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
             _findings = [v["finding"] for v in host.udp_services.values()
                          if isinstance(v, dict) and v.get("finding")]
             for _f in _findings[:6]:
-                host_display += f"\n[yellow]  [!] UDP: {_f}[/yellow]"
+                host_display += f"\n[yellow]  [!] UDP: {_esc(str(_f))}[/yellow]"
 
         # Phase 56: closed + filtered summary in dim italics so the user can
         # see them without flooding the table

@@ -213,6 +213,10 @@ def run(scan_json_path: str) -> int:
                                   Input, Label, RadioButton, RadioSet,
                                   Static, TabbedContent, TabPane)
     from textual.reactive import reactive
+    # Untrusted scanner output (banners, stderr) must never be parsed as Rich
+    # markup — escape() for mixed strings, Text() for raw blobs.
+    from rich.markup import escape as _esc
+    from rich.text import Text as _Text
 
     scan = json.loads(Path(scan_json_path).read_text(encoding="utf-8"))
 
@@ -885,7 +889,9 @@ def run(scan_json_path: str) -> int:
                     classes="err-meta",
                 )
                 if p.error:
-                    yield Static(f"[b]Summary:[/b] [red]{p.error}[/red]",
+                    # p.error is captured subprocess stderr — escape it so
+                    # bracketed content can't inject/break Rich markup.
+                    yield Static(f"[b]Summary:[/b] [red]{_esc(p.error)}[/red]",
                                   classes="err-meta")
 
                 yield Label("COMMAND", classes="err-section")
@@ -896,22 +902,23 @@ def run(scan_json_path: str) -> int:
                         quoted.append(f'"{tok}"')
                     else:
                         quoted.append(tok)
-                yield Static(" ".join(quoted), classes="err-cmd")
+                yield Static(_Text(" ".join(quoted)), classes="err-cmd")
 
                 if p.stderr_full:
                     yield Label("STDERR", classes="err-section")
                     # Cap absurdly large blobs in the renderer to keep Textual happy
                     txt = p.stderr_full
                     if len(txt) > 32000:
-                        txt = txt[:32000] + "\n[…truncated, full text on disk only…]"
-                    yield Static(txt, classes="err-stderr")
+                        txt = txt[:32000] + "\n(…truncated, full text on disk only…)"
+                    # Raw subprocess output — render literally, never as markup.
+                    yield Static(_Text(txt), classes="err-stderr")
 
                 if p.stdout_full.strip():
                     yield Label("STDOUT", classes="err-section")
                     txt = p.stdout_full
                     if len(txt) > 32000:
-                        txt = txt[:32000] + "\n[…truncated…]"
-                    yield Static(txt, classes="err-stdout")
+                        txt = txt[:32000] + "\n(…truncated…)"
+                    yield Static(_Text(txt), classes="err-stdout")
 
                 if not p.stderr_full and not p.stdout_full.strip():
                     yield Static(
@@ -1387,25 +1394,28 @@ def run(scan_json_path: str) -> int:
         def _show_host_detail(self, h: dict) -> None:
             self.detail_pane.remove_children()
             from textual.widgets import Static as S
-            lines = [f"[bold cyan]{h['ip']}[/bold cyan]"]
+            # Host/port fields (hostname, banner, product, service…) are
+            # derived from untrusted scan targets — escape before they reach
+            # Rich markup so a crafted banner can't inject tags or crash render.
+            lines = [f"[bold cyan]{_esc(str(h['ip']))}[/bold cyan]"]
             if h.get("hostname"):
-                lines.append(f"hostname: [cyan]{h['hostname']}[/cyan]")
+                lines.append(f"hostname: [cyan]{_esc(str(h['hostname']))}[/cyan]")
             if h.get("mac"):
-                lines.append(f"MAC: {h['mac']}  vendor: {h.get('vendor') or '-'}")
+                lines.append(f"MAC: {_esc(str(h['mac']))}  vendor: {_esc(str(h.get('vendor') or '-'))}")
             if h.get("os_hint"):
                 oh = h["os_hint"]
                 lines.append(
-                    f"OS: {oh.get('os_family')} "
-                    f"(TTL={h.get('ttl')})"
+                    f"OS: {_esc(str(oh.get('os_family')))} "
+                    f"(TTL={_esc(str(h.get('ttl')))})"
                 )
             self.detail_pane.mount(S("\n".join(lines)))
 
             for p in h.get("ports", []):
-                pl = [f"\n[bold green]{p['number']}/{p.get('protocol', 'tcp')}[/bold green] {p.get('service', '')}"]
+                pl = [f"\n[bold green]{_esc(str(p['number']))}/{_esc(str(p.get('protocol', 'tcp')))}[/bold green] {_esc(str(p.get('service', '')))}"]
                 if p.get("product_name") and p.get("product_version"):
-                    pl.append(f"  [yellow]{p['product_name']} {p['product_version']}[/yellow]")
+                    pl.append(f"  [yellow]{_esc(str(p['product_name']))} {_esc(str(p['product_version']))}[/yellow]")
                 if p.get("banner"):
-                    pl.append(f"  [dim]{p['banner'][:120]}[/dim]")
+                    pl.append(f"  [dim]{_esc(str(p['banner'])[:120])}[/dim]")
                 cves = sorted(
                     p.get("cves", []),
                     key=lambda c: (
@@ -1420,10 +1430,10 @@ def run(scan_json_path: str) -> int:
                     marker = " [red bold]KEV[/red bold]" if c.get("in_kev") else ""
                     pl.append(
                         f"  [{color}]{sev:<8}[/{color}] "
-                        f"{c.get('cvss') or '?':<5}  [cyan]{c['id']}[/cyan]{marker}"
+                        f"{c.get('cvss') or '?':<5}  [cyan]{_esc(str(c['id']))}[/cyan]{marker}"
                     )
                 for ex in (p.get("exploits") or [])[:3]:
-                    pl.append(f"  💥 [magenta]EDB-{ex.get('edb_id', '?')}[/magenta]  {ex.get('title', '')[:60]}")
+                    pl.append(f"  💥 [magenta]EDB-{_esc(str(ex.get('edb_id', '?')))}[/magenta]  {_esc(str(ex.get('title', ''))[:60])}")
                 self.detail_pane.mount(S("\n".join(pl)))
 
         # ── Search / filter ─────────────────────────────────────────────
@@ -1673,7 +1683,7 @@ def run(scan_json_path: str) -> int:
             ), callback)
 
         def action_dashboard(self) -> None:
-            cmd = [sys.executable, "-m", "explotica.dashboard", self.scan_path]
+            cmd = [sys.executable, "-m", "explotica.output.dashboard", self.scan_path]
             try:
                 subprocess.Popen(cmd)
                 self.notify("Dashboard launched at http://localhost:8765 "

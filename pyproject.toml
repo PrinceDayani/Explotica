@@ -117,9 +117,9 @@ all = [
 
 [project.scripts]
 explotica = "explotica.cli:main"
-explotica-tui = "explotica.tui:main"
-explotica-dashboard = "explotica.dashboard:main"
-explotica-shell = "explotica.shell:main"
+explotica-tui = "explotica.ui.tui:main"
+explotica-dashboard = "explotica.output.dashboard:main"
+explotica-shell = "explotica.ui.shell:launch_shell"
 
 [project.urls]
 "Homepage" = "https://github.com/PrinceDayani/Explotica"

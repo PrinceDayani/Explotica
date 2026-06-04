@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from rich.console import Console
+from rich.markup import escape as _esc
 from rich.panel import Panel
 from rich.table import Table
 
@@ -291,9 +292,11 @@ class ExploticaShell(cmd.Cmd):
             worst_str = {4: "[red]CRITICAL[/red]", 3: "[orange1]HIGH[/orange1]",
                           2: "[yellow]MEDIUM[/yellow]",
                           1: "[green]LOW[/green]"}.get(worst, "-")
-            t.add_row(h.ip, h.hostname or "-",
+            # hostname/vendor are attacker-influenced — escape before they hit
+            # a Rich table cell (cells parse markup by default).
+            t.add_row(h.ip, _esc(h.hostname) if h.hostname else "-",
                        (h.mac or "-")[:17],
-                       (h.vendor or "-")[:18],
+                       _esc((h.vendor or "-")[:18]),
                        str(len(h.ports)),
                        str(len(cves)),
                        worst_str)
@@ -489,8 +492,9 @@ class ExploticaShell(cmd.Cmd):
         for h, p in hits:
             prod = (f"{p.product_name} {p.product_version}"
                     if p.product_name else "-")
-            t.add_row(h.ip, p.service or "-", prod,
-                       (p.banner or "")[:60], str(len(p.cves)))
+            # service/product/banner come from untrusted responses — escape.
+            t.add_row(h.ip, _esc(p.service or "-"), _esc(prod),
+                       _esc((p.banner or "")[:60]), str(len(p.cves)))
         console.print(t)
         return False
 
