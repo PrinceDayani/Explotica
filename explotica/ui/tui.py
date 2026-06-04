@@ -813,6 +813,8 @@ def run(scan_json_path: str) -> int:
               "Full UI to configure a new scan with all options"),
             ("scan", "⚡ Quick scan (modal)",
               "Type target + flags directly"),
+            ("history", "📜 Browse scan history",
+              "Pick from past scans/*.json (target/hosts/CVEs at a glance)"),
             ("load", "📂 Load scan from JSON file", ""),
             ("save", "💾 Save current scan", ""),
             ("verify", "✅ Verify probes",
@@ -877,6 +879,63 @@ def run(scan_json_path: str) -> int:
                     self.dismiss(key)
                     return
             self.dismiss(None)
+
+    # ── Modal: scan-history browser ──────────────────────────────────────
+    class ScanHistoryModal(ModalScreen[Optional[str]]):
+        """Browse past scans/*.json and pick one to load. Returns its path."""
+        CSS = """
+        ScanHistoryModal { align: center middle; }
+        #history-box {
+            background: $surface; border: thick $accent;
+            padding: 1 2; min-width: 84; max-width: 120; height: 28;
+        }
+        """
+        BINDINGS = [
+            Binding("escape,q", "dismiss(None)", "Cancel"),
+            Binding("r", "toggle_sort", "Sort recent/risk", show=True),
+        ]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._sort = "recent"
+            self._paths: list[str] = []
+
+        def compose(self) -> ComposeResult:
+            with Container(id="history-box"):
+                yield Label("📜 Scan history  [dim](Enter = load · r = sort by "
+                            "risk · Esc = cancel)[/dim]")
+                self.h_table = DataTable(id="history-table", cursor_type="row",
+                                          zebra_stripes=True)
+                yield self.h_table
+
+        def on_mount(self) -> None:
+            self.h_table.add_columns("#", "Target", "Up/Hosts", "Ports",
+                                      "CVEs", "When", "File")
+            self._reload()
+            self.h_table.focus()
+
+        def _reload(self) -> None:
+            from .scan_history import list_scans
+            self.h_table.clear()
+            self._paths = []
+            metas = list_scans(sort=self._sort)
+            if not metas:
+                self.h_table.add_row("—", "no saved scans in ./scans/",
+                                      "", "", "", "", "")
+                return
+            for i, m in enumerate(metas, 1):
+                tgt, hosts, ports, cves, age, name = m.row()
+                self._paths.append(str(m.path))
+                self.h_table.add_row(str(i), tgt, hosts, ports, cves, age, name)
+
+        def action_toggle_sort(self) -> None:
+            self._sort = "risk" if self._sort != "risk" else "recent"
+            self._reload()
+
+        def on_data_table_row_selected(self, event) -> None:
+            idx = self.h_table.cursor_row
+            if 0 <= idx < len(self._paths):
+                self.dismiss(self._paths[idx])
 
     # ── Modal: help overlay ──────────────────────────────────────────────
     class HelpModal(ModalScreen):
@@ -1125,6 +1184,7 @@ def run(scan_json_path: str) -> int:
             Binding("ctrl+p", "open_palette", "Palette", show=True),
             Binding("P", "open_palette", "Palette", show=False),
             Binding("l", "action_load", "Load"),
+            Binding("L", "action_history", "History", show=True),
             Binding("ctrl+s", "action_save", "Save", show=False),
             Binding("v", "action_verify", "Verify"),
             Binding("c", "action_sshcreds", "SSH creds"),
@@ -1619,24 +1679,35 @@ def run(scan_json_path: str) -> int:
                 "🔍 Run scan", "target [flags]", "192.168.1.0/24 --full-coverage --turbo"
             ), callback)
 
+        def _apply_loaded_scan(self, path: str) -> None:
+            """Load a scan JSON from disk and refresh every tab."""
+            self.scan_data = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.scan_path = str(path)
+            self.hosts = sorted(self.scan_data.get("hosts", []),
+                                  key=_ip_sort_key)
+            self._populate_hosts()
+            self._populate_cves()
+            self._populate_ports()
+            self._populate_exploits()
+            self._populate_compliance()
+            self._populate_extra()
+            self.notify(f"Loaded {Path(path).name}", timeout=2)
+
         def action_load(self) -> None:
             def callback(path: Optional[str]) -> None:
                 if not path or not Path(path).exists():
                     return
-                self.scan_data = json.loads(Path(path).read_text(encoding="utf-8"))
-                self.scan_path = path
-                self.hosts = sorted(self.scan_data.get("hosts", []),
-                                      key=_ip_sort_key)
-                self._populate_hosts()
-                self._populate_cves()
-                self._populate_ports()
-                self._populate_exploits()
-                self._populate_compliance()
-                self._populate_extra()
-                self.notify(f"Loaded {path}", timeout=2)
+                self._apply_loaded_scan(path)
             self.push_screen(CommandModal(
                 "📂 Load JSON", "path to scan JSON", self.scan_path or ""
             ), callback)
+
+        def action_history(self) -> None:
+            """Open the visual scan-history browser; load the chosen scan."""
+            def callback(path: Optional[str]) -> None:
+                if path and Path(path).exists():
+                    self._apply_loaded_scan(path)
+            self.push_screen(ScanHistoryModal(), callback)
 
         def action_save(self) -> None:
             def callback(path: Optional[str]) -> None:
@@ -1877,6 +1948,7 @@ def run(scan_json_path: str) -> int:
                 dispatch = {
                     "setup": self.action_open_setup,
                     "scan": self.action_scan,
+                    "history": self.action_history,
                     "load": self.action_load,
                     "save": self.action_save,
                     "verify": self.action_verify,
