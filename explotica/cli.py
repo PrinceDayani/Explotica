@@ -599,6 +599,21 @@ def main(argv: list[str] | None = None) -> int:
                    help="Extended verification probes (Citrix, Confluence, "
                         "Spring4Shell, F5, ProxyLogon, GitLab, ConnectWise, "
                         "TeamCity, Zoho, JBoss, Jenkins)")
+    # ── Phase 73: advanced web cluster ─────────────────────────────────
+    p.add_argument("--jwt-crack", action="store_true",
+                   help="Active JWT audit: crack weak HMAC secrets offline + "
+                        "generate alg:none/kid/confusion forgeries from tokens "
+                        "found on HTTP ports. OPT-IN.")
+    p.add_argument("--graphql-audit", action="store_true",
+                   help="GraphQL depth/cost analysis + schema cycle (DoS) "
+                        "detection + sensitive-field surfacing. OPT-IN.")
+    p.add_argument("--dom-xss", action="store_true",
+                   help="Taint-based DOM XSS detection (requires Playwright). "
+                        "OPT-IN.")
+    p.add_argument("--idor-test", action="store_true",
+                   help="Passive IDOR object-reference detection on discovered "
+                        "URLs (confirmation needs two sessions via library). "
+                        "OPT-IN.")
     p.add_argument("--web-fuzz", action="store_true",
                    help="Active web fuzzing (path traversal, open redirect, "
                         "CRLF, XSS reflection, SSRF hints). OPT-IN.")
@@ -1014,6 +1029,7 @@ def main(argv: list[str] | None = None) -> int:
                     udp_probe=args.udp_probe,
                     udp_full=getattr(args, "udp_full", False),
                     udp_raw=getattr(args, "udp_raw", False),
+                    udp_evasion=_udp_evasion,
                     web_crawl_enabled=args.web_crawl,
                     shodan_enabled=args.shodan,
                     ssh_enum_enabled=args.ssh_enum,
@@ -1143,6 +1159,7 @@ def main(argv: list[str] | None = None) -> int:
                 udp_probe=args.udp_probe,
                 udp_full=getattr(args, "udp_full", False),
                 udp_raw=getattr(args, "udp_raw", False),
+                udp_evasion=_udp_evasion,
                 web_crawl_enabled=args.web_crawl,
                 shodan_enabled=args.shodan,
                 ssh_enum_enabled=args.ssh_enum,
@@ -1182,6 +1199,10 @@ def main(argv: list[str] | None = None) -> int:
                 verify_cves_v2=args.verify_cves_v2,
                 web_fuzz_enabled=args.web_fuzz,
                 sqli_time_based=args.sqli_time,
+                jwt_crack=args.jwt_crack,
+                graphql_audit=args.graphql_audit,
+                dom_xss=args.dom_xss,
+                idor_passive=args.idor_test,
                 nmap_timeout=args.nmap_timeout,
                 # Phase 56 state filtering
                 include_closed=not args.open_only,
@@ -1429,6 +1450,37 @@ def main(argv: list[str] | None = None) -> int:
                     f"{s.get('golden_ticket_risks', 0)} golden-ticket enabler(s), "
                     f"{s.get('silver_ticket_risks', 0)} silver-ticket enabler(s)"
                 )
+        if ef.get("web_advanced"):
+            for ip, wa in ef["web_advanced"].items():
+                for j in wa.get("jwt", []):
+                    if j.get("cracked_secret"):
+                        console.print(
+                            f"  🔓 [bold red]JWT SECRET CRACKED[/bold red] on "
+                            f"{ip}:{j.get('port')}: '{j['cracked_secret']}' — "
+                            f"full token forgery possible")
+                for g in wa.get("graphql", []):
+                    dos = [f for f in g.get("findings", [])
+                           if f.get("issue") == "schema_cycle_depth_dos"]
+                    console.print(
+                        f"  ⚛ [bold]GraphQL audit[/bold] {ip}{g.get('endpoint','')}: "
+                        f"{g.get('type_count', 0)} types, "
+                        f"{len(g.get('cycles', []))} cycle(s), "
+                        f"{len(g.get('sensitive_fields', []))} sensitive field(s)"
+                        + (" — [red]depth-DoS PoC available[/red]" if dos else ""))
+                for d in wa.get("dom_xss", []):
+                    conf = d.get("confirmed_xss", [])
+                    console.print(
+                        f"  🧪 [bold]DOM XSS[/bold] {d.get('url')}: "
+                        f"{len(d.get('findings', []))} sink flow(s)"
+                        + (f", [bold red]{len(conf)} CONFIRMED[/bold red]"
+                           if conf else ""))
+                if wa.get("idor_refs"):
+                    console.print(
+                        f"  🔢 [bold]IDOR surface[/bold] {ip}: "
+                        f"{len(wa['idor_refs'])} object-reference(s) to test")
+                if wa.get("dom_xss_skipped"):
+                    console.print(f"  🧪 [dim]DOM XSS skipped: "
+                                  f"{wa['dom_xss_skipped']}[/dim]")
         if ef.get("honeypot_indicators"):
             console.print(
                 f"  🎭 Honeypot indicators on "
