@@ -188,6 +188,7 @@ class ExploticaShell(cmd.Cmd):
         rows = [
             ("─── Scan setup ───", ""),
             ("scan <target> [opts]", "Fresh scan (e.g. `scan 192.168.1.0/24 --full-coverage --turbo`)"),
+            ("profiles", "Show scan types (Discovery/Standard/Full/All-Things)"),
             ("auto [opts]", "Auto-discover & scan all local subnets"),
             ("wizard", "Guided setup wizard"),
             ("listnet", "List local subnets without scanning"),
@@ -755,6 +756,37 @@ class ExploticaShell(cmd.Cmd):
         wiz_args = run_wizard()
         if wiz_args:
             self.do_scan(" ".join(wiz_args))
+        return False
+
+    def do_profiles(self, arg: str) -> bool:
+        """Show the scan profiles (types of scan) and how to run each."""
+        t = Table(title="Scan profiles (types of scan)", show_lines=True)
+        t.add_column("Profile", style="cyan", no_wrap=True)
+        t.add_column("What it does")
+        t.add_column("Run it with", style="dim")
+        rows = [
+            ("Discovery", "Host discovery + port scan only. Fast, light touch.",
+             "scan <target>"),
+            ("Standard", "Discovery + CVE matching + version probes + nmap "
+             "NSE + EPSS/KEV scoring.",
+             "scan <target> --vuln-scan --deep\n  --use-nmap --epss-kev"),
+            ("Full Coverage", "Everything SAFE: vuln, deep, nmap, "
+             "searchsploit, TLS/HTTP/SMB intel, UDP, web-crawl, shodan, "
+             "ssh/dns/service/http enrich, OS-fp, prioritize.",
+             "scan <target> --full-coverage"),
+            ("All The Things", "Full Coverage + [red]ACTIVE[/red] checks "
+             "(default-creds, takeover, SMTP relay, web-fuzz). Intrusive — "
+             "authorized targets only.",
+             "scan <target> --all-the-things"),
+            ("Custom", "Pick exactly the modules you want, or use the wizard.",
+             "wizard"),
+        ]
+        for name, what, how in rows:
+            t.add_row(name, what, how)
+        console.print(t)
+        console.print("[dim]Speed: add [cyan]--turbo[/cyan] / [cyan]--ultra[/cyan]. "
+                      "UDP: [cyan]--udp-probe[/cyan] (+ [cyan]--udp-raw[/cyan]/"
+                      "[cyan]--udp-full[/cyan]). Guided setup: [cyan]wizard[/cyan].[/dim]")
         return False
 
     def do_auto(self, arg: str) -> bool:

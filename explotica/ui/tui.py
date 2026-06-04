@@ -455,13 +455,15 @@ def run(scan_json_path: str) -> int:
 
                 yield Label("[b]PROFILE[/b]", classes="setup-section-title")
                 with RadioSet(id="profile"):
-                    yield RadioButton("Discovery only", id="rb-discover")
-                    yield RadioButton("Standard scan", id="rb-standard")
-                    yield RadioButton("Full Coverage (safe)",
+                    yield RadioButton("Discovery only — hosts + ports, fast",
+                                       id="rb-discover")
+                    yield RadioButton("Standard — CVEs + version probes + nmap",
+                                       id="rb-standard")
+                    yield RadioButton("Full Coverage (safe) — all passive intel",
                                        value=True, id="rb-full")
-                    yield RadioButton("All The Things (active checks)",
+                    yield RadioButton("All The Things — + ACTIVE checks (intrusive)",
                                        id="rb-all-things")
-                    yield RadioButton("Custom (pick modules below)",
+                    yield RadioButton("Custom — pick modules below",
                                        id="rb-custom-profile")
 
                 yield Label("[b]MODULES[/b] (used if Profile=Custom)",
