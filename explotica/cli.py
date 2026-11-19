@@ -541,6 +541,11 @@ def main(argv: list[str] | None = None) -> int:
                         "addresses (default: 4096 = /20).")
     p.add_argument("--list-network", action="store_true",
                    help="Just print the discovered subnets and exit — no scanning.")
+    p.add_argument("--mdns-sniff", nargs="?", type=float, const=3.0,
+                   default=None, metavar="SECONDS",
+                   help="Passively listen for mDNS (Bonjour/Avahi) announcements "
+                        "on the LAN for N seconds (default 3) and print the "
+                        "discovered hosts/services, then exit.")
     p.add_argument("-p", "--ports", default="all",
                    help="Ports: 'all' (default — 1-65535), 'top1000', "
                         "'top100', or '22,80,443' or '1-1024'. "
@@ -905,6 +910,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.interactive or (not args.target and not args.from_json
                               and not args.auto and not args.list_network
                               and not getattr(args, "explain", False)
+                              and getattr(args, "mdns_sniff", None) is None
                               and argv is None):
         from .ui.interactive import run_wizard
         wiz_args = run_wizard()
@@ -1123,6 +1129,24 @@ def main(argv: list[str] | None = None) -> int:
         from .discovery.enumerate import list_subnets, format_summary
         net = list_subnets(max_hosts_per_subnet=args.max_hosts_per_subnet)
         console.print(format_summary(net))
+        return 0
+
+    if getattr(args, "mdns_sniff", None) is not None:
+        from .discovery.mdns_sniff import sniff_mdns
+        console.print(f"[dim]Listening for mDNS announcements "
+                      f"for {args.mdns_sniff:.0f}s…[/dim]")
+        res = sniff_mdns(duration=args.mdns_sniff)
+        if res.get("errors"):
+            console.print(f"[yellow]mDNS sniff note:[/yellow] "
+                          f"{'; '.join(res['errors'])}")
+        if not res.get("hosts"):
+            console.print("No mDNS announcements observed.")
+        for ip, info in sorted(res.get("hosts", {}).items()):
+            console.print(f"[cyan]{ip}[/cyan]")
+            for svc in info.get("ptr", []):
+                console.print(f"  service: {svc}")
+            for s in info.get("srv", []):
+                console.print(f"  {s['target']}:{s['port']}")
         return 0
 
     # Validate input mode
