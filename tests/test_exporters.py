@@ -58,6 +58,41 @@ def test_sarif_written_is_valid_json(tmp_path):
     assert data["runs"][0]["results"][0]["ruleId"] == "CVE-2021-44228"
 
 
+def test_csv_formula_injection_neutralised(tmp_path):
+    cve = CVE(id="CVE-2020-0001", severity="HIGH",
+              summary="=cmd|' /c calc'!A1")  # malicious summary
+    port = Port(number=80, protocol="tcp", state="open",
+                service="=HYPERLINK(evil)", cves=[cve])
+    host = Host(ip="10.0.0.5", hostname="-2+3", ports=[port])
+    scan = ScanResult(target="t", started_at="t0", finished_at="t1",
+                      duration_s=0.0, hosts=[host])
+    out = write_csv(scan, tmp_path / "o.csv")
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    r = rows[0]
+    assert r["service"].startswith("'=")
+    assert r["summary"].startswith("'=")
+    assert r["hostname"].startswith("'-")
+
+
+def test_csv_atomic_leaves_previous_on_failure(tmp_path, monkeypatch):
+    out = tmp_path / "o.csv"
+    write_csv(_sample(), out)          # first good write
+    original = out.read_text(encoding="utf-8")
+
+    import explotica.output.exporters as ex
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ex.os, "replace", boom)
+    try:
+        write_csv(_sample(), out)
+    except OSError:
+        pass
+    # Previous report is intact; no partial/empty overwrite.
+    assert out.read_text(encoding="utf-8") == original
+
+
 def test_empty_scan_sarif_has_no_results():
     empty = ScanResult(target="x", started_at="t0", finished_at="t1",
                        duration_s=0.0, hosts=[])

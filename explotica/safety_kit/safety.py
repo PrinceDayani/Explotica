@@ -85,6 +85,11 @@ class Scope:
         return s
 
     def add_network(self, cidr: str) -> None:
+        # Strip any IPv6 zone id first: ipaddress.ip_network rejects a scoped
+        # address on some Python versions, which would otherwise leave the
+        # scope empty (and an empty scope permits everything). permits()
+        # strips the zone on the target side too, so matching stays correct.
+        cidr = _strip_zone(cidr)
         try:
             net = ipaddress.ip_network(cidr, strict=False)
             if net not in self.networks:

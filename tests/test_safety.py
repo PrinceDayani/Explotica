@@ -53,6 +53,16 @@ class TestScope:
         s = Scope.from_target("fe80::/10")
         assert s.permits("fe80::1%eth0")  # link-local with zone id
 
+    def test_scoped_ipv6_target_builds_nonempty_scope(self):
+        # A zone-scoped host target must produce a real /128 scope, not an
+        # empty one (which would permit everything).
+        s = Scope.from_target("fe80::1%eth0")
+        assert s.networks  # not empty
+        assert s.permits("fe80::1%eth0")
+        assert s.permits("fe80::1")
+        assert not s.permits("8.8.8.8")
+        assert not s.permits("fe80::2")
+
     def test_mixed_v4_v6_scope(self):
         s = Scope.from_target("192.168.1.0/24,2001:db8::/32")
         assert s.permits("192.168.1.9")
