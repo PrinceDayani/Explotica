@@ -27,6 +27,11 @@ Security model:
   - Residual risk: another local user on the same host can read the page and
     the token. Do not run the launcher on a shared/multi-user host; use
     --no-launch there.
+  - Remote binds (non-loopback, via --allow-remote) require HTTP Basic auth on
+    every route, page included, with the password set in
+    EXPLOTICA_DASHBOARD_TOKEN. The launcher refuses to start a remote bind
+    without it. This is real authentication for off-box access, not the
+    page-embedded launch token (which only gates the local same-origin flow).
 
 Run:
   python -m explotica.output.dashboard               # empty, launch from UI
@@ -36,8 +41,11 @@ Run:
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+import os
 import re
 import secrets
 import subprocess
@@ -813,12 +821,18 @@ async function pollJobs() {
 
 # ── server ───────────────────────────────────────────────────────────────
 def build_app(state: dict, mgr: "ScanJobManager", *, host: str = "127.0.0.1",
-              allow_launch: bool = True):
+              allow_launch: bool = True, auth_token: Optional[str] = None):
     """Build the FastAPI app and its per-process launch token.
 
     Separated from serve() so tests can exercise the endpoints (token check,
-    DNS-rebinding guard, viewer mode) without starting a real server.
-    Requires fastapi_available().
+    DNS-rebinding guard, viewer mode, remote auth) without starting a real
+    server. Requires fastapi_available().
+
+    auth_token: when set (used for non-loopback/remote binds), every request —
+    the page itself and all API routes — must carry HTTP Basic credentials
+    whose password equals this token. This is real authentication for remote
+    access, unlike the page-embedded launch token which only gates the local
+    same-origin flow.
 
     Returns (app, launch_token).
     """
@@ -839,6 +853,18 @@ def build_app(state: dict, mgr: "ScanJobManager", *, host: str = "127.0.0.1",
     # Host header is a loopback name. A rebinding page sends its own hostname.
     allowed_host_names = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
+    def _basic_ok(request) -> bool:
+        authz = request.headers.get("authorization", "")
+        if not authz.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(authz[6:], validate=True).decode(
+                "utf-8", "replace")
+        except (binascii.Error, ValueError):
+            return False
+        _user, _sep, password = decoded.partition(":")
+        return secrets.compare_digest(password, auth_token or "")
+
     @app.middleware("http")
     async def _guard(request: Request, call_next):
         if loopback:
@@ -849,6 +875,13 @@ def build_app(state: dict, mgr: "ScanJobManager", *, host: str = "127.0.0.1",
                     {"detail": "Host header not allowed (DNS-rebinding guard)."},
                     status_code=421,
                 )
+        # Remote binds require HTTP Basic auth on every route (page + API).
+        if auth_token and not _basic_ok(request):
+            return JSONResponse(
+                {"detail": "Authentication required."},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="Explotica"'},
+            )
         return await call_next(request)
 
     @app.get("/", response_class=HTMLResponse)
@@ -942,8 +975,14 @@ def serve(json_path: Optional[str] = None, *, host: str = "127.0.0.1",
                     if allow_launch else None,
     )
 
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    # Remote binds require a shared secret in EXPLOTICA_DASHBOARD_TOKEN, used
+    # as the HTTP Basic password for every route. main() refuses to start a
+    # remote bind without it, so by the time we get here it is present.
+    auth_token = None if loopback else os.environ.get("EXPLOTICA_DASHBOARD_TOKEN")
+
     app, _launch_token = build_app(
-        state, mgr, host=host, allow_launch=allow_launch
+        state, mgr, host=host, allow_launch=allow_launch, auth_token=auth_token
     )
 
     print(f"[*] Serving Explotica dashboard at http://{host}:{port}")
@@ -952,11 +991,9 @@ def serve(json_path: Optional[str] = None, *, host: str = "127.0.0.1",
     if allow_launch:
         print(f"[*] Scan launching ENABLED — open the page and click '＋ New scan'")
         print(f"[*] Launch requires a per-session token embedded in the page.")
-    if host not in ("127.0.0.1", "localhost", "::1") and allow_launch:
-        print("[!] WARNING: bound to a non-loopback address with scan launching")
-        print("[!]          enabled. Anyone who can reach this port can start")
-        print("[!]          active scans. Use --no-launch for a read-only viewer.")
-    print(f"[*] Press Ctrl+C to stop")
+    if not loopback:
+        print("[*] Remote bind: HTTP Basic auth required on every route "
+              "(password = EXPLOTICA_DASHBOARD_TOKEN; any username).")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
@@ -980,11 +1017,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="Read-only viewer: disable the scan-launch endpoints.")
     args = p.parse_args(argv)
 
-    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.allow_remote:
+    remote = args.host not in ("127.0.0.1", "localhost", "::1")
+    if remote and not args.allow_remote:
         print(f"[!] Refusing to bind to non-loopback host '{args.host}' without "
               f"--allow-remote.")
         print("[!] The dashboard can launch active scans; exposing it off-box is")
         print("[!] dangerous. Re-run with --allow-remote (and ideally --no-launch).")
+        return 2
+
+    if remote and not os.environ.get("EXPLOTICA_DASHBOARD_TOKEN"):
+        print("[!] Refusing to bind to a non-loopback host without "
+              "EXPLOTICA_DASHBOARD_TOKEN set.")
+        print("[!] Remote access requires HTTP Basic auth; set a strong shared")
+        print("[!] secret, e.g.:  EXPLOTICA_DASHBOARD_TOKEN=$(openssl rand -hex 24)")
         return 2
 
     serve(args.scan_json, host=args.host, port=args.port,

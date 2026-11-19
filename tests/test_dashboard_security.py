@@ -92,6 +92,40 @@ def test_loopback_host_header_allowed():
     assert r.status_code == 200
 
 
+def _remote_client(auth_token="s3cret"):
+    state = {"scan_path": None}
+    app, _tok = dashboard.build_app(
+        state, _OkMgr(), host="0.0.0.0", allow_launch=True, auth_token=auth_token
+    )
+    # Remote bind: no loopback Host guard, so any Host is fine; auth is Basic.
+    return TestClient(app, base_url="http://example.com")
+
+
+def test_remote_requires_basic_auth():
+    client = _remote_client()
+    r = client.get("/api/health")
+    assert r.status_code == 401
+    assert r.headers.get("www-authenticate", "").startswith("Basic")
+
+
+def test_remote_accepts_correct_basic_auth():
+    client = _remote_client(auth_token="s3cret")
+    r = client.get("/api/health", auth=("admin", "s3cret"))
+    assert r.status_code == 200
+
+
+def test_remote_rejects_wrong_basic_auth():
+    client = _remote_client(auth_token="s3cret")
+    r = client.get("/api/health", auth=("admin", "wrong"))
+    assert r.status_code == 401
+
+
+def test_remote_page_also_requires_auth():
+    client = _remote_client(auth_token="s3cret")
+    assert client.get("/").status_code == 401
+    assert client.get("/", auth=("x", "s3cret")).status_code == 200
+
+
 def test_viewer_mode_disables_launch():
     client, _token = _client(allow_launch=False)
     r = client.post(
