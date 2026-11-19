@@ -20,8 +20,10 @@ This module:
   - walk(): proper RFC-1157 iterative GetNextRequest until end-of-MIB
   - bulk_walk(): RFC-3416 GetBulkRequest for v2c (fewer round-trips)
 
-Limited to v1/v2c. SNMPv3 needs USM/auth/priv which is a much bigger
-implementation — kept in snmp_inventory.py via the binary fallback for now.
+Limited to v1/v2c. SNMPv3 USM key derivation (RFC 3414 password-to-key +
+localization and HMAC auth params) now lives in snmpv3_usm.py, verified
+against the RFC test vectors; the full v3 message exchange against a live
+agent still uses snmp_inventory.py's binary fallback.
 """
 
 from __future__ import annotations
