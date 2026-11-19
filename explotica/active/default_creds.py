@@ -116,29 +116,53 @@ def check_http_basic(host: str, port: int, *, tls: bool = False,
 
 # ── MySQL ─────────────────────────────────────────────────────────────────
 def check_mysql_empty_root(host: str, port: int = 3306,
-                           timeout: float = 4.0) -> Optional[dict]:
-    """Read MySQL handshake; if it allows empty-password root auth, flag it.
+                           timeout: float = 4.0,
+                           users=("root", "mysql")) -> Optional[dict]:
+    """Actively test empty-password login for common MySQL accounts.
 
-    Note: a true auth test requires sending a Login Request packet with
-    proper Caching SHA2 / Native Password handshake. This is a *passive*
-    check — we only verify the server is reachable and identify version.
-    A future enhancement would attempt the actual auth.
+    Uses the native mysql_protocol client to complete a real
+    HandshakeResponse41 (mysql_native_password / caching_sha2_password, incl.
+    plugin-switch) and reads the server's OK/ERR. A returned OK means the
+    account authenticates with an empty password — a real, confirmed finding,
+    not a guess. ERR 1045 (access-denied) means not vulnerable.
     """
+    from ..protocols.mysql_protocol import MySQLConnection
+
+    conn = MySQLConnection(host, port, timeout=timeout)
+    if not conn.connect():
+        return None  # not reachable / not MySQL
+    server_version = (conn.handshake or {}).get("server_version", "")
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        data = sock.recv(1024)
-        sock.close()
-    except (socket.timeout, OSError):
-        return None
-    if not data or b"\x00" not in data[5:]:
-        return None
-    # Just flag MySQL is reachable without auth at the network layer
-    # (proper default cred check would need full mysql-protocol implementation)
+        for user in users:
+            # Re-handshake per attempt: a failed login closes the auth state.
+            if not conn.handshake:
+                if not conn.connect():
+                    break
+            if conn.login(user, "", database=""):
+                return {
+                    "service": "mysql",
+                    "credentials": f"{user}:(empty)",
+                    "severity": "CRITICAL",
+                    "confirmed": True,
+                    "server_version": server_version,
+                    "note": f"MySQL account '{user}' authenticates with an "
+                            "empty password (confirmed login).",
+                }
+            # Reconnect for the next user (socket is now in a failed state).
+            conn.close()
+            conn = MySQLConnection(host, port, timeout=timeout)
+            if not conn.connect():
+                break
+    finally:
+        conn.close()
     return {
         "service": "mysql",
-        "credentials": "root:(unknown)",
+        "credentials": "root/mysql:(empty)",
         "severity": "INFO",
-        "note": "MySQL reachable; recommend `mysql -h <host> -u root` to test empty password",
+        "confirmed": False,
+        "server_version": server_version,
+        "note": "MySQL reachable; empty-password login for common accounts "
+                "was rejected.",
     }
 
 
