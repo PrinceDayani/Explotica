@@ -30,6 +30,12 @@ class TestCheckpoint:
         # every_n=5 + every_secs=60: first update writes (because
         # _last_write=0 makes elapsed huge), then writes every 5th update
         chk = Checkpoint(path, every_n_hosts=5, every_secs=60)
+        # Force the first update to write via the elapsed-time path
+        # deterministically. _last_write starts at 0.0, so the production
+        # check is time.monotonic() - 0.0; on a freshly-booted CI VM
+        # time.monotonic() can be < every_secs, which would throttle the first
+        # write and make this test flaky. Seed it clearly into the past.
+        chk._last_write = time.monotonic() - 3600
         chk.update({"hosts": ["a"]})           # count=1, writes via elapsed
         first_mtime = path.stat().st_mtime
         time.sleep(0.01)
