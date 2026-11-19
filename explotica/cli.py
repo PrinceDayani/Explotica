@@ -82,19 +82,51 @@ def _parse_winrm_creds(creds_str: str, transport: str = "ntlm") -> dict:
         user, password = creds_str, ""
     return {"username": user, "password": password, "transport": transport}
 
+# Literal emoji → ASCII, applied only when colour/emoji output is disabled so
+# piped, redirected, or non-UTF terminals get clean, screen-reader-friendly
+# text. Rich's emoji= flag only affects :shortcodes:, not literal glyphs.
+_EMOJI_ASCII = {
+    "🛰️": "", "🛰": "", "✅": "[OK]", "✔": "[OK]", "✓": "[OK]",
+    "⚠️": "[!]", "⚠": "[!]", "❌": "[X]", "✗": "[X]", "💥": "[!]",
+    "🔴": "[CRIT]", "🟢": "[OK]", "🟡": "[WARN]", "➜": "->", "＋": "+",
+    "🚀": "", "📊": "", "🔍": "", "🧠": "", "🔒": "", "🔑": "",
+}
+
+
+def _to_ascii(text: str) -> str:
+    for glyph, repl in _EMOJI_ASCII.items():
+        text = text.replace(glyph, repl)
+    return text
+
+
+class _Console(Console):
+    """Console that substitutes literal emoji for ASCII when ascii_only."""
+
+    def __init__(self, *args, ascii_only: bool = False, **kwargs):
+        self._ascii_only = ascii_only
+        super().__init__(*args, **kwargs)
+
+    def print(self, *objects, **kwargs):  # type: ignore[override]
+        if self._ascii_only:
+            objects = tuple(
+                _to_ascii(o) if isinstance(o, str) else o for o in objects
+            )
+        super().print(*objects, **kwargs)
+
+
 def _build_console(no_color: bool = False) -> Console:
     """Build the output Console, honouring colour-disable signals.
 
-    Colour is disabled when any of these hold:
+    Colour/emoji output is disabled when any of these hold:
       - ``--no-color`` was passed (``no_color=True``), or
       - the ``NO_COLOR`` environment variable is set (see https://no-color.org),
       - stdout is not a TTY (Rich detects this itself and strips ANSI).
 
-    Disabling colour also strips Rich markup/emoji styling from piped output,
-    so redirecting to a file or another process yields clean text.
+    Disabling also substitutes literal emoji for ASCII, so redirecting to a
+    file or another process yields clean, screen-reader-friendly text.
     """
     disable = no_color or bool(os.environ.get("NO_COLOR"))
-    return Console(no_color=disable, emoji=not disable)
+    return _Console(no_color=disable, emoji=not disable, ascii_only=disable)
 
 
 console = _build_console()
