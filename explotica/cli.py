@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from typing import Optional
 import sys
 from pathlib import Path
@@ -71,7 +72,22 @@ def _parse_winrm_creds(creds_str: str, transport: str = "ntlm") -> dict:
         user, password = creds_str, ""
     return {"username": user, "password": password, "transport": transport}
 
-console = Console()
+def _build_console(no_color: bool = False) -> Console:
+    """Build the output Console, honouring colour-disable signals.
+
+    Colour is disabled when any of these hold:
+      - ``--no-color`` was passed (``no_color=True``), or
+      - the ``NO_COLOR`` environment variable is set (see https://no-color.org),
+      - stdout is not a TTY (Rich detects this itself and strips ANSI).
+
+    Disabling colour also strips Rich markup/emoji styling from piped output,
+    so redirecting to a file or another process yields clean text.
+    """
+    disable = no_color or bool(os.environ.get("NO_COLOR"))
+    return Console(no_color=disable, emoji=not disable)
+
+
+console = _build_console()
 
 
 # ── Phase 61: helpers for new CLI options ──────────────────────────────
@@ -410,6 +426,23 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="explotica",
         description="Network discovery & reconnaissance — for authorized use only.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  explotica 192.168.1.0/24\n"
+            "      Discover hosts, scan ports, grab banners on a LAN.\n\n"
+            "  explotica scanme.example.com -Pn -p top1000 --vuln-scan\n"
+            "      Skip ping, scan the top 1000 ports, match CVEs.\n\n"
+            "  explotica 10.0.0.0/24 --full-coverage --json out.json -q\n"
+            "      Maximum coverage, write JSON, suppress the progress UI.\n\n"
+            "  explotica --full-coverage --explain\n"
+            "      Show exactly what --full-coverage enables, then exit.\n\n"
+            "  explotica 10.0.0.5 --no-color | tee scan.txt\n"
+            "      Clean, un-styled text suitable for piping or logging.\n\n"
+            "  explotica --interactive        # guided wizard\n"
+            "  explotica --shell              # persistent REPL\n"
+            "  explotica --platform-caps      # what works on this OS\n"
+        ),
     )
     p.add_argument("target", nargs="?",
                    help="CIDR ('192.168.1.0/24'), single IP, or hostname. "
@@ -696,6 +729,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--report-html", metavar="PATH",
                    help="Write a self-contained HTML report to PATH.")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="Suppress the progress spinner and lower logging to "
+                        "ERROR. Final results still print. Combine with --json "
+                        "for machine-readable output on stdout.")
+    p.add_argument("--no-color", dest="no_color", action="store_true",
+                   help="Disable ANSI colour and styled output (also honoured "
+                        "via the NO_COLOR env var; colour is auto-disabled when "
+                        "stdout is not a terminal).")
+    p.add_argument("--explain", action="store_true",
+                   help="Print the concrete set of checks a preset (e.g. "
+                        "--full-coverage) would enable, then exit without "
+                        "scanning.")
     p.add_argument("-i", "--interactive", action="store_true",
                    help="Interactive wizard mode — guided scan setup")
     p.add_argument("--shell", action="store_true",
@@ -735,6 +780,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="Checkpoint every N completed hosts (default: 10)")
     args = p.parse_args(argv)
 
+    # Reconfigure the global console for colour-disable signals (--no-color /
+    # NO_COLOR / non-TTY) so every subsequent print is affected, including the
+    # early-exit paths below.
+    if getattr(args, "no_color", False) or os.environ.get("NO_COLOR"):
+        global console
+        console = _build_console(no_color=True)
+
+    # Snapshot scan flags before preset expansion so --explain can diff them.
+    _flags_before = {k: v for k, v in vars(args).items()}
+
     # --shell launches the REPL
     # Phase 66: --platform-caps prints capability matrix and exits
     if getattr(args, "platform_caps", False):
@@ -750,6 +805,7 @@ def main(argv: list[str] | None = None) -> int:
     # main() with the wizard-built argv. The wizard returns the full arg list.
     if args.interactive or (not args.target and not args.from_json
                               and not args.auto and not args.list_network
+                              and not getattr(args, "explain", False)
                               and argv is None):
         from .ui.interactive import run_wizard
         wiz_args = run_wizard()
@@ -762,6 +818,7 @@ def main(argv: list[str] | None = None) -> int:
     from .safety_kit.logging_config import configure as configure_logging
     log_level = (args.log_level
                  or ("DEBUG" if args.verbose else None)
+                 or ("ERROR" if getattr(args, "quiet", False) else None)
                  or None)
     configure_logging(level=log_level, logfile=args.log_file,
                        format_kind="json" if args.log_json else "plain",
@@ -892,6 +949,31 @@ def main(argv: list[str] | None = None) -> int:
             f"--ports={args.ports}"
         )
 
+    # --explain: report the concrete checks the chosen preset enables, then
+    # exit without touching the network.
+    if getattr(args, "explain", False):
+        _scan_keys = {
+            "vuln_scan", "deep", "use_nmap", "use_searchsploit", "rich_intel",
+            "epss_kev", "unmask", "udp_probe", "udp_full", "udp_raw",
+            "web_crawl", "shodan", "ssh_enum", "dns_enum", "service_intel",
+            "http_audit", "osint", "netfabric", "async_io", "honeypot_check",
+            "web_security", "ics", "prioritize", "os_fp_db", "verify_cves",
+            "verify_cves_v2", "aggressive", "check_default_creds",
+            "check_takeover", "smtp_audit", "syn_scan",
+        }
+        enabled = sorted(
+            k for k in _scan_keys
+            if vars(args).get(k) and not _flags_before.get(k)
+        )
+        console.print("[bold]Preset would enable the following checks:[/bold]")
+        if enabled:
+            for k in enabled:
+                console.print(f"  --{k.replace('_', '-')}")
+        else:
+            console.print("  (none — no preset flag was given)")
+        console.print(f"[dim]ports = {args.ports}[/dim]")
+        return 0
+
     # --turbo > --ultra > --aggressive (each subsumes the previous)
     if args.turbo:
         args.ultra = True
@@ -953,6 +1035,7 @@ def main(argv: list[str] | None = None) -> int:
         TextColumn("{task.fields[detail]}"),
         console=console,
         transient=False,
+        disable=getattr(args, "quiet", False),
     )
     progress_task = progress_obj.add_task(
         "scanning", total=None, detail=""
