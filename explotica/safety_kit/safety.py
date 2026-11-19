@@ -23,6 +23,17 @@ log = logging.getLogger(__name__)
 
 
 # ── Scope enforcement ───────────────────────────────────────────────────
+def _strip_zone(target: str) -> str:
+    """Drop an IPv6 zone/scope id (``fe80::1%eth0`` → ``fe80::1``).
+
+    ``ipaddress`` does not accept a zone suffix, but scanners pass link-local
+    addresses with one. Non-IPv6 strings are returned unchanged.
+    """
+    if "%" in target and ":" in target:
+        return target.split("%", 1)[0]
+    return target
+
+
 class ScopeViolation(RuntimeError):
     """Raised when an in-flight probe targets something outside the declared
     scope. Don't swallow this — surface it to the user."""
@@ -35,7 +46,7 @@ class Scope:
     def __init__(self, *, networks: Optional[list[str]] = None,
                   domains: Optional[list[str]] = None,
                   strict: bool = True):
-        self.networks: list[ipaddress.IPv4Network] = []
+        self.networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
         self.domains: set[str] = set()
         self.strict = strict
         self.violations: list[dict] = []
@@ -48,9 +59,11 @@ class Scope:
     def from_target(cls, target: str, strict: bool = True) -> "Scope":
         """Build a scope from a single --target argument.
 
-        Accepts:
+        Accepts IPv4 and IPv6:
           - "192.168.1.0/24"     → adds the /24 network
           - "192.168.1.5"        → adds /32 host
+          - "2001:db8::/32"      → adds the IPv6 /32 network
+          - "::1"                → adds /128 host
           - "example.com"        → adds the bare domain + *.example.com
           - "auto"               → empty scope; caller adds discovered subnets
           - comma-separated mix  → multiple
@@ -60,22 +73,23 @@ class Scope:
             piece = piece.strip()
             if not piece or piece == "auto":
                 continue
+            if "/" in piece:
+                s.add_network(piece)
+                continue
             try:
-                if "/" in piece:
-                    s.add_network(piece)
-                else:
-                    ipaddress.IPv4Address(piece)
-                    s.add_network(piece + "/32")
-            except (ValueError, ipaddress.AddressValueError):
+                # A bare host (v4 or v6); ip_network turns it into /32 or /128.
+                ipaddress.ip_address(piece)
+                s.add_network(piece)
+            except ValueError:
                 s.add_domain(piece)
         return s
 
     def add_network(self, cidr: str) -> None:
         try:
-            net = ipaddress.IPv4Network(cidr, strict=False)
+            net = ipaddress.ip_network(cidr, strict=False)
             if net not in self.networks:
                 self.networks.append(net)
-        except (ValueError, ipaddress.AddressValueError):
+        except ValueError:
             log.warning("invalid CIDR in scope: %s", cidr)
 
     def add_domain(self, domain: str) -> None:
@@ -88,11 +102,13 @@ class Scope:
         if not self.networks and not self.domains:
             return True
         try:
-            addr = ipaddress.IPv4Address(target)
+            addr = ipaddress.ip_address(_strip_zone(target))
             for net in self.networks:
-                if addr in net:
+                # Membership across address families raises; compare only
+                # same-version network/address pairs.
+                if addr.version == net.version and addr in net:
                     return True
-        except (ValueError, ipaddress.AddressValueError):
+        except ValueError:
             t = target.lower().lstrip(".")
             if t in self.domains:
                 return True

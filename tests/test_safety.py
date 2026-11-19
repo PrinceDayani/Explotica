@@ -37,6 +37,29 @@ class TestScope:
         assert s.permits("10.5.5.5")
         assert not s.permits("172.16.0.1")
 
+    def test_ipv6_host_scope(self):
+        s = Scope.from_target("2001:db8::1")
+        assert s.permits("2001:db8::1")
+        assert not s.permits("2001:db8::2")
+        assert not s.permits("192.168.1.1")  # different family, not in scope
+
+    def test_ipv6_network_scope(self):
+        s = Scope.from_target("2001:db8::/32")
+        assert s.permits("2001:db8::dead:beef")
+        assert s.permits("2001:db8:1234::1")
+        assert not s.permits("2001:db9::1")
+
+    def test_ipv6_zone_id_stripped(self):
+        s = Scope.from_target("fe80::/10")
+        assert s.permits("fe80::1%eth0")  # link-local with zone id
+
+    def test_mixed_v4_v6_scope(self):
+        s = Scope.from_target("192.168.1.0/24,2001:db8::/32")
+        assert s.permits("192.168.1.9")
+        assert s.permits("2001:db8::5")
+        assert not s.permits("10.0.0.1")
+        assert not s.permits("2001:db9::1")
+
     def test_domain_scope_exact(self):
         s = Scope.from_target("example.com")
         assert s.permits("example.com")
