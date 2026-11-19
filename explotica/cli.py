@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -20,11 +21,25 @@ from rich.text import Text
 
 from . import __version__
 from .core.models import ScanResult
-from .core.secret_input import resolve_secret
+from .core.secret_input import resolve_secret, SecretResolutionError
 from .discovery.ports import TOP_100_PORTS
 from .scanner import run_scan
 
 log = logging.getLogger(__name__)
+
+
+def _ip_sort_key(ip: str) -> tuple:
+    """Sort key that handles IPv4 and IPv6 (and junk) without raising.
+
+    Sorts by address family first, then numeric address within a family;
+    unparseable values sort last. Prevents an IPv6 host from crashing the
+    final render (which previously int()-split on '.').
+    """
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+        return (addr.version, int(addr))
+    except (ValueError, AttributeError):
+        return (9, 0)
 
 
 def _parse_ssh_creds(creds_str: str, key_filename: str = None) -> dict:
@@ -125,7 +140,8 @@ def _build_console(no_color: bool = False) -> Console:
     Disabling also substitutes literal emoji for ASCII, so redirecting to a
     file or another process yields clean, screen-reader-friendly text.
     """
-    disable = no_color or bool(os.environ.get("NO_COLOR"))
+    not_a_tty = not getattr(sys.stdout, "isatty", lambda: False)()
+    disable = no_color or bool(os.environ.get("NO_COLOR")) or not_a_tty
     return _Console(no_color=disable, emoji=not disable, ascii_only=disable)
 
 
@@ -215,7 +231,7 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
     if show_vulns:
         table.add_column("Vulns (top CVEs)", overflow="fold")
 
-    for host in sorted(result.hosts, key=lambda h: tuple(int(o) for o in h.ip.split("."))):
+    for host in sorted(result.hosts, key=lambda h: _ip_sort_key(h.ip)):
         ports_cell = Text()
         vulns_cell = Text()
         # Phase 56: rendered table shows only open ports by default to avoid
@@ -1022,6 +1038,8 @@ def main(argv: list[str] | None = None) -> int:
                 console.print(f"  --{k.replace('_', '-')}")
         else:
             console.print("  (none — no preset flag was given)")
+        if getattr(args, "compliance", None) and not _flags_before.get("compliance"):
+            console.print(f"  --compliance {args.compliance}")
         console.print(f"[dim]ports = {args.ports}[/dim]")
         return 0
 
@@ -1361,6 +1379,9 @@ def main(argv: list[str] | None = None) -> int:
                 checkpoint_every_n=args.checkpoint_every,
                 progress=progress,
             )
+        except SecretResolutionError as e:
+            console.print(f"[red]Credential error:[/red] {e}")
+            return 2
         except NotImplementedError as e:
             console.print(f"[yellow]Orchestrator not implemented yet:[/yellow] {e}")
             return 3
@@ -1637,6 +1658,27 @@ def main(argv: list[str] | None = None) -> int:
                     f"{tp[0]['cve_id']} on {tp[0]['host_ip']} "
                     f"(score {tp[0]['score']:.0f}/100, {tp[0]['bucket']})"
                 )
+
+    # Reject colliding output paths so one artifact can't silently overwrite
+    # another (e.g. --report-csv X --report-sarif X).
+    _out_specs = [
+        ("--json", getattr(args, "json", None)),
+        ("--report-html", getattr(args, "report_html", None)),
+        ("--report-csv", getattr(args, "report_csv", None)),
+        ("--report-sarif", getattr(args, "report_sarif", None)),
+    ]
+    _seen: dict[str, str] = {}
+    for _flag, _p in _out_specs:
+        if not _p:
+            continue
+        _key = str(Path(_p).resolve())
+        if _key in _seen:
+            console.print(
+                f"[red]Output path collision:[/red] {_flag} and {_seen[_key]} "
+                f"both write to {_p}. Use distinct paths."
+            )
+            return 2
+        _seen[_key] = _flag
 
     if args.json:
         out = Path(args.json)

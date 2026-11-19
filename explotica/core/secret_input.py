@@ -45,9 +45,14 @@ def resolve_secret(value: str | None) -> str | None:
         path = value[len("file:"):]
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                return fh.read().rstrip("\n")
+                content = fh.read().rstrip("\n")
         except OSError as exc:
             raise SecretResolutionError(
                 f"could not read secret file {path!r}: {exc}"
             ) from exc
+        if not content:
+            raise SecretResolutionError(
+                f"secret file {path!r} is empty"
+            )
+        return content
     return value

@@ -385,7 +385,7 @@ aside {
     <button class="btn" id="new-scan">＋ New scan</button>
   </div>
 </header>
-<div id="graph" role="img" aria-label="Network scan graph. A text summary is provided below.">
+<div id="graph" role="region" aria-label="Network scan graph. A text summary is provided below.">
   <div id="empty">
     <div style="font-size:42px" aria-hidden="true">🛰️</div>
     <div>No scan loaded yet.</div>

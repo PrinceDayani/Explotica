@@ -37,6 +37,27 @@ def _client(allow_launch=True):
     return TestClient(app, base_url="http://127.0.0.1"), token
 
 
+class _OkMgr(_DummyMgr):
+    """Manager whose start() succeeds, to prove a valid token launches."""
+    def start(self, target, profile, aggressive):
+        return {"id": "job-1", "target": target, "status": "running"}
+
+
+def test_launch_accepted_with_valid_token():
+    state = {"scan_path": None}
+    app, token = dashboard.build_app(
+        state, _OkMgr(), host="127.0.0.1", allow_launch=True
+    )
+    client = TestClient(app, base_url="http://127.0.0.1")
+    r = client.post(
+        "/api/scan",
+        json={"target": "10.0.0.1", "profile": "quick"},
+        headers={"X-Explotica-Token": token},
+    )
+    assert r.status_code == 200
+    assert r.json()["job_id"] == "job-1"
+
+
 def test_launch_rejected_without_token():
     client, _token = _client()
     r = client.post("/api/scan", json={"target": "10.0.0.1", "profile": "quick"})

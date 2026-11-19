@@ -35,6 +35,13 @@ def test_file_missing_raises(tmp_path):
         resolve_secret(f"file:{tmp_path / 'nope.txt'}")
 
 
+def test_empty_file_raises(tmp_path):
+    p = tmp_path / "empty.txt"
+    p.write_text("\n", encoding="utf-8")  # only a newline
+    with pytest.raises(SecretResolutionError):
+        resolve_secret(f"file:{p}")
+
+
 def test_ssh_parser_resolves_env(monkeypatch):
     monkeypatch.setenv("EXPLOTICA_SSH", "root:toor")
     creds = cli._parse_ssh_creds("env:EXPLOTICA_SSH")

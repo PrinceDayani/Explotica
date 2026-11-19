@@ -32,7 +32,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest
+          # fastapi + httpx so the dashboard security tests actually run in
+          # the blocking gate rather than being skipped by importorskip.
+          pip install pytest "fastapi<1" httpx
       - name: Run test suite
         # Blocking gate. Deselect tests that require IPv6 loopback, which
         # GitHub-hosted runners do not provide.
