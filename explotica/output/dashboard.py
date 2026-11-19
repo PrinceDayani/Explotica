@@ -18,6 +18,15 @@ Security model:
     are spawned with a list argv (no shell), so there is no shell injection.
   - Binds 127.0.0.1 by default. Because the control panel can launch active
     scans, binding to a non-loopback address is gated behind --allow-remote.
+  - The launch endpoint (POST /api/scan) requires a per-process capability
+    token that is embedded in the served page. Same-origin policy prevents a
+    foreign web page from reading it, so only the local user who opened the
+    dashboard can start scans.
+  - When bound to loopback, a Host-header allowlist rejects DNS-rebinding
+    requests (which arrive with a non-loopback Host header).
+  - Residual risk: another local user on the same host can read the page and
+    the token. Do not run the launcher on a shared/multi-user host; use
+    --no-launch there.
 
 Run:
   python -m explotica.output.dashboard               # empty, launch from UI
@@ -30,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -235,11 +245,22 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https://unpkg.com; img-src 'self' data:;">
 <title>Explotica Dashboard</title>
+<script>window.EXPLOTICA_TOKEN = "__EXPLOTICA_TOKEN__";</script>
 <script src="https://unpkg.com/cytoscape@3.28/dist/cytoscape.min.js"></script>
 <style>
-:root { color-scheme: dark; }
+:root { color-scheme: dark light; }
+/* Screen-reader-only utility: present in the DOM, hidden visually. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+:focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
 * { box-sizing: border-box; }
 body {
   font-family: -apple-system, "Segoe UI", "Helvetica Neue", sans-serif;
@@ -364,16 +385,17 @@ aside {
     <button class="btn" id="new-scan">＋ New scan</button>
   </div>
 </header>
-<div id="graph">
+<div id="graph" role="img" aria-label="Network scan graph. A text summary is provided below.">
   <div id="empty">
-    <div style="font-size:42px">🛰️</div>
+    <div style="font-size:42px" aria-hidden="true">🛰️</div>
     <div>No scan loaded yet.</div>
     <button class="btn" id="empty-launch">Launch a scan</button>
   </div>
 </div>
+<div id="a11y-summary" class="sr-only" aria-live="polite" role="status"></div>
 <aside>
   <div id="jobs"></div>
-  <input class="search" placeholder="Filter host or CVE…" id="search">
+  <input class="search" placeholder="Filter host or CVE…" aria-label="Filter hosts or CVEs" id="search">
   <div class="stat-row" id="stats"></div>
   <div class="legend">
     <span class="dot" style="background:#ff3b30"></span> Critical &nbsp;
@@ -478,6 +500,14 @@ function renderStats(scan) {
         if (c.in_kev) counts.kev++;
       }
     }
+  }
+  const a11y = document.getElementById('a11y-summary');
+  if (a11y) {
+    a11y.textContent =
+      `Scan of ${scan.target || 'target'}: ${scan.hosts.length} hosts, ` +
+      `${openPorts} open ports, ${counts.critical} critical, ${counts.high} high, ` +
+      `${counts.medium} medium, ${counts.kev} known-exploited (KEV), ` +
+      `${exploits} exploits.`;
   }
   const stats = [
     [scan.hosts.length, 'Hosts', ''],
@@ -704,7 +734,11 @@ async function launch() {
   btn.disabled = true;
   try {
     const r = await fetch('/api/scan', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Explotica-Token': window.EXPLOTICA_TOKEN,
+      },
       body: JSON.stringify({target, profile: SEL_PROFILE, aggressive}),
     });
     const data = await r.json().catch(() => ({}));
@@ -778,41 +812,48 @@ async function pollJobs() {
 
 
 # ── server ───────────────────────────────────────────────────────────────
-def serve(json_path: Optional[str] = None, *, host: str = "127.0.0.1",
-          port: int = 8765, allow_launch: bool = True) -> None:
-    """Launch the dashboard server.
+def build_app(state: dict, mgr: "ScanJobManager", *, host: str = "127.0.0.1",
+              allow_launch: bool = True):
+    """Build the FastAPI app and its per-process launch token.
 
-    json_path: optional initial scan to display. If None, the dashboard
-               starts empty and you launch scans from the UI.
-    allow_launch: if False, the scan-launch endpoints are disabled (viewer
-                  only).
+    Separated from serve() so tests can exercise the endpoints (token check,
+    DNS-rebinding guard, viewer mode) without starting a real server.
+    Requires fastapi_available().
+
+    Returns (app, launch_token).
     """
-    if not fastapi_available():
-        print("[!] fastapi + uvicorn required for dashboard.")
-        print("    Install: pip install fastapi uvicorn[standard]")
-        sys.exit(1)
-
-    from fastapi import FastAPI, HTTPException, Body
+    from fastapi import FastAPI, HTTPException, Body, Header, Request
     from fastapi.responses import HTMLResponse, JSONResponse
-    import uvicorn
 
     app = FastAPI(title="Explotica Dashboard", version="0.2.0")
 
-    # Mutable holder for the "current" scan path the graph view reads.
-    state: dict[str, Optional[Path]] = {
-        "scan_path": Path(json_path) if json_path else None
-    }
+    # Per-process capability token. The page (served same-origin) carries it;
+    # the launch endpoint requires it. The same-origin policy stops an
+    # arbitrary web page from reading it, so only the local user who opened the
+    # dashboard can start scans — closing the unauthenticated-launch gap.
+    launch_token = secrets.token_urlsafe(32)
+    html_page = DASHBOARD_HTML.replace("__EXPLOTICA_TOKEN__", launch_token)
 
-    out_dir = Path(tempfile.gettempdir()) / "explotica_dashboard"
-    mgr = ScanJobManager(
-        out_dir,
-        on_complete=(lambda p: state.__setitem__("scan_path", p))
-                    if allow_launch else None,
-    )
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    # DNS-rebinding guard: when bound to loopback, only accept requests whose
+    # Host header is a loopback name. A rebinding page sends its own hostname.
+    allowed_host_names = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+    @app.middleware("http")
+    async def _guard(request: Request, call_next):
+        if loopback:
+            host_hdr = (request.headers.get("host") or "").rsplit(":", 1)[0]
+            host_hdr = host_hdr.strip("[]").lower()
+            if host_hdr and host_hdr not in allowed_host_names:
+                return JSONResponse(
+                    {"detail": "Host header not allowed (DNS-rebinding guard)."},
+                    status_code=421,
+                )
+        return await call_next(request)
 
     @app.get("/", response_class=HTMLResponse)
     def root():
-        return DASHBOARD_HTML
+        return html_page
 
     @app.get("/api/scan")
     def get_scan():
@@ -843,7 +884,10 @@ def serve(json_path: Optional[str] = None, *, host: str = "127.0.0.1",
 
     if allow_launch:
         @app.post("/api/scan")
-        def start_scan(req: dict = Body(...)):
+        def start_scan(req: dict = Body(...),
+                       x_explotica_token: str = Header(default="")):
+            if not secrets.compare_digest(x_explotica_token, launch_token):
+                raise HTTPException(403, "Missing or invalid launch token.")
             target = str(req.get("target") or "").strip()
             profile = str(req.get("profile") or "quick").strip()
             aggressive = bool(req.get("aggressive"))
@@ -867,11 +911,47 @@ def serve(json_path: Optional[str] = None, *, host: str = "127.0.0.1",
                 "launch_enabled": allow_launch,
                 "active_jobs": mgr.active_count()}
 
+    return app, launch_token
+
+
+def serve(json_path: Optional[str] = None, *, host: str = "127.0.0.1",
+          port: int = 8765, allow_launch: bool = True) -> None:
+    """Launch the dashboard server.
+
+    json_path: optional initial scan to display. If None, the dashboard
+               starts empty and you launch scans from the UI.
+    allow_launch: if False, the scan-launch endpoints are disabled (viewer
+                  only).
+    """
+    if not fastapi_available():
+        print("[!] fastapi + uvicorn required for dashboard.")
+        print("    Install: pip install fastapi uvicorn[standard]")
+        sys.exit(1)
+
+    import uvicorn
+
+    # Mutable holder for the "current" scan path the graph view reads.
+    state: dict[str, Optional[Path]] = {
+        "scan_path": Path(json_path) if json_path else None
+    }
+
+    out_dir = Path(tempfile.gettempdir()) / "explotica_dashboard"
+    mgr = ScanJobManager(
+        out_dir,
+        on_complete=(lambda p: state.__setitem__("scan_path", p))
+                    if allow_launch else None,
+    )
+
+    app, _launch_token = build_app(
+        state, mgr, host=host, allow_launch=allow_launch
+    )
+
     print(f"[*] Serving Explotica dashboard at http://{host}:{port}")
     if json_path:
         print(f"[*] Loading scan from: {json_path}")
     if allow_launch:
         print(f"[*] Scan launching ENABLED — open the page and click '＋ New scan'")
+        print(f"[*] Launch requires a per-session token embedded in the page.")
     if host not in ("127.0.0.1", "localhost", "::1") and allow_launch:
         print("[!] WARNING: bound to a non-loopback address with scan launching")
         print("[!]          enabled. Anyone who can reach this port can start")
