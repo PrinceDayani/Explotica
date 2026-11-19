@@ -42,9 +42,9 @@ jobs:
     name: lint + types (reporting)
     runs-on: ubuntu-latest
     # Non-blocking: the codebase predates enforced lint/type checking.
-    # Findings are surfaced in the log; cleanup is tracked separately so a
-    # red lint run never blocks a correct change.
-    continue-on-error: true
+    # The individual tool steps are continue-on-error so their findings are
+    # surfaced as annotations while the job itself reports success — a red
+    # lint run never blocks a correct change. Cleanup is tracked separately.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -57,6 +57,8 @@ jobs:
           pip install -e .
           pip install ruff mypy
       - name: ruff
+        continue-on-error: true
         run: ruff check . --output-format=github
       - name: mypy
-        run: mypy explotica || true
+        continue-on-error: true
+        run: mypy explotica
