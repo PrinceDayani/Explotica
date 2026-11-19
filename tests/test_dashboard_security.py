@@ -39,7 +39,7 @@ def _client(allow_launch=True):
 
 class _OkMgr(_DummyMgr):
     """Manager whose start() succeeds, to prove a valid token launches."""
-    def start(self, target, profile, aggressive):
+    def start(self, target, profile, aggressive, idempotency_key=None):
         return {"id": "job-1", "target": target, "status": "running"}
 
 

@@ -266,7 +266,12 @@ def _lock_down(p: Path) -> bool:
                         "be readable by other accounts", p)
             return False
         try:
-            # /inheritance:r removes inherited ACEs; /grant gives only this user.
+            # /reset first clears any pre-existing explicit ACEs (e.g. grants
+            # to other accounts on an overwritten file); /inheritance:r then
+            # removes inherited ACEs; /grant:r leaves only this user. Without
+            # the reset, explicit grants to other principals would survive.
+            subprocess.run(["icacls", str(p), "/reset"],
+                           check=True, capture_output=True)
             subprocess.run(
                 ["icacls", str(p), "/inheritance:r",
                  "/grant:r", f"{user}:F"],

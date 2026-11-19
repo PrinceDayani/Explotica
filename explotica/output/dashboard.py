@@ -136,9 +136,28 @@ class ScanJobManager:
         self._jobs: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._seq = 0
+        self._published_seq = 0          # highest job seq published as live
+        self._idem: dict[str, str] = {}  # idempotency-key -> job_id
         self._out_dir = out_dir
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._on_complete = on_complete
+
+    def _active_locked(self) -> int:
+        """Active-job count. Caller must hold self._lock."""
+        return sum(1 for j in self._jobs.values()
+                   if j["state"] in ("queued", "running"))
+
+    def _mark_published(self, seq: int) -> bool:
+        """Return True and record seq if it is newer than the last published.
+
+        Serializes the 'is this result the newest?' decision so an older scan
+        finishing late does not replace a newer one.
+        """
+        with self._lock:
+            if seq > self._published_seq:
+                self._published_seq = seq
+                return True
+            return False
 
     def _public(self, job: dict[str, Any]) -> dict[str, Any]:
         """A browser-safe view of a job (no absolute filesystem paths)."""
@@ -158,8 +177,7 @@ class ScanJobManager:
 
     def active_count(self) -> int:
         with self._lock:
-            return sum(1 for j in self._jobs.values()
-                       if j["state"] in ("queued", "running"))
+            return self._active_locked()
 
     def list_jobs(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -172,17 +190,27 @@ class ScanJobManager:
             job = self._jobs.get(job_id)
             return self._public(job) if job else None
 
-    def start(self, target: str, profile: str, aggressive: bool) -> dict[str, Any]:
+    def start(self, target: str, profile: str, aggressive: bool,
+              idempotency_key: Optional[str] = None) -> dict[str, Any]:
         err = validate_target(target)
         if err:
             raise ValueError(err)
         if profile not in PROFILES:
             raise ValueError(f"unknown profile '{profile}'")
-        if self.active_count() >= _MAX_ACTIVE_JOBS:
-            raise RuntimeError(
-                f"too many scans running (max {_MAX_ACTIVE_JOBS}); wait for one to finish")
 
+        # The limit check and the insert happen under one lock so two
+        # concurrent launches can't both pass the check and exceed the cap.
+        # An idempotency key makes a retried request return the original job
+        # instead of starting a second scan.
         with self._lock:
+            if idempotency_key and idempotency_key in self._idem:
+                existing = self._jobs.get(self._idem[idempotency_key])
+                if existing:
+                    return self._public(existing)
+            if self._active_locked() >= _MAX_ACTIVE_JOBS:
+                raise RuntimeError(
+                    f"too many scans running (max {_MAX_ACTIVE_JOBS}); "
+                    "wait for one to finish")
             self._seq += 1
             seq = self._seq
             job_id = f"job-{seq}"
@@ -194,6 +222,8 @@ class ScanJobManager:
                 "error": None, "tail": "", "out": str(out_path),
             }
             self._jobs[job_id] = job
+            if idempotency_key:
+                self._idem[idempotency_key] = job_id
 
         t = threading.Thread(target=self._run, args=(job_id,), daemon=True)
         t.start()
@@ -231,7 +261,9 @@ class ScanJobManager:
                     job["state"] = "failed"
                     job["error"] = (errtxt.strip().splitlines() or
                                     ["scan failed (no output)"])[-1][:300]
-            if ok and self._on_complete:
+            # Only publish if this scan is at least as new as the one currently
+            # shown, so a slow older scan can't overwrite a newer finished result.
+            if ok and self._mark_published(job["seq"]) and self._on_complete:
                 self._on_complete(Path(job["out"]))
         except subprocess.TimeoutExpired:
             with self._lock:
@@ -918,14 +950,16 @@ def build_app(state: dict, mgr: "ScanJobManager", *, host: str = "127.0.0.1",
     if allow_launch:
         @app.post("/api/scan")
         def start_scan(req: dict = Body(...),
-                       x_explotica_token: str = Header(default="")):
+                       x_explotica_token: str = Header(default=""),
+                       idempotency_key: str = Header(default="")):
             if not secrets.compare_digest(x_explotica_token, launch_token):
                 raise HTTPException(403, "Missing or invalid launch token.")
             target = str(req.get("target") or "").strip()
             profile = str(req.get("profile") or "quick").strip()
             aggressive = bool(req.get("aggressive"))
             try:
-                job = mgr.start(target, profile, aggressive)
+                job = mgr.start(target, profile, aggressive,
+                                idempotency_key=idempotency_key or None)
             except ValueError as e:
                 raise HTTPException(400, str(e))
             except RuntimeError as e:
