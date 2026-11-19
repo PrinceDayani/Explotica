@@ -741,6 +741,12 @@ def main(argv: list[str] | None = None) -> int:
                         "(optionally) re-run --vuln-scan / --use-nmap on it.")
     p.add_argument("--report-html", metavar="PATH",
                    help="Write a self-contained HTML report to PATH.")
+    p.add_argument("--report-csv", metavar="PATH",
+                   help="Write a flat CSV (one row per port/CVE) to PATH "
+                        "for spreadsheets and pipelines.")
+    p.add_argument("--report-sarif", metavar="PATH",
+                   help="Write a SARIF 2.1.0 log to PATH (e.g. for GitHub "
+                        "code scanning / SARIF viewers).")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="Suppress the progress spinner and lower logging to "
@@ -1610,6 +1616,16 @@ def main(argv: list[str] | None = None) -> int:
         from .output.report import write_report
         out = write_report(result, args.report_html)
         console.print(f"[green]✓[/green] HTML report at [cyan]{out}[/cyan]")
+
+    if getattr(args, "report_csv", None):
+        from .output.exporters import write_csv
+        out = write_csv(result, args.report_csv)
+        console.print(f"[green]✓[/green] CSV written to [cyan]{out}[/cyan]")
+
+    if getattr(args, "report_sarif", None):
+        from .output.exporters import write_sarif
+        out = write_sarif(result, args.report_sarif)
+        console.print(f"[green]✓[/green] SARIF written to [cyan]{out}[/cyan]")
 
     # ── Optional dashboard launch ───────────────────────────────────────
     if args.dashboard is not None:
