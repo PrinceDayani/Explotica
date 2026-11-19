@@ -317,32 +317,55 @@ def classify_args_risk(args) -> tuple[list[str], list[str]]:
 
 # ── Rate limiting ───────────────────────────────────────────────────────
 class RateLimiter:
-    """Simple token-bucket rate limiter."""
+    """Simple token-bucket rate limiter.
+
+    Thread-safe: acquire() serializes its timing update so a single limiter
+    shared across worker threads enforces one global packets/sec budget rather
+    than one-per-thread.
+    """
 
     def __init__(self, pps: float):
+        import threading
         import time
         self._time = time
+        self._lock = threading.Lock()
         self.pps = max(0.1, pps)
         self.interval = 1.0 / self.pps
         self._last = 0.0
 
     def acquire(self) -> None:
-        now = self._time.monotonic()
-        wait = self._last + self.interval - now
+        with self._lock:
+            now = self._time.monotonic()
+            wait = self._last + self.interval - now
+            if wait > 0:
+                self._last = now + wait
+            else:
+                self._last = now
+                wait = 0.0
         if wait > 0:
             self._time.sleep(wait)
-            self._last = self._time.monotonic()
-        else:
-            self._last = now
 
 
-_default_rate_limiter = RateLimiter(pps=100)
+# Global budget shared across scan phases. None = unlimited (the default, so
+# ordinary scans are not throttled). Set a real cap with --max-rate.
+_default_rate_limiter: Optional[RateLimiter] = None
 
 
 def set_global_rate_limit(pps: float) -> None:
+    """Install (or clear) the global packets/sec budget. pps<=0 → unlimited."""
     global _default_rate_limiter
-    _default_rate_limiter = RateLimiter(pps=pps)
+    _default_rate_limiter = RateLimiter(pps=pps) if pps and pps > 0 else None
 
 
-def get_global_rate_limiter() -> RateLimiter:
+def get_global_rate_limiter() -> Optional[RateLimiter]:
     return _default_rate_limiter
+
+
+def acquire_global() -> None:
+    """Block as needed to honour the global rate budget; no-op when unlimited.
+
+    Safe and cheap to call on every network operation in the scan hot path.
+    """
+    rl = _default_rate_limiter
+    if rl is not None:
+        rl.acquire()

@@ -852,6 +852,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--safe-mode", action="store_true",
                    help="Disable ALL active checks that could cause harm "
                         "(default-creds, web-fuzz, syn-scan, AS-REP, etc.)")
+    p.add_argument("--max-rate", type=float, default=0.0, metavar="PPS",
+                   help="Global cap on outbound TCP-connect probes per second, "
+                        "shared across all worker threads (0 = unlimited). Use "
+                        "to stay gentle on fragile targets or links.")
     p.add_argument("--yes", "-y", action="store_true",
                    help="Skip the authorization confirmation prompt "
                         "(equivalent to EXPLOTICA_I_AM_AUTHORIZED=1)")
@@ -927,6 +931,11 @@ def main(argv: list[str] | None = None) -> int:
             set_active_scope(scope)
         except Exception as e:
             log.warning("could not establish scope from target: %s", e)
+
+    # Install the global rate budget (shared across scan threads).
+    if getattr(args, "max_rate", 0.0):
+        from .safety_kit.safety import set_global_rate_limit
+        set_global_rate_limit(args.max_rate)
 
     # Install safe-mode if requested
     if args.safe_mode:

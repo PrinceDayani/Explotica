@@ -174,6 +174,49 @@ class TestRateLimiter:
         assert rl.pps >= 0.1
 
 
+class TestGlobalRateBudget:
+    def teardown_method(self):
+        from explotica.safety_kit.safety import set_global_rate_limit
+        set_global_rate_limit(0)  # reset to unlimited
+
+    def test_unlimited_by_default(self):
+        from explotica.safety_kit import safety
+        safety.set_global_rate_limit(0)
+        assert safety.get_global_rate_limiter() is None
+        # acquire_global is a cheap no-op when unlimited
+        t0 = time.monotonic()
+        for _ in range(1000):
+            safety.acquire_global()
+        assert time.monotonic() - t0 < 0.2
+
+    def test_set_and_clear(self):
+        from explotica.safety_kit import safety
+        safety.set_global_rate_limit(50)
+        assert safety.get_global_rate_limiter() is not None
+        safety.set_global_rate_limit(0)
+        assert safety.get_global_rate_limiter() is None
+
+    def test_shared_budget_paces_threads(self):
+        import threading
+        from explotica.safety_kit import safety
+        safety.set_global_rate_limit(200)  # 200 pps -> 5ms spacing
+
+        def worker():
+            for _ in range(10):
+                safety.acquire_global()
+
+        t0 = time.monotonic()
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        elapsed = time.monotonic() - t0
+        # 40 acquisitions at 200 pps = ~0.2s minimum if the budget is global;
+        # if it were per-thread this would finish in ~0.05s.
+        assert elapsed > 0.12
+
+
 # ── classify_args_risk ───────────────────────────────────────────────────
 class TestClassify:
     def test_passive_only(self):

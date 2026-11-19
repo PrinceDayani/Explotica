@@ -182,6 +182,8 @@ def probe_tcp(ip: str, port: int, timeout: float = 0.8) -> Port:
 
     The caller decides whether to keep closed/filtered entries.
     """
+    from ..safety_kit.safety import acquire_global
+    acquire_global()  # honour the global --max-rate budget (no-op by default)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     err = 0
