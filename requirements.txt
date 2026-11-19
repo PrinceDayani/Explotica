@@ -1,19 +1,20 @@
-scapy>=2.5.0
-rich>=13.7.0
+scapy>=2.5.0,<3
+rich>=13.7.0,<15
 # Optional but recommended on Linux/macOS — 2-4× faster asyncio event loop.
 # Not available on Windows. The --async-io flag still works without it.
-uvloop>=0.19.0; sys_platform != "win32"
+uvloop>=0.19.0,<1; sys_platform != "win32"
 # Optional — required only for the --dashboard web UI.
-fastapi>=0.110.0
-uvicorn[standard]>=0.27.0
-# Optional — required only for the TUI (textual library).
-textual>=0.50.0
+fastapi>=0.110.0,<1
+uvicorn[standard]>=0.27.0,<1
+# Optional — required only for the TUI (textual library). Pinned <1: the TUI
+# targets the 0.x widget API, which changed incompatibly at 1.0.
+textual>=0.50.0,<1
 # Optional — required only for --browser-crawl (Playwright).
 # After install run: playwright install chromium
-playwright>=1.40.0
+playwright>=1.40.0,<2
 # Optional — required for PDF report (--report-pdf).
-weasyprint>=60.0
+weasyprint>=60.0,<67
 # Optional — required for --ssh-creds credentialed scanning.
-paramiko>=3.0.0
+paramiko>=3.0.0,<4
 # Optional — required for --winrm-creds Windows credentialed scanning.
-pywinrm>=0.4.3
+pywinrm>=0.4.3,<1
