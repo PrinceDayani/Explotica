@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import stat
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -247,12 +248,42 @@ def save_profile(profile: VaultProfile, path: Optional[Path] = None) -> Path:
         },
     }
     p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    # Best-effort lock-down — works on POSIX; silently does nothing on Windows
+    _lock_down(p)
+    return p
+
+
+def _lock_down(p: Path) -> bool:
+    """Restrict a credential file to the current user. Returns True on success.
+
+    POSIX: chmod 0600. Windows: reset inheritance and grant only the current
+    user, via icacls. Unlike the previous POSIX-only path, a failure on any OS
+    is surfaced (warning) instead of silently leaving the file world-readable.
+    """
+    if os.name == "nt":
+        user = os.environ.get("USERNAME")
+        if not user:
+            log.warning("could not lock down %s: USERNAME unset; the file may "
+                        "be readable by other accounts", p)
+            return False
+        try:
+            # /inheritance:r removes inherited ACEs; /grant gives only this user.
+            subprocess.run(
+                ["icacls", str(p), "/inheritance:r",
+                 "/grant:r", f"{user}:F"],
+                check=True, capture_output=True,
+            )
+            return True
+        except (OSError, subprocess.CalledProcessError) as exc:
+            log.warning("could not lock down %s on Windows (icacls failed: %s); "
+                        "the file may be readable by other accounts", p, exc)
+            return False
     try:
         os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    return p
+        return True
+    except OSError as exc:
+        log.warning("could not lock down %s (%s); the file may be readable by "
+                    "other accounts", p, exc)
+        return False
 
 
 # ── Compat helpers — accept legacy {"user":..,"password":..} dict ──────

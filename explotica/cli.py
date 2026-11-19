@@ -20,6 +20,7 @@ from rich.text import Text
 
 from . import __version__
 from .core.models import ScanResult
+from .core.secret_input import resolve_secret
 from .discovery.ports import TOP_100_PORTS
 from .scanner import run_scan
 
@@ -27,7 +28,12 @@ log = logging.getLogger(__name__)
 
 
 def _parse_ssh_creds(creds_str: str, key_filename: str = None) -> dict:
-    """Parse `user:password` (or just `user` with key) for credentialed scan."""
+    """Parse `user:password` (or just `user` with key) for credentialed scan.
+
+    The value may be a literal, or an ``env:NAME`` / ``file:PATH`` reference
+    so the secret stays out of argv.
+    """
+    creds_str = resolve_secret(creds_str)
     if ":" in creds_str:
         user, password = creds_str.split(":", 1)
     else:
@@ -50,7 +56,7 @@ def _parse_ad_creds(args) -> "dict | None":
         return None
     if not (args.bloodhound or args.adcs_audit or args.ticket_risk):
         return None
-    creds = args.ad_creds
+    creds = resolve_secret(args.ad_creds)
     if ":" in creds:
         user, password = creds.split(":", 1)
     else:
@@ -65,7 +71,11 @@ def _parse_ad_creds(args) -> "dict | None":
 
 
 def _parse_winrm_creds(creds_str: str, transport: str = "ntlm") -> dict:
-    """Parse user:password for WinRM credentialed scan."""
+    """Parse user:password for WinRM credentialed scan.
+
+    Accepts a literal or an ``env:NAME`` / ``file:PATH`` reference.
+    """
+    creds_str = resolve_secret(creds_str)
     if ":" in creds_str:
         user, password = creds_str.split(":", 1)
     else:
@@ -104,7 +114,7 @@ def _resolve_db_credentials(args):
             return get_profile()
         except Exception:
             pass
-    raw = getattr(args, "db_creds", None)
+    raw = resolve_secret(getattr(args, "db_creds", None))
     if not raw:
         return None
     parsed: dict[str, dict] = {}
@@ -620,7 +630,10 @@ def main(argv: list[str] | None = None) -> int:
                         "(Heartbleed/MS17-010/Shellshock/BlueKeep/Log4Shell/ProxyShell/Apache)")
     p.add_argument("--ssh-creds", metavar="USER:PASSWORD",
                    help="Run credentialed SSH scan: inventory installed pkgs + "
-                        "match against NVD. Format: user:pass (or user with --ssh-key)")
+                        "match against NVD. Format: user:pass (or user with "
+                        "--ssh-key). To keep the secret out of argv/ps/history, "
+                        "pass 'env:VARNAME' or 'file:/path' — this also works "
+                        "for --winrm-creds, --ad-creds and --db-creds.")
     p.add_argument("--ssh-key", metavar="KEYFILE",
                    help="SSH private key for credentialed scan (use with --ssh-creds USER)")
     p.add_argument("--winrm-creds", metavar="USER:PASSWORD",
@@ -1298,7 +1311,7 @@ def main(argv: list[str] | None = None) -> int:
                 db_credentials=_resolve_db_credentials(args),
                 snmp_inventory_enabled=args.snmp_inventory,
                 snmp_creds={"version": "2c",
-                              "community": args.snmp_community},
+                              "community": resolve_secret(args.snmp_community)},
                 web_appscan_enabled=args.web_appscan,
                 container_scan_enabled=args.container_scan,
                 kube_token=args.kube_token,
