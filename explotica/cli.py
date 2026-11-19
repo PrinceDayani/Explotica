@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
+import os
 from typing import Optional
 import sys
 from pathlib import Path
@@ -19,14 +21,34 @@ from rich.text import Text
 
 from . import __version__
 from .core.models import ScanResult
+from .core.secret_input import resolve_secret, SecretResolutionError
 from .discovery.ports import TOP_100_PORTS
 from .scanner import run_scan
 
 log = logging.getLogger(__name__)
 
 
+def _ip_sort_key(ip: str) -> tuple:
+    """Sort key that handles IPv4 and IPv6 (and junk) without raising.
+
+    Sorts by address family first, then numeric address within a family;
+    unparseable values sort last. Prevents an IPv6 host from crashing the
+    final render (which previously int()-split on '.').
+    """
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+        return (addr.version, int(addr))
+    except (ValueError, AttributeError):
+        return (9, 0)
+
+
 def _parse_ssh_creds(creds_str: str, key_filename: str = None) -> dict:
-    """Parse `user:password` (or just `user` with key) for credentialed scan."""
+    """Parse `user:password` (or just `user` with key) for credentialed scan.
+
+    The value may be a literal, or an ``env:NAME`` / ``file:PATH`` reference
+    so the secret stays out of argv.
+    """
+    creds_str = resolve_secret(creds_str)
     if ":" in creds_str:
         user, password = creds_str.split(":", 1)
     else:
@@ -49,7 +71,7 @@ def _parse_ad_creds(args) -> "dict | None":
         return None
     if not (args.bloodhound or args.adcs_audit or args.ticket_risk):
         return None
-    creds = args.ad_creds
+    creds = resolve_secret(args.ad_creds)
     if ":" in creds:
         user, password = creds.split(":", 1)
     else:
@@ -64,14 +86,94 @@ def _parse_ad_creds(args) -> "dict | None":
 
 
 def _parse_winrm_creds(creds_str: str, transport: str = "ntlm") -> dict:
-    """Parse user:password for WinRM credentialed scan."""
+    """Parse user:password for WinRM credentialed scan.
+
+    Accepts a literal or an ``env:NAME`` / ``file:PATH`` reference.
+    """
+    creds_str = resolve_secret(creds_str)
     if ":" in creds_str:
         user, password = creds_str.split(":", 1)
     else:
         user, password = creds_str, ""
     return {"username": user, "password": password, "transport": transport}
 
-console = Console()
+# Literal emoji → ASCII, applied only when colour/emoji output is disabled so
+# piped, redirected, or non-UTF terminals get clean, screen-reader-friendly
+# text. Rich's emoji= flag only affects :shortcodes:, not literal glyphs.
+_EMOJI_ASCII = {
+    "🛰️": "", "🛰": "", "✅": "[OK]", "✔": "[OK]", "✓": "[OK]",
+    "⚠️": "[!]", "⚠": "[!]", "❌": "[X]", "✗": "[X]", "💥": "[!]",
+    "🔴": "[CRIT]", "🟢": "[OK]", "🟡": "[WARN]", "➜": "->", "＋": "+",
+    "🚀": "", "📊": "", "🔍": "", "🧠": "", "🔒": "", "🔑": "",
+}
+
+
+def _to_ascii(text: str) -> str:
+    for glyph, repl in _EMOJI_ASCII.items():
+        text = text.replace(glyph, repl)
+    return text
+
+
+class _AsciiFileWrapper:
+    """Output stream wrapper that ASCII-folds everything written to it.
+
+    Applied at the byte-stream level so it catches emoji inside Rich
+    renderables (Table cells, Text, Panels) too — not just top-level strings.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        return self._stream.write(_to_ascii(text) if isinstance(text, str)
+                                  else text)
+
+    def flush(self):
+        return self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class _Console(Console):
+    """Console that substitutes literal emoji for ASCII when ascii_only.
+
+    Top-level string arguments are folded here; everything else (renderables)
+    is folded by the _AsciiFileWrapper the console writes through. Both are
+    idempotent, so double-folding is harmless.
+    """
+
+    def __init__(self, *args, ascii_only: bool = False, **kwargs):
+        self._ascii_only = ascii_only
+        super().__init__(*args, **kwargs)
+
+    def print(self, *objects, **kwargs):  # type: ignore[override]
+        if self._ascii_only:
+            objects = tuple(
+                _to_ascii(o) if isinstance(o, str) else o for o in objects
+            )
+        super().print(*objects, **kwargs)
+
+
+def _build_console(no_color: bool = False) -> Console:
+    """Build the output Console, honouring colour-disable signals.
+
+    Colour/emoji output is disabled when any of these hold:
+      - ``--no-color`` was passed (``no_color=True``), or
+      - the ``NO_COLOR`` environment variable is set (see https://no-color.org),
+      - stdout is not a TTY (Rich detects this itself and strips ANSI).
+
+    Disabling also substitutes literal emoji for ASCII, so redirecting to a
+    file or another process yields clean, screen-reader-friendly text.
+    """
+    not_a_tty = not getattr(sys.stdout, "isatty", lambda: False)()
+    disable = no_color or bool(os.environ.get("NO_COLOR")) or not_a_tty
+    file = _AsciiFileWrapper(sys.stdout) if disable else None
+    return _Console(file=file, no_color=disable, emoji=not disable,
+                    ascii_only=disable)
+
+
+console = _build_console()
 
 
 # ── Phase 61: helpers for new CLI options ──────────────────────────────
@@ -88,7 +190,7 @@ def _resolve_db_credentials(args):
             return get_profile()
         except Exception:
             pass
-    raw = getattr(args, "db_creds", None)
+    raw = resolve_secret(getattr(args, "db_creds", None))
     if not raw:
         return None
     parsed: dict[str, dict] = {}
@@ -157,7 +259,7 @@ def render_result(result: ScanResult, show_vulns: bool = False) -> Table:
     if show_vulns:
         table.add_column("Vulns (top CVEs)", overflow="fold")
 
-    for host in sorted(result.hosts, key=lambda h: tuple(int(o) for o in h.ip.split("."))):
+    for host in sorted(result.hosts, key=lambda h: _ip_sort_key(h.ip)):
         ports_cell = Text()
         vulns_cell = Text()
         # Phase 56: rendered table shows only open ports by default to avoid
@@ -410,6 +512,23 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="explotica",
         description="Network discovery & reconnaissance — for authorized use only.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  explotica 192.168.1.0/24\n"
+            "      Discover hosts, scan ports, grab banners on a LAN.\n\n"
+            "  explotica scanme.example.com -Pn -p top1000 --vuln-scan\n"
+            "      Skip ping, scan the top 1000 ports, match CVEs.\n\n"
+            "  explotica 10.0.0.0/24 --full-coverage --json out.json -q\n"
+            "      Maximum coverage, write JSON, suppress the progress UI.\n\n"
+            "  explotica --full-coverage --explain\n"
+            "      Show exactly what --full-coverage enables, then exit.\n\n"
+            "  explotica 10.0.0.5 --no-color | tee scan.txt\n"
+            "      Clean, un-styled text suitable for piping or logging.\n\n"
+            "  explotica --interactive        # guided wizard\n"
+            "  explotica --shell              # persistent REPL\n"
+            "  explotica --platform-caps      # what works on this OS\n"
+        ),
     )
     p.add_argument("target", nargs="?",
                    help="CIDR ('192.168.1.0/24'), single IP, or hostname. "
@@ -422,6 +541,11 @@ def main(argv: list[str] | None = None) -> int:
                         "addresses (default: 4096 = /20).")
     p.add_argument("--list-network", action="store_true",
                    help="Just print the discovered subnets and exit — no scanning.")
+    p.add_argument("--mdns-sniff", nargs="?", type=float, const=3.0,
+                   default=None, metavar="SECONDS",
+                   help="Passively listen for mDNS (Bonjour/Avahi) announcements "
+                        "on the LAN for N seconds (default 3) and print the "
+                        "discovered hosts/services, then exit.")
     p.add_argument("-p", "--ports", default="all",
                    help="Ports: 'all' (default — 1-65535), 'top1000', "
                         "'top100', or '22,80,443' or '1-1024'. "
@@ -587,7 +711,10 @@ def main(argv: list[str] | None = None) -> int:
                         "(Heartbleed/MS17-010/Shellshock/BlueKeep/Log4Shell/ProxyShell/Apache)")
     p.add_argument("--ssh-creds", metavar="USER:PASSWORD",
                    help="Run credentialed SSH scan: inventory installed pkgs + "
-                        "match against NVD. Format: user:pass (or user with --ssh-key)")
+                        "match against NVD. Format: user:pass (or user with "
+                        "--ssh-key). To keep the secret out of argv/ps/history, "
+                        "pass 'env:VARNAME' or 'file:/path' — this also works "
+                        "for --winrm-creds, --ad-creds and --db-creds.")
     p.add_argument("--ssh-key", metavar="KEYFILE",
                    help="SSH private key for credentialed scan (use with --ssh-creds USER)")
     p.add_argument("--winrm-creds", metavar="USER:PASSWORD",
@@ -695,7 +822,25 @@ def main(argv: list[str] | None = None) -> int:
                         "(optionally) re-run --vuln-scan / --use-nmap on it.")
     p.add_argument("--report-html", metavar="PATH",
                    help="Write a self-contained HTML report to PATH.")
+    p.add_argument("--report-csv", metavar="PATH",
+                   help="Write a flat CSV (one row per port/CVE) to PATH "
+                        "for spreadsheets and pipelines.")
+    p.add_argument("--report-sarif", metavar="PATH",
+                   help="Write a SARIF 2.1.0 log to PATH (e.g. for GitHub "
+                        "code scanning / SARIF viewers).")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="Suppress the progress spinner and lower logging to "
+                        "ERROR. Final results still print. Combine with --json "
+                        "for machine-readable output on stdout.")
+    p.add_argument("--no-color", dest="no_color", action="store_true",
+                   help="Disable ANSI colour and styled output (also honoured "
+                        "via the NO_COLOR env var; colour is auto-disabled when "
+                        "stdout is not a terminal).")
+    p.add_argument("--explain", action="store_true",
+                   help="Print the concrete set of checks a preset (e.g. "
+                        "--full-coverage) would enable, then exit without "
+                        "scanning.")
     p.add_argument("-i", "--interactive", action="store_true",
                    help="Interactive wizard mode — guided scan setup")
     p.add_argument("--shell", action="store_true",
@@ -712,6 +857,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--safe-mode", action="store_true",
                    help="Disable ALL active checks that could cause harm "
                         "(default-creds, web-fuzz, syn-scan, AS-REP, etc.)")
+    p.add_argument("--max-rate", type=float, default=0.0, metavar="PPS",
+                   help="Global cap on outbound TCP-connect probes per second, "
+                        "shared across all worker threads (0 = unlimited). Use "
+                        "to stay gentle on fragile targets or links.")
     p.add_argument("--yes", "-y", action="store_true",
                    help="Skip the authorization confirmation prompt "
                         "(equivalent to EXPLOTICA_I_AM_AUTHORIZED=1)")
@@ -735,6 +884,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="Checkpoint every N completed hosts (default: 10)")
     args = p.parse_args(argv)
 
+    # Reconfigure the global console for colour-disable signals (--no-color /
+    # NO_COLOR / non-TTY) so every subsequent print is affected, including the
+    # early-exit paths below.
+    if getattr(args, "no_color", False) or os.environ.get("NO_COLOR"):
+        global console
+        console = _build_console(no_color=True)
+
+    # Snapshot scan flags before preset expansion so --explain can diff them.
+    _flags_before = {k: v for k, v in vars(args).items()}
+
     # --shell launches the REPL
     # Phase 66: --platform-caps prints capability matrix and exits
     if getattr(args, "platform_caps", False):
@@ -750,6 +909,8 @@ def main(argv: list[str] | None = None) -> int:
     # main() with the wizard-built argv. The wizard returns the full arg list.
     if args.interactive or (not args.target and not args.from_json
                               and not args.auto and not args.list_network
+                              and not getattr(args, "explain", False)
+                              and getattr(args, "mdns_sniff", None) is None
                               and argv is None):
         from .ui.interactive import run_wizard
         wiz_args = run_wizard()
@@ -762,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
     from .safety_kit.logging_config import configure as configure_logging
     log_level = (args.log_level
                  or ("DEBUG" if args.verbose else None)
+                 or ("ERROR" if getattr(args, "quiet", False) else None)
                  or None)
     configure_logging(level=log_level, logfile=args.log_file,
                        format_kind="json" if args.log_json else "plain",
@@ -775,6 +937,11 @@ def main(argv: list[str] | None = None) -> int:
             set_active_scope(scope)
         except Exception as e:
             log.warning("could not establish scope from target: %s", e)
+
+    # Install the global rate budget (shared across scan threads).
+    if getattr(args, "max_rate", 0.0):
+        from .safety_kit.safety import set_global_rate_limit
+        set_global_rate_limit(args.max_rate)
 
     # Install safe-mode if requested
     if args.safe_mode:
@@ -892,6 +1059,33 @@ def main(argv: list[str] | None = None) -> int:
             f"--ports={args.ports}"
         )
 
+    # --explain: report the concrete checks the chosen preset enables, then
+    # exit without touching the network.
+    if getattr(args, "explain", False):
+        _scan_keys = {
+            "vuln_scan", "deep", "use_nmap", "use_searchsploit", "rich_intel",
+            "epss_kev", "unmask", "udp_probe", "udp_full", "udp_raw",
+            "web_crawl", "shodan", "ssh_enum", "dns_enum", "service_intel",
+            "http_audit", "osint", "netfabric", "async_io", "honeypot_check",
+            "web_security", "ics", "prioritize", "os_fp_db", "verify_cves",
+            "verify_cves_v2", "aggressive", "check_default_creds",
+            "check_takeover", "smtp_audit", "syn_scan",
+        }
+        enabled = sorted(
+            k for k in _scan_keys
+            if vars(args).get(k) and not _flags_before.get(k)
+        )
+        console.print("[bold]Preset would enable the following checks:[/bold]")
+        if enabled:
+            for k in enabled:
+                console.print(f"  --{k.replace('_', '-')}")
+        else:
+            console.print("  (none — no preset flag was given)")
+        if getattr(args, "compliance", None) and not _flags_before.get("compliance"):
+            console.print(f"  --compliance {args.compliance}")
+        console.print(f"[dim]ports = {args.ports}[/dim]")
+        return 0
+
     # --turbo > --ultra > --aggressive (each subsumes the previous)
     if args.turbo:
         args.ultra = True
@@ -937,6 +1131,24 @@ def main(argv: list[str] | None = None) -> int:
         console.print(format_summary(net))
         return 0
 
+    if getattr(args, "mdns_sniff", None) is not None:
+        from .discovery.mdns_sniff import sniff_mdns
+        console.print(f"[dim]Listening for mDNS announcements "
+                      f"for {args.mdns_sniff:.0f}s…[/dim]")
+        res = sniff_mdns(duration=args.mdns_sniff)
+        if res.get("errors"):
+            console.print(f"[yellow]mDNS sniff note:[/yellow] "
+                          f"{'; '.join(res['errors'])}")
+        if not res.get("hosts"):
+            console.print("No mDNS announcements observed.")
+        for ip, info in sorted(res.get("hosts", {}).items()):
+            console.print(f"[cyan]{ip}[/cyan]")
+            for svc in info.get("ptr", []):
+                console.print(f"  service: {svc}")
+            for s in info.get("srv", []):
+                console.print(f"  {s['target']}:{s['port']}")
+        return 0
+
     # Validate input mode
     if not args.target and not args.from_json and not args.auto:
         console.print("[red]Need one of: positional `target`, `--from-json PATH`, "
@@ -953,6 +1165,7 @@ def main(argv: list[str] | None = None) -> int:
         TextColumn("{task.fields[detail]}"),
         console=console,
         transient=False,
+        disable=getattr(args, "quiet", False),
     )
     progress_task = progress_obj.add_task(
         "scanning", total=None, detail=""
@@ -1215,7 +1428,7 @@ def main(argv: list[str] | None = None) -> int:
                 db_credentials=_resolve_db_credentials(args),
                 snmp_inventory_enabled=args.snmp_inventory,
                 snmp_creds={"version": "2c",
-                              "community": args.snmp_community},
+                              "community": resolve_secret(args.snmp_community)},
                 web_appscan_enabled=args.web_appscan,
                 container_scan_enabled=args.container_scan,
                 kube_token=args.kube_token,
@@ -1227,6 +1440,9 @@ def main(argv: list[str] | None = None) -> int:
                 checkpoint_every_n=args.checkpoint_every,
                 progress=progress,
             )
+        except SecretResolutionError as e:
+            console.print(f"[red]Credential error:[/red] {e}")
+            return 2
         except NotImplementedError as e:
             console.print(f"[yellow]Orchestrator not implemented yet:[/yellow] {e}")
             return 3
@@ -1504,6 +1720,27 @@ def main(argv: list[str] | None = None) -> int:
                     f"(score {tp[0]['score']:.0f}/100, {tp[0]['bucket']})"
                 )
 
+    # Reject colliding output paths so one artifact can't silently overwrite
+    # another (e.g. --report-csv X --report-sarif X).
+    _out_specs = [
+        ("--json", getattr(args, "json", None)),
+        ("--report-html", getattr(args, "report_html", None)),
+        ("--report-csv", getattr(args, "report_csv", None)),
+        ("--report-sarif", getattr(args, "report_sarif", None)),
+    ]
+    _seen: dict[str, str] = {}
+    for _flag, _p in _out_specs:
+        if not _p:
+            continue
+        _key = str(Path(_p).resolve())
+        if _key in _seen:
+            console.print(
+                f"[red]Output path collision:[/red] {_flag} and {_seen[_key]} "
+                f"both write to {_p}. Use distinct paths."
+            )
+            return 2
+        _seen[_key] = _flag
+
     if args.json:
         out = Path(args.json)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1514,6 +1751,16 @@ def main(argv: list[str] | None = None) -> int:
         from .output.report import write_report
         out = write_report(result, args.report_html)
         console.print(f"[green]✓[/green] HTML report at [cyan]{out}[/cyan]")
+
+    if getattr(args, "report_csv", None):
+        from .output.exporters import write_csv
+        out = write_csv(result, args.report_csv)
+        console.print(f"[green]✓[/green] CSV written to [cyan]{out}[/cyan]")
+
+    if getattr(args, "report_sarif", None):
+        from .output.exporters import write_sarif
+        out = write_sarif(result, args.report_sarif)
+        console.print(f"[green]✓[/green] SARIF written to [cyan]{out}[/cyan]")
 
     # ── Optional dashboard launch ───────────────────────────────────────
     if args.dashboard is not None:

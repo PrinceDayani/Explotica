@@ -5,7 +5,10 @@ reorganization, modules live in topic-based sub-packages, but the
 top-level imports still resolve to the new locations.
 """
 
-from .core.constants import SCANNER_VERSION as __version__
+try:
+    from .core.constants import SCANNER_VERSION as __version__
+except Exception:  # pragma: no cover - defensive: never let version break import
+    __version__ = "0+unknown"
 
 # Backward-compat re-exports — added by _reorg.py.
 # These let existing user scripts like `from explotica.ports import

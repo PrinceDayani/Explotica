@@ -29,6 +29,7 @@ CLI_ONLY_FLAGS = {
     "--log-json", "--no-banners", "--open-only", "--platform-caps",
     "--safe-mode", "--shell", "--strict-scope", "--use-cred-vault", "--yes",
     "--sqli-time",          # sub-toggle of --web-fuzz, not a standalone module
+    "--no-color", "--explain",  # global output/UX plumbing, not scan modules
 }
 
 

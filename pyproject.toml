@@ -28,91 +28,96 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
     "Topic :: System :: Networking :: Monitoring",
 ]
 
-# Core required dependencies — installed by default
+# Core required dependencies — installed by default.
+# Upper bounds cap at the next major (or, for 0.x projects, the next minor
+# with a known-breaking history) so an upstream major release cannot silently
+# break installs. Raise a bound deliberately after testing the new major.
 dependencies = [
-    "scapy>=2.5.0",
-    "rich>=13.7.0",
+    "scapy>=2.5.0,<3",
+    "rich>=13.7.0,<15",
 ]
 
 [project.optional-dependencies]
 # Async I/O acceleration (Linux/macOS only)
 async = [
-    "uvloop>=0.19.0; sys_platform != 'win32'",
+    "uvloop>=0.19.0,<1; sys_platform != 'win32'",
 ]
 
 # Web dashboard
 dashboard = [
-    "fastapi>=0.110.0",
-    "uvicorn[standard]>=0.27.0",
+    "fastapi>=0.110.0,<1",
+    "uvicorn[standard]>=0.27.0,<1",
 ]
 
-# Textual TUI
+# Textual TUI — pinned <1 because the TUI targets the 0.x widget API, which
+# changed incompatibly at 1.0. Bump after porting to the 1.x API.
 tui = [
-    "textual>=0.50.0",
+    "textual>=0.50.0,<1",
 ]
 
 # Browser-based crawling
 browser = [
-    "playwright>=1.40.0",
+    "playwright>=1.40.0,<2",
 ]
 
 # PDF reports
 pdf = [
-    "weasyprint>=60.0",
+    "weasyprint>=60.0,<67",
 ]
 
 # Credentialed scanning
 credentialed = [
-    "paramiko>=3.0.0",       # SSH
-    "pywinrm>=0.4.3",        # WinRM
+    "paramiko>=3.0.0,<4",    # SSH
+    "pywinrm>=0.4.3,<1",     # WinRM
 ]
 
 # Database fingerprinting (full auth paths)
 databases = [
-    "pymysql>=1.1.0",        # MySQL/MariaDB
-    "psycopg2-binary>=2.9",  # PostgreSQL
-    "pymssql>=2.2.10",       # MSSQL
-    "pymongo>=4.5.0",        # MongoDB
-    "redis>=5.0.0",          # Redis
+    "pymysql>=1.1.0,<2",       # MySQL/MariaDB
+    "psycopg2-binary>=2.9,<3", # PostgreSQL
+    "pymssql>=2.2.10,<3",      # MSSQL
+    "pymongo>=4.5.0,<5",       # MongoDB
+    "redis>=5.0.0,<7",         # Redis
 ]
 
 # Active Directory + Kerberos (production-grade AS-REQ / AS-REP via impacket)
 # Phase 67: without impacket we fall back to a pure-Python ASN.1 stub that
 # returns confidence="low" — install this extra for production AD work.
 ad = [
-    "impacket>=0.11.0",
+    "impacket>=0.11.0,<1",
 ]
 
 # Development / testing
 dev = [
-    "pytest>=8.0.0",
-    "pytest-cov>=4.1.0",
-    "pytest-asyncio>=0.23.0",
-    "black>=24.0.0",
-    "ruff>=0.3.0",
-    "mypy>=1.8.0",
+    "pytest>=8.0.0,<9",
+    "pytest-cov>=4.1.0,<7",
+    "pytest-asyncio>=0.23.0,<1",
+    "black>=24.0.0,<26",
+    "ruff>=0.3.0,<1",
+    "mypy>=1.8.0,<2",
 ]
 
 # Everything — convenience for "give me the works"
 all = [
-    "uvloop>=0.19.0; sys_platform != 'win32'",
-    "fastapi>=0.110.0",
-    "uvicorn[standard]>=0.27.0",
-    "textual>=0.50.0",
-    "playwright>=1.40.0",
-    "weasyprint>=60.0",
-    "paramiko>=3.0.0",
-    "pywinrm>=0.4.3",
-    "pymysql>=1.1.0",
-    "psycopg2-binary>=2.9",
-    "pymssql>=2.2.10",
-    "pymongo>=4.5.0",
-    "redis>=5.0.0",
-    "impacket>=0.11.0",
+    "uvloop>=0.19.0,<1; sys_platform != 'win32'",
+    "fastapi>=0.110.0,<1",
+    "uvicorn[standard]>=0.27.0,<1",
+    "textual>=0.50.0,<1",
+    "playwright>=1.40.0,<2",
+    "weasyprint>=60.0,<67",
+    "paramiko>=3.0.0,<4",
+    "pywinrm>=0.4.3,<1",
+    "pymysql>=1.1.0,<2",
+    "psycopg2-binary>=2.9,<3",
+    "pymssql>=2.2.10,<3",
+    "pymongo>=4.5.0,<5",
+    "redis>=5.0.0,<7",
+    "impacket>=0.11.0,<1",
 ]
 
 [project.scripts]

@@ -37,6 +37,39 @@ class TestScope:
         assert s.permits("10.5.5.5")
         assert not s.permits("172.16.0.1")
 
+    def test_ipv6_host_scope(self):
+        s = Scope.from_target("2001:db8::1")
+        assert s.permits("2001:db8::1")
+        assert not s.permits("2001:db8::2")
+        assert not s.permits("192.168.1.1")  # different family, not in scope
+
+    def test_ipv6_network_scope(self):
+        s = Scope.from_target("2001:db8::/32")
+        assert s.permits("2001:db8::dead:beef")
+        assert s.permits("2001:db8:1234::1")
+        assert not s.permits("2001:db9::1")
+
+    def test_ipv6_zone_id_stripped(self):
+        s = Scope.from_target("fe80::/10")
+        assert s.permits("fe80::1%eth0")  # link-local with zone id
+
+    def test_scoped_ipv6_target_builds_nonempty_scope(self):
+        # A zone-scoped host target must produce a real /128 scope, not an
+        # empty one (which would permit everything).
+        s = Scope.from_target("fe80::1%eth0")
+        assert s.networks  # not empty
+        assert s.permits("fe80::1%eth0")
+        assert s.permits("fe80::1")
+        assert not s.permits("8.8.8.8")
+        assert not s.permits("fe80::2")
+
+    def test_mixed_v4_v6_scope(self):
+        s = Scope.from_target("192.168.1.0/24,2001:db8::/32")
+        assert s.permits("192.168.1.9")
+        assert s.permits("2001:db8::5")
+        assert not s.permits("10.0.0.1")
+        assert not s.permits("2001:db9::1")
+
     def test_domain_scope_exact(self):
         s = Scope.from_target("example.com")
         assert s.permits("example.com")
@@ -139,6 +172,49 @@ class TestRateLimiter:
     def test_clamps_negative_pps(self):
         rl = RateLimiter(pps=0)
         assert rl.pps >= 0.1
+
+
+class TestGlobalRateBudget:
+    def teardown_method(self):
+        from explotica.safety_kit.safety import set_global_rate_limit
+        set_global_rate_limit(0)  # reset to unlimited
+
+    def test_unlimited_by_default(self):
+        from explotica.safety_kit import safety
+        safety.set_global_rate_limit(0)
+        assert safety.get_global_rate_limiter() is None
+        # acquire_global is a cheap no-op when unlimited
+        t0 = time.monotonic()
+        for _ in range(1000):
+            safety.acquire_global()
+        assert time.monotonic() - t0 < 0.2
+
+    def test_set_and_clear(self):
+        from explotica.safety_kit import safety
+        safety.set_global_rate_limit(50)
+        assert safety.get_global_rate_limiter() is not None
+        safety.set_global_rate_limit(0)
+        assert safety.get_global_rate_limiter() is None
+
+    def test_shared_budget_paces_threads(self):
+        import threading
+        from explotica.safety_kit import safety
+        safety.set_global_rate_limit(200)  # 200 pps -> 5ms spacing
+
+        def worker():
+            for _ in range(10):
+                safety.acquire_global()
+
+        t0 = time.monotonic()
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        elapsed = time.monotonic() - t0
+        # 40 acquisitions at 200 pps = ~0.2s minimum if the budget is global;
+        # if it were per-thread this would finish in ~0.05s.
+        assert elapsed > 0.12
 
 
 # ── classify_args_risk ───────────────────────────────────────────────────

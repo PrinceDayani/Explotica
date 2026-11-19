@@ -23,6 +23,17 @@ log = logging.getLogger(__name__)
 
 
 # ── Scope enforcement ───────────────────────────────────────────────────
+def _strip_zone(target: str) -> str:
+    """Drop an IPv6 zone/scope id (``fe80::1%eth0`` → ``fe80::1``).
+
+    ``ipaddress`` does not accept a zone suffix, but scanners pass link-local
+    addresses with one. Non-IPv6 strings are returned unchanged.
+    """
+    if "%" in target and ":" in target:
+        return target.split("%", 1)[0]
+    return target
+
+
 class ScopeViolation(RuntimeError):
     """Raised when an in-flight probe targets something outside the declared
     scope. Don't swallow this — surface it to the user."""
@@ -35,7 +46,7 @@ class Scope:
     def __init__(self, *, networks: Optional[list[str]] = None,
                   domains: Optional[list[str]] = None,
                   strict: bool = True):
-        self.networks: list[ipaddress.IPv4Network] = []
+        self.networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
         self.domains: set[str] = set()
         self.strict = strict
         self.violations: list[dict] = []
@@ -48,9 +59,11 @@ class Scope:
     def from_target(cls, target: str, strict: bool = True) -> "Scope":
         """Build a scope from a single --target argument.
 
-        Accepts:
+        Accepts IPv4 and IPv6:
           - "192.168.1.0/24"     → adds the /24 network
           - "192.168.1.5"        → adds /32 host
+          - "2001:db8::/32"      → adds the IPv6 /32 network
+          - "::1"                → adds /128 host
           - "example.com"        → adds the bare domain + *.example.com
           - "auto"               → empty scope; caller adds discovered subnets
           - comma-separated mix  → multiple
@@ -60,22 +73,28 @@ class Scope:
             piece = piece.strip()
             if not piece or piece == "auto":
                 continue
+            if "/" in piece:
+                s.add_network(piece)
+                continue
             try:
-                if "/" in piece:
-                    s.add_network(piece)
-                else:
-                    ipaddress.IPv4Address(piece)
-                    s.add_network(piece + "/32")
-            except (ValueError, ipaddress.AddressValueError):
+                # A bare host (v4 or v6); ip_network turns it into /32 or /128.
+                ipaddress.ip_address(piece)
+                s.add_network(piece)
+            except ValueError:
                 s.add_domain(piece)
         return s
 
     def add_network(self, cidr: str) -> None:
+        # Strip any IPv6 zone id first: ipaddress.ip_network rejects a scoped
+        # address on some Python versions, which would otherwise leave the
+        # scope empty (and an empty scope permits everything). permits()
+        # strips the zone on the target side too, so matching stays correct.
+        cidr = _strip_zone(cidr)
         try:
-            net = ipaddress.IPv4Network(cidr, strict=False)
+            net = ipaddress.ip_network(cidr, strict=False)
             if net not in self.networks:
                 self.networks.append(net)
-        except (ValueError, ipaddress.AddressValueError):
+        except ValueError:
             log.warning("invalid CIDR in scope: %s", cidr)
 
     def add_domain(self, domain: str) -> None:
@@ -88,11 +107,13 @@ class Scope:
         if not self.networks and not self.domains:
             return True
         try:
-            addr = ipaddress.IPv4Address(target)
+            addr = ipaddress.ip_address(_strip_zone(target))
             for net in self.networks:
-                if addr in net:
+                # Membership across address families raises; compare only
+                # same-version network/address pairs.
+                if addr.version == net.version and addr in net:
                     return True
-        except (ValueError, ipaddress.AddressValueError):
+        except ValueError:
             t = target.lower().lstrip(".")
             if t in self.domains:
                 return True
@@ -296,32 +317,55 @@ def classify_args_risk(args) -> tuple[list[str], list[str]]:
 
 # ── Rate limiting ───────────────────────────────────────────────────────
 class RateLimiter:
-    """Simple token-bucket rate limiter."""
+    """Simple token-bucket rate limiter.
+
+    Thread-safe: acquire() serializes its timing update so a single limiter
+    shared across worker threads enforces one global packets/sec budget rather
+    than one-per-thread.
+    """
 
     def __init__(self, pps: float):
+        import threading
         import time
         self._time = time
+        self._lock = threading.Lock()
         self.pps = max(0.1, pps)
         self.interval = 1.0 / self.pps
         self._last = 0.0
 
     def acquire(self) -> None:
-        now = self._time.monotonic()
-        wait = self._last + self.interval - now
+        with self._lock:
+            now = self._time.monotonic()
+            wait = self._last + self.interval - now
+            if wait > 0:
+                self._last = now + wait
+            else:
+                self._last = now
+                wait = 0.0
         if wait > 0:
             self._time.sleep(wait)
-            self._last = self._time.monotonic()
-        else:
-            self._last = now
 
 
-_default_rate_limiter = RateLimiter(pps=100)
+# Global budget shared across scan phases. None = unlimited (the default, so
+# ordinary scans are not throttled). Set a real cap with --max-rate.
+_default_rate_limiter: Optional[RateLimiter] = None
 
 
 def set_global_rate_limit(pps: float) -> None:
+    """Install (or clear) the global packets/sec budget. pps<=0 → unlimited."""
     global _default_rate_limiter
-    _default_rate_limiter = RateLimiter(pps=pps)
+    _default_rate_limiter = RateLimiter(pps=pps) if pps and pps > 0 else None
 
 
-def get_global_rate_limiter() -> RateLimiter:
+def get_global_rate_limiter() -> Optional[RateLimiter]:
     return _default_rate_limiter
+
+
+def acquire_global() -> None:
+    """Block as needed to honour the global rate budget; no-op when unlimited.
+
+    Safe and cheap to call on every network operation in the scan hot path.
+    """
+    rl = _default_rate_limiter
+    if rl is not None:
+        rl.acquire()
