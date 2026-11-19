@@ -288,8 +288,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https://unpkg.com; img-src 'self' data:;">
 <title>Explotica Dashboard</title>
-<script>window.EXPLOTICA_TOKEN = "__EXPLOTICA_TOKEN__";</script>
-<script src="https://unpkg.com/cytoscape@3.28/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
 <style>
 :root { color-scheme: dark light; }
 /* Screen-reader-only utility: present in the DOM, hidden visually. */
@@ -470,6 +469,13 @@ aside {
 </div>
 
 <script>
+// Everything runs inside this IIFE so the launch token and helpers live in a
+// closure, not on window / the global lexical scope. A compromised or
+// substituted third-party script (e.g. the Cytoscape CDN asset) therefore
+// cannot read EXPLOTICA_TOKEN. (Subresource Integrity on the CDN script is the
+// stronger fix; pin it once a hash can be computed with network access.)
+(() => {
+const EXPLOTICA_TOKEN = "__EXPLOTICA_TOKEN__";
 // XSS protection: ALL scan data is treated as untrusted.
 // Use esc() before inserting into innerHTML, or use el/text helpers.
 function esc(s) {
@@ -777,7 +783,7 @@ async function launch() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Explotica-Token': window.EXPLOTICA_TOKEN,
+        'X-Explotica-Token': EXPLOTICA_TOKEN,
       },
       body: JSON.stringify({target, profile: SEL_PROFILE, aggressive}),
     });
@@ -845,6 +851,7 @@ async function pollJobs() {
   await reload();
   await pollJobs();
 })();
+})();  // end top-level IIFE (token + helpers stay in this closure)
 </script>
 </body>
 </html>
