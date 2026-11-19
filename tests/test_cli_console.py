@@ -31,3 +31,19 @@ def test_build_console_env_no_color(monkeypatch):
     c = _build_console()
     assert isinstance(c, _Console)
     assert c._ascii_only is True
+
+
+def test_ascii_folds_emoji_inside_rich_table():
+    from rich.table import Table
+    from explotica.cli import _AsciiFileWrapper
+    import io
+    buf = io.StringIO()
+    c = _Console(file=_AsciiFileWrapper(buf), no_color=True, emoji=False,
+                 ascii_only=True)
+    t = Table()
+    t.add_column("sev")
+    t.add_row("🔴 critical")   # emoji inside a table cell
+    c.print(t)
+    out = buf.getvalue()
+    assert "🔴" not in out
+    assert "[CRIT]" in out

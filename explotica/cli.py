@@ -114,8 +114,34 @@ def _to_ascii(text: str) -> str:
     return text
 
 
+class _AsciiFileWrapper:
+    """Output stream wrapper that ASCII-folds everything written to it.
+
+    Applied at the byte-stream level so it catches emoji inside Rich
+    renderables (Table cells, Text, Panels) too — not just top-level strings.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        return self._stream.write(_to_ascii(text) if isinstance(text, str)
+                                  else text)
+
+    def flush(self):
+        return self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 class _Console(Console):
-    """Console that substitutes literal emoji for ASCII when ascii_only."""
+    """Console that substitutes literal emoji for ASCII when ascii_only.
+
+    Top-level string arguments are folded here; everything else (renderables)
+    is folded by the _AsciiFileWrapper the console writes through. Both are
+    idempotent, so double-folding is harmless.
+    """
 
     def __init__(self, *args, ascii_only: bool = False, **kwargs):
         self._ascii_only = ascii_only
@@ -142,7 +168,9 @@ def _build_console(no_color: bool = False) -> Console:
     """
     not_a_tty = not getattr(sys.stdout, "isatty", lambda: False)()
     disable = no_color or bool(os.environ.get("NO_COLOR")) or not_a_tty
-    return _Console(no_color=disable, emoji=not disable, ascii_only=disable)
+    file = _AsciiFileWrapper(sys.stdout) if disable else None
+    return _Console(file=file, no_color=disable, emoji=not disable,
+                    ascii_only=disable)
 
 
 console = _build_console()
